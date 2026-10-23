@@ -1,0 +1,48 @@
+<?xml version="1.0"?>
+<info>
+	<id>marp_slides</id>
+	<name>Marp Slides</name>
+	<summary>Turn a prompt into a PPTX slide deck</summary>
+	<description><![CDATA[Turn a user prompt into a slide deck. A language model authors Marp Markdown from the prompt; the deck is built as an editable PPTX (default, native shapes, images via provided files), a standalone HTML presentation or a PDF document, with speaker notes (PDF output excludes them) and the Markdown source retained.]]></description>
+	<version>0.1.0</version>
+	<licence>agpl</licence>
+	<namespace>MarpSlides</namespace>
+	<category>office</category>
+	<dependencies>
+		<nextcloud min-version="33" max-version="35"/>
+	</dependencies>
+	<external-app>
+		<docker-install>
+			<registry>docker.io</registry>
+			<image>marp-slides</image>
+			<image-tag>0.1.0</image-tag>
+		</docker-install>
+		<environment-variables>
+			<variable>
+				<name>MARP_SLIDES_POLL_INTERVAL</name>
+				<display-name>Task poll interval (seconds)</display-name>
+				<description>How often the ExApp polls Nextcloud for new slide deck tasks when no trigger event has arrived. Default: 5.</description>
+			</variable>
+			<variable>
+				<name>MARP_SLIDES_MARP_TIMEOUT</name>
+				<display-name>Marp conversion timeout (seconds)</display-name>
+				<description>Timeout for each marp-cli conversion subprocess (HTML validation and PPTX rendering each). Default: 120.</description>
+			</variable>
+			<variable>
+				<name>MARP_SLIDES_LLM_TIMEOUT</name>
+				<display-name>Inner LLM task timeout (seconds)</display-name>
+				<description>Maximum time to wait for the nested core:text2text task that authors the deck Markdown. Default: 300.</description>
+			</variable>
+			<variable>
+				<name>MARP_SLIDES_TOTAL_LLM_TIMEOUT</name>
+				<display-name>Total inner LLM time cap (seconds)</display-name>
+				<description>Total time budget across BOTH inner LLM attempts (the first plus the self-correcting retry). Default: 480.</description>
+			</variable>
+			<variable>
+				<name>MARP_SLIDES_LOG_EXCERPT</name>
+				<display-name>Log deck-failure markdown excerpts</display-name>
+				<description>When a generated deck fails validation, log a 240-character excerpt of the extracted markdown (WARNING, deck content only) for diagnosability. Set to false to suppress the excerpt in privacy-sensitive deployments; the error line itself is always logged. Default: true.</description>
+			</variable>
+		</environment-variables>
+	</external-app>
+</info>
