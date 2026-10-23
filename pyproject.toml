@@ -1,0 +1,213 @@
+# Static code quality gates for marp_slides.
+#
+# The whole gate suite runs through scripts/check.sh (local + CI); every
+# tool below is also wired into .pre-commit-config.yaml so the same gates
+# run client-side. Rationale for each gate is documented in README.md
+# ("Quality gates") and in the comments here.
+
+[tool.ruff]
+target-version = "py311"
+line-length = 88
+# The formatter enforces 88 on code; E501 (below) caps string/comment
+# lines at 120 — the few user-facing error messages the formatter cannot
+# reflow stay readable but bounded.
+
+[tool.ruff.lint]
+select = [
+    "E4", "E7", "E9", "F", # pycodestyle/pyflakes subsets ruff enables by default
+    "E501",                # line cap for what the formatter cannot reflow (see pycodestyle)
+    "A",                   # flake8-builtins: shadowing a builtin is a real bug class
+    "ARG",                 # flake8-unused-arguments: dead parameters rot in place
+    "ASYNC",               # flake8-async: blocking calls in async contexts block the loop
+    "B",                   # flake8-bugbear: real bug patterns (mutable defaults, ...)
+    "BLE",                 # blind excepts hide deck failures from the report path
+    "C4",                  # flake8-comprehensions: comprehension misuse
+    "C90",                 # mccabe complexity ceiling (see lint.mccabe below)
+    "DTZ",                 # flake8-datetimez: naive datetimes are wrong in a scheduler
+    "FA",                  # future-annotations: keep PEP 563+ discipline
+    "FLY",                 # flynt: f-strings over .format/concat
+    "FURB",                # refurb: idiomatic refinement
+    "I",                   # isort: stable import order (ecosystem standard)
+    "ICN",                 # import conventions
+    "ISC",                 # implicit string concatenation discipline
+    "N",                   # pep8-naming
+    "PERF",                # perflint: wasteful patterns
+    "PIE",                 # misc lint
+    "PLC", "PLE", "PLR", "PLW", # pylint parity, tuned below
+    "PTH",                 # flake8-use-pathlib: no hand-rolled path strings
+    "RET",                 # flake8-return: dead assignment-before-return
+    "RUF",                 # ruff-specific, incl. RUF100 unused-noqa (ratchet)
+    "S",                   # flake8-bandit: security-sensitive patterns
+    "SIM",                 # flake8-simplify
+    "T20",                 # no stray print() in the app
+    "TID",                 # tidy imports
+    "TRY",                 # tryceratops (tuned below)
+    "UP",                  # pyupgrade for py311
+]
+ignore = [
+    # Long, actionable exception messages are this product's UX: the strict
+    # validator's errors tell the model what to do instead, verbatim in tests.
+    "TRY003",
+    # process_task's try blocks legitimately end with a summary return after
+    # the per-failure reporting branches; logging, not raising, is deliberate
+    # in the env-validation except (a traceback there is noise, not signal).
+    "TRY300",
+    "TRY400",
+]
+# Deliberately NOT selected (each after measuring findings on this codebase):
+#   EM101/EM102  - forces exception messages out of context; the long
+#                  actionable messages are the product (same reason as TRY003)
+#   SLF001       - python-pptx's XML injection points (para._p, ph._element)
+#                  are private by name but the documented XML mechanism
+#   COM812        - trailing commas are the formatter's job, selecting this
+#                  fights `ruff format`
+#   ANN          - annotation coverage is mypy --strict's job (stricter)
+#   D            - docstring style: the codebase has real docstrings; a
+#                  pydocstyle pass would churn every docstring for no defect
+#   PT           - pytest style opinions (PT018) without defect classes
+
+[tool.ruff.lint.mccabe]
+# Cyclomatic complexity ceiling: 10 is the flake8-mccabe default and radon's
+# "stay in rank B" line. The two strict-parser dispatchers were refactored
+# under it (see git history); there are no per-file C901 exemptions.
+max-complexity = 10
+
+[tool.ruff.lint.pycodestyle]
+# Hard cap for lines the 88-col formatter cannot reflow (long error-message
+# strings). Measured on adoption: the longest line in the tree is 113.
+max-line-length = 120
+
+[tool.ruff.lint.pylint]
+# Measured against the current tree: the widest legitimate signatures are
+# 8 args (ocs_tasks schedule/poll helpers carrying explicit knobs), and
+# builder.estimate_height's isinstance ladder returns 8 height constants.
+max-args = 8
+max-positional-args = 8
+max-returns = 8
+# Tightened from the pylint default 12 as a partial proxy for nesting depth
+# (ruff has no per-function nesting-depth rule): the poll/retry loops sit
+# at exactly 9 branches. process_task carries one documented noqa at 10.
+max-branches = 9
+
+[tool.ruff.lint.per-file-ignores]
+# 0.0.0.0 binding is required inside the Docker ExApp container (commented
+# in main.py); the bind surface is firewalled per README Security.
+"main.py" = ["S104"]
+# pPr mirrors the OOXML tag name it builds; renaming would obscure the XML.
+"marp_slides/elements.py" = ["N806"]
+# Tests: assert is the tool (S101); monkeypatched fakes legitimately take
+# unused args to match real signatures (ARG/A002); module-level import
+# patching needs local imports (PLC0415); tmp_path covers PTH123; expected
+# values are literal by nature (PLR2004); the opt-in render test drives the
+# same trusted local binaries as scripts/lo_render_check.py (S108/S603/S607).
+"tests/*" = ["S101", "S314", "ARG", "A002", "A006", "PLC0415", "PTH123", "B905", "PLR2004", "S108", "S603", "S607"]
+# Developer tooling: prints are the interface, subprocess calls run trusted
+# local binaries (pdffonts, soffice, marp), /tmp is the audit workspace.
+"scripts/*" = ["T201", "S108", "S314", "S603", "S607", "E402"]
+# Hand-run container probe, never imported; its checks assert literal
+# expected values like tests do (PLR2004).
+"fixtures/*" = ["S101", "T201", "PTH123", "E402", "SIM105", "B007", "PLW1641", "PLR2004"]
+
+[tool.mypy]
+# Strict on the application surface. nc_py_api ships no py.typed marker
+# (checked: 0.30.3), so its imports resolve to Any behind an override.
+# PyYAML gets real typeshed stubs via types-PyYAML (dev).
+# tests/ are covered by the ruff gate + 401 tests, not by strict
+# typing: backfilling annotations across thousands of lines of fakes was
+# measured and rejected as churn without defect classes.
+python_version = "3.11"
+strict = true
+files = ["marp_slides", "main.py"]
+
+[[tool.mypy.overrides]]
+module = ["nc_py_api.*"]
+ignore_missing_imports = true
+
+[tool.importlinter]
+root_packages = ["marp_slides"]
+include_external_packages = true
+# slide_blocks annotates its `state: SlideState` parameter with a
+# TYPE_CHECKING import from slides (the runtime dependency points the other
+# way: slides dispatches to slide_blocks). Type-only imports cannot create
+# runtime layering violations, so they are excluded.
+exclude_type_checking_imports = true
+
+[[tool.importlinter.contracts]]
+name = "Pipeline layering: app above services above facade above core"
+type = "layers"
+layers = [
+    "marp_slides.controller",
+    "marp_slides.task_worker",
+    "marp_slides.task_definition",
+    "marp_slides.deck_pipeline",
+    "marp_slides.images",
+    "marp_slides.ocs_tasks",
+    "marp_slides.marp_cli",
+    "marp_slides.editable_pptx",
+    "marp_slides.builder",
+    "marp_slides.elements",
+    "marp_slides.validator",
+    "marp_slides.parser",
+    "marp_slides.slides",
+    "marp_slides.slide_blocks",
+    "marp_slides.directives",
+    "marp_slides.inline",
+    "marp_slides.blocks",
+    "marp_slides.constructs",
+    "marp_slides.geometry",
+    "marp_slides.settings",
+]
+
+[[tool.importlinter.contracts]]
+name = "App layer talks to the facade and the services, never internals"
+type = "forbidden"
+# Indirect chains are fine: task_worker calling images (a service) whose
+# internals touch the validator is exactly the intended architecture.
+# Only a DIRECT internal import by the app layer breaks the boundary.
+allow_indirect_imports = true
+source_modules = ["marp_slides.controller", "marp_slides.task_worker"]
+forbidden_modules = [
+    "marp_slides.builder",
+    "marp_slides.elements",
+    "marp_slides.validator",
+    "marp_slides.parser",
+    "marp_slides.slides",
+    "marp_slides.slide_blocks",
+    "marp_slides.directives",
+    "marp_slides.inline",
+    "marp_slides.blocks",
+    "marp_slides.geometry",
+    "marp_slides.marp_cli",
+]
+
+[[tool.importlinter.contracts]]
+name = "The deck core stays framework-free (testable without Nextcloud)"
+type = "forbidden"
+source_modules = [
+    "marp_slides.deck_pipeline",
+    "marp_slides.marp_cli",
+    "marp_slides.editable_pptx",
+    "marp_slides.builder",
+    "marp_slides.elements",
+    "marp_slides.validator",
+    "marp_slides.parser",
+    "marp_slides.slides",
+    "marp_slides.slide_blocks",
+    "marp_slides.directives",
+    "marp_slides.inline",
+    "marp_slides.blocks",
+    "marp_slides.constructs",
+    "marp_slides.geometry",
+]
+forbidden_modules = ["nc_py_api", "fastapi", "niquests"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "--strict-markers --strict-config"
+
+[tool.vulture]
+# Dead-code tripwire at high confidence only (90: unused imports and
+# unreachable code, the classes where vulture has no false-positive mode).
+# Found nothing on adoption: the gate exists to catch future rot.
+min_confidence = 90
+paths = ["marp_slides", "main.py"]
