@@ -43,6 +43,8 @@ occ app_api:app:register marp_slides \
 
 Then ask for a deck from the Assistant or any chat tool that schedules TaskProcessing work; the download link comes back when the task reports.
 
+Editing a generated deck in place needs an office integration. Where Collabora's viewer app is present, the pptx opens and edits there; git-based Nextcloud 35 no longer ships that app, so office files do not open in-app until the platform's viewer migration lands on the Nextcloud 36 line. Pinning the viewer app at v35.0.2 restores it in the meantime (nextcloud/richdocuments#6218). The deck itself is unaffected: the download opens and edits in PowerPoint, OnlyOffice or desktop LibreOffice, and the html and pdf outputs need no office integration at all.
+
 ## Task contract
 
 The task type takes a required text `prompt`, an optional `output_format` enum (`pptx` default, `html`, `pdf`), and an optional `images` list of Nextcloud file ids the server access-checks for the requesting user. It returns the generated deck as a file plus the retained Marp Markdown source. The canonical shape lives in `marp_slides/task_definition.py`.
