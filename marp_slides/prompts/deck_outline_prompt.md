@@ -28,4 +28,5 @@ Rules:
 - "footer" and "header" are short single-line texts shown on every slide; omit them unless the deck needs them.
 - "slides" plans the deck in order: the first slide opens the deck, the last closes it. Plan 6 to 12 slides unless the user's request explicitly asks for a different number.
 - Every slide's "title" is short (it becomes the slide's heading), its "summary" names the concrete points the slide must cover, and "has_image" is true only when that slide should show one of the task's provided images: {image_count_clause}
+- When the task provides images, EVERY image MUST appear on at least one slide. Plan a dedicated slide for each image that does not fit naturally into a content slide. The deck is rejected if any provided image is never referenced.
 - Write the plan in the same language as the user's request.

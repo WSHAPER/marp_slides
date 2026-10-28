@@ -159,15 +159,25 @@ def _image_count_clause(image_count: int) -> str:
 
 
 def build_outline_prompt(
-    user_prompt: str, theme: str = THEME_AUTO, image_count: int = 0
+    user_prompt: str,
+    theme: str = THEME_AUTO,
+    image_count: int = 0,
+    max_slides: int = 8,
 ) -> str:
     """Combine the outline system prompt with the user request for the
     Phase 1 nested ``core:text2text`` task. ``theme`` is the task's
     validated theme input: ``'auto'`` (the default) keeps the
     pick-the-best-fit rule; any other value appends the hard
     user-requirement clause from prompts/outline_theme_override.md."""
-    system_prompt = _fill(
-        OUTLINE_SYSTEM_PROMPT, image_count_clause=_image_count_clause(image_count)
+    slide_count_clause = (
+        f"\nTarget deck length: about {max_slides} slides "
+        "(fewer is fine, more only if the topic truly needs it).\n"
+    )
+    system_prompt = (
+        _fill(
+            OUTLINE_SYSTEM_PROMPT, image_count_clause=_image_count_clause(image_count)
+        )
+        + slide_count_clause
     )
     if theme != THEME_AUTO:
         system_prompt = (
@@ -250,6 +260,9 @@ def _parse_background_color(data: dict[str, Any]) -> str | None:
 def _parse_background_image(data: dict[str, Any], image_count: int) -> str | None:
     if "backgroundImage" not in data or data["backgroundImage"] is None:
         return None
+    raw = data["backgroundImage"]
+    if isinstance(raw, str) and not raw.strip():
+        return None  # empty string means "no background image", not a rejection
     try:
         index = validate_background_image_reference(data["backgroundImage"])
     except UnsupportedConstructError as exc:
@@ -420,6 +433,9 @@ def extract_slide_markdown(llm_output: object) -> str:
             "text provider."
         )
     text = llm_output.strip()
+    # strip thinking-model artifacts (<think>...</think> blocks) before any
+    # other processing; models sometimes leak their reasoning wrapper
+    text = re.sub(r"</?think>", "", text)
     fence = _FENCE_WRAP_RE.match(text)
     if fence is not None:
         text = fence.group("content").strip()

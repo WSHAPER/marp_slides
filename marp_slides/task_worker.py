@@ -237,17 +237,27 @@ def _total_llm_cap_error(cap_s: int) -> DeckError:
     )
 
 
+#: The minimum seconds a round needs to be worth scheduling: when less
+#: than this remains of the total budget, fail with the budget-exhausted
+#: error instead of scheduling a round the model cannot finish (which
+#: surfaces as a confusing "stalled" message).
+_MINIMUM_VIABLE_ROUND_S = 120
+
+
 def _remaining_llm_timeout(deadline: float, settings: Settings) -> int:
     """The timeout for the NEXT LLM round: never more than the per-round
     cap, never more than what is left of the shared total budget; an
-    exhausted budget fails the task with the actionable timeout error."""
+    exhausted budget fails the task with the actionable timeout error.
+    A budget with less than _MINIMUM_VIABLE_ROUND_S left also fails:
+    the 9B model can take 60-90 seconds per slide, so a 60-second round
+    is an impossible deadline that masquerades as a stall."""
     remaining = deadline - monotonic()
-    if remaining <= 0:
+    if remaining < _MINIMUM_VIABLE_ROUND_S:
         raise _total_llm_cap_error(settings.total_llm_timeout_s)
     return min(settings.llm_timeout_s, int(remaining))
 
 
-def _generate_outline(
+def _generate_outline(  # noqa: PLR0913 (internal dispatch; params mirror the pipeline context)
     nc: NextcloudApp,
     prompt: str,
     theme: str,
@@ -255,7 +265,9 @@ def _generate_outline(
     task_id: int,
     image_count: int,
     deadline: float,
+    *,
     feedback: str | None = None,
+    max_slides: int = 8,
 ) -> DeckOutline:
     """Phase 1: one short constrained LLM call returns the deck plan as a
     JSON outline (slide titles + summaries + deck metadata; ~500 tokens, so
@@ -269,7 +281,9 @@ def _generate_outline(
     attempts = 2 if settings.retry_llm else 1
     last_error = DeckError("outline generation failed")
     for attempt in range(1, attempts + 1):
-        llm_input = build_outline_prompt(prompt, theme, image_count)
+        llm_input = build_outline_prompt(
+            prompt, theme, image_count, max_slides=max_slides
+        )
         if feedback is not None:
             llm_input = f"{llm_input}\n\n{feedback}"
         if attempt > 1:
@@ -408,6 +422,18 @@ def _generate_slide(
     raise last_error
 
 
+def _validate_max_slides(raw: object, settings: Settings) -> int:
+    """Validate the optional max_slides task input: 1 to the hard cap
+    (settings.max_slides), default 8."""
+    if raw is None:
+        return 8
+    try:
+        value: int = int(str(raw))
+    except (TypeError, ValueError):
+        return 8
+    return max(1, min(value, settings.max_slides))
+
+
 def _author_validated_deck(
     nc: NextcloudApp,
     prompt: str,
@@ -415,6 +441,7 @@ def _author_validated_deck(
     settings: Settings,
     task_id: int,
     image_file_ids: list[int],
+    max_slides: int = 8,
 ) -> tuple[ValidatedDeck, str]:
     """Author the deck in two phases and strictly validate the result.
 
@@ -455,7 +482,8 @@ def _author_validated_deck(
             task_id,
             len(image_file_ids),
             deadline,
-            feedback,
+            feedback=feedback,
+            max_slides=max_slides,
         )
         LOGGER.info(
             "Task %s: outline ready (%d slides, theme %s)",
@@ -870,6 +898,7 @@ def _generate_deck(
         task_input.get("input", task_input.get("prompt")), settings.max_prompt_chars
     )
     image_file_ids = validate_images_slot(task_input.get("images"))
+    _validate_max_slides(task_input.get("max_slides"), settings)
 
     validated, markdown = _author_validated_deck(
         nc, prompt, theme, settings, task_id, image_file_ids

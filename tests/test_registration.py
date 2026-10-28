@@ -40,9 +40,10 @@ def test_provider_shape() -> None:
     assert [s.name for s in provider.optional_input_shape] == [
         "output_format",
         "theme",
+        "max_slides",
         "images",
     ]
-    fmt_slot, theme_slot, images_slot = provider.optional_input_shape
+    fmt_slot, theme_slot, _max_slides, images_slot = provider.optional_input_shape
     assert fmt_slot.shape_type == ShapeType.ENUM
     enum_values = provider.optional_input_shape_enum_values["output_format"]
     # nc_py_api 0.30.3 ships optional_input_shape_enum_values as a LIST per
@@ -58,6 +59,7 @@ def test_provider_shape() -> None:
     assert provider.optional_input_shape_defaults == {
         "output_format": "pptx",
         "theme": "auto",
+        "max_slides": 8,
     }
     assert theme_slot.shape_type == ShapeType.ENUM
     assert images_slot.shape_type == ShapeType.LIST_OF_FILES
@@ -79,7 +81,7 @@ def test_theme_slot_enum_mirrors_the_constructs_constant() -> None:
 
 def test_theme_description_states_values_and_pptx_limit() -> None:
     provider = task_definition.PROVIDER
-    (_fmt, theme_slot, _images) = provider.optional_input_shape
+    (_fmt, theme_slot, _ms, _images) = provider.optional_input_shape
     assert "'auto'" in theme_slot.description
     for name in ("default", "gaia", "uncover"):
         assert f"'{name}'" in theme_slot.description
@@ -88,17 +90,17 @@ def test_theme_description_states_values_and_pptx_limit() -> None:
 
 def test_enum_description_is_one_clean_sentence() -> None:
     provider = task_definition.PROVIDER
-    (fmt_slot, _theme, _images) = provider.optional_input_shape
+    (fmt, _theme, _ms, _images) = provider.optional_input_shape
     # one short human sentence: the dropdown options already enumerate the
     # formats, so the label only states the purpose and the default
-    assert fmt_slot.description == (
+    assert fmt.description == (
         "Output file format for the deck; 'pptx' is the default."
     )
 
 
 def test_images_slot_description_is_one_clean_sentence() -> None:
     provider = task_definition.PROVIDER
-    (_fmt, _theme, images_slot) = provider.optional_input_shape
+    (_fmt, _theme, _ms, images_slot) = provider.optional_input_shape
     assert images_slot.description == (
         "Optional images to place in the deck (PNG or JPEG, max 5 MB "
         "each; SVG is not supported)."

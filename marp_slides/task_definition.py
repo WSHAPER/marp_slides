@@ -117,6 +117,14 @@ PROVIDER = TaskProcessingProvider(
             shape_type=ShapeType.ENUM,
         ),
         ShapeDescriptor(
+            name="max_slides",
+            description=(
+                "Target deck length; the model aims for this many slides "
+                "(8 is the default)."
+            ),
+            shape_type=ShapeType.NUMBER,
+        ),
+        ShapeDescriptor(
             name="images",
             description=(
                 "Optional images to place in the deck (PNG or JPEG, max 5 MB "
@@ -135,6 +143,7 @@ PROVIDER = TaskProcessingProvider(
     optional_input_shape_defaults={
         "output_format": OUTPUT_FORMAT_VALUES[0],
         "theme": THEME_AUTO,
+        "max_slides": 8,
     },
     optional_output_shape=[
         ShapeDescriptor(
