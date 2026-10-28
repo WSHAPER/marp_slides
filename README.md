@@ -47,9 +47,9 @@ Editing a generated deck in place needs an office integration. Where Collabora's
 
 ## Task contract
 
-The task type takes a required text `prompt`, an optional `output_format` enum (`pptx` default, `html`, `pdf`), and an optional `images` list of Nextcloud file ids the server access-checks for the requesting user. It returns the generated deck as a file plus the retained Marp Markdown source. The canonical shape lives in `marp_slides/task_definition.py`.
+The task type takes a required text `prompt`, an optional `output_format` enum (`pptx` default, `html`, `pdf`), an optional `theme` enum (`auto` default, or one of the three themes bundled with Marp: `default`, `gaia`, `uncover`), and an optional `images` list of Nextcloud file ids the server access-checks for the requesting user. It returns the generated deck as a file plus the retained Marp Markdown source. The canonical shape lives in `marp_slides/task_definition.py`.
 
-`output_format` is a real ENUM shape with three registered values plus a default of `pptx`, and it is validated again inside the provider.
+`output_format` is a real ENUM shape with three registered values plus a default of `pptx`, and it is validated again inside the provider. So is `theme`: `auto` lets the model pick the best-fitting theme; any other value is a hard requirement the authoring prompt states and the validator enforces against the deck's frontmatter theme.
 
 ### Constructs
 
@@ -67,7 +67,7 @@ The task type takes a required text `prompt`, an optional `output_format` enum (
 - deck-level `<!-- footer: ... -->` and `<!-- header: ... -->` chrome on every slide, with per-slide `_footer` and `_header` overrides
 - `paginate: true` as real slide-number fields, deck-wide and per-slide solid background colors, two-column slides via `<!-- columns: 2 -->` plus `<!-- column-break -->`
 - `#file:N` image references resolved against the task's `images` input, downloaded with sniffed type and size caps (PNG or JPEG, 5 MB)
-- YAML frontmatter with exactly: `marp: true` (the literal scalar, YAML 1.1 spellings like `yes` reject on purpose), `title` (a string), `theme: default`, optional `paginate` and `backgroundColor`
+- YAML frontmatter with exactly: `marp: true` (the literal scalar, YAML 1.1 spellings like `yes` reject on purpose), `title` (a string), `theme` (one of the three bundled Marp themes), optional `paginate` and `backgroundColor`
 
 Anything outside the list is rejected at validation time with an error that tells the model what to do instead: raw HTML, remote image URLs, math equations (`$...$` and `$$...$$` LaTeX; the message says to write the formula as plain text), strikethrough, underscore emphasis, footnotes, link schemes outside http/https, control characters in URLs, ragged tables, tables on column slides, oversized code blocks, unknown frontmatter keys, stray `---` separators. There is no image fallback and no render-mode knob.
 
@@ -100,11 +100,13 @@ The codebase is small enough to read top-down.
 
 **pptx** (default) is rebuilt as native content with python-pptx on 16:9 title and Title+Content layouts: headings become title placeholders, body placeholders carry paragraphs, lists and quotes, code fences and tables become sequential native shapes, column slides become two side-by-side text boxes.
 
-**html** is rendered by marp CLI as one standalone file: theme CSS and the viewer JavaScript are inlined, with no external stylesheet or script assets. Speaker notes stay inside as hidden elements and are available in the bundled presenter view. No browser is needed or spawned; the conversion is Node-only.
+**html** is rendered by marp CLI as one standalone file: theme CSS and the viewer JavaScript are inlined, with no external stylesheet or script assets. Speaker notes stay inside as hidden elements and are available in the bundled presenter view. No browser is needed or spawned; the conversion is Node-only. Task `#file:N` images are materialized into the throwaway render workdir and embedded, with marp's local-files read enabled for that workdir only (it holds nothing but the app's own validated files).
 
-**pdf** is the one format that uses the Chromium bundled in the base image, driven by marp CLI through puppeteer-core. The browserless syntax gate runs first, so malformed Markdown fails fast and only a validated deck reaches the slower browser render. Speaker notes are not part of marp's default PDF output (the retained Markdown source carries them); hyperlinks survive as clickable annotations.
+**pdf** is the one format that uses the Chromium bundled in the base image, driven by marp CLI through puppeteer-core. The browserless syntax gate runs first, so malformed Markdown fails fast and only a validated deck reaches the slower browser render. Speaker notes are not part of marp's default PDF output (the retained Markdown source carries them); hyperlinks survive as clickable annotations. Task images are materialized into the render workdir exactly as for html.
 
 ODP is deliberately not offered: neither the native builder nor marp CLI can emit it. If ODF output ever becomes a requirement, the path is PPTX to ODP conversion via Collabora.
+
+The optional `theme` input styles the html and pdf outputs: `auto` (the default) has the model pick the best-fitting of the bundled `default`, `gaia` and `uncover` themes, any other value is a fixed requirement; the pptx build ignores it, since native decks carry no Marp theme.
 
 Every task also uploads the final validated Marp Markdown as `<deckname>.md` next to the deck, so a later turn can refeed the original prompt plus this source for small edits instead of a full recompute.
 

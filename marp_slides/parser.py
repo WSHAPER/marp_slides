@@ -99,7 +99,11 @@ def _collect_link_def_line(line: str, refs: dict[str, str]) -> None:
 
 
 def parse_deck(
-    markdown: str, *, paginate: bool = False, background: str | None = None
+    markdown: str,
+    *,
+    paginate: bool = False,
+    background: str | None = None,
+    background_image: int | None = None,
 ) -> ParsedDeck:
     """Parse a validated-frontmatter Marp deck into the supported construct
     tree, raising :class:`UnsupportedConstructError` for anything outside
@@ -108,10 +112,11 @@ def parse_deck(
     including the model-natural 'directives + ---' shape normalized by
     :func:`marp_slides.directives.normalize_preamble_separators`) or from the
     first slide's region (between the frontmatter and the first '---'
-    separator). ``paginate`` and ``background`` carry the validated
-    frontmatter values (the YAML block itself is stripped before parsing); a
-    backgroundColor comment directive in the preamble is equivalent to the
-    frontmatter key, so setting both is a duplicate and rejected."""
+    separator). ``paginate``, ``background`` and ``background_image`` carry
+    the validated frontmatter values (the YAML block itself is stripped
+    before parsing); a backgroundColor comment directive in the preamble is
+    equivalent to the frontmatter key, so setting both is a duplicate and
+    rejected."""
     directives: Directives = {}
     bodies = split_slides(markdown)
     link_refs = collect_link_refs(bodies)
@@ -132,6 +137,7 @@ def parse_deck(
         header=directives.get("header", ()),
         paginate=paginate,
         background=deck_background,
+        background_image=background_image,
     )
 
 

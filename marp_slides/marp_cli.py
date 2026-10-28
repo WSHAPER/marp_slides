@@ -3,6 +3,10 @@
 Every marp conversion (the browserless syntax gate, the standalone-HTML
 render, the PDF render) runs under the same strict configuration and the
 same safety flags, so no output format can ever be looser than the gate.
+The one deliberate per-invocation difference: render conversions whose
+deck images were materialized into the workdir pass
+``--allow-local-files`` (see :func:`_marp_convert` for the containment
+argument); the gate never does.
 """
 
 from __future__ import annotations
@@ -67,6 +71,7 @@ def render_deck_html(
     marp_timeout_s: int = 120,
     marp_bin: str = "marp",
     runner: Runner = subprocess.run,
+    allow_local_files: bool = False,
 ) -> bytes:
     """Render a validated deck to the deliverable standalone HTML file
     (browserless: Node only, no Chromium is spawned, verified empirically
@@ -78,6 +83,10 @@ def render_deck_html(
     (marp's default; visible in the bundled presenter view). The same strict
     flags as the syntax gate apply, so raw HTML authored in the Markdown is
     rendered as escaped text, never live markup.
+
+    ``allow_local_files`` is set by the caller only when the deck's
+    ``#file:N`` images were already materialized into ``workdir`` (see
+    :func:`marp_slides.deck_pipeline.render_deck_html`).
     """
     return _marp_convert(
         markdown,
@@ -87,6 +96,7 @@ def render_deck_html(
         runner,
         stage="HTML rendering",
         out_name="deck.html",
+        allow_local_files=allow_local_files,
     )
 
 
@@ -96,6 +106,7 @@ def render_deck_pdf(
     marp_timeout_s: int = 120,
     marp_bin: str = "marp",
     runner: Runner = subprocess.run,
+    allow_local_files: bool = False,
 ) -> bytes:
     """Render a validated deck to the deliverable PDF document.
 
@@ -109,6 +120,10 @@ def render_deck_pdf(
     retained ``slide_deck_source`` Markdown carries them. The strict flags
     are identical to the gate/HTML render, and the output format is
     extension-driven (``-o deck.pdf``).
+
+    ``allow_local_files`` is set by the caller only when the deck's
+    ``#file:N`` images were already materialized into ``workdir`` (see
+    :func:`marp_slides.deck_pipeline.render_deck_pdf`).
     """
     return _marp_convert(
         markdown,
@@ -118,6 +133,7 @@ def render_deck_pdf(
         runner,
         stage="PDF rendering",
         out_name="deck.pdf",
+        allow_local_files=allow_local_files,
     )
 
 
@@ -129,6 +145,7 @@ def _marp_convert(
     runner: Runner,
     stage: str,
     out_name: str,
+    allow_local_files: bool = False,
 ) -> bytes:
     """Shared strict marp-cli conversion step (Node-only for HTML output;
     ``.pdf`` additionally drives the bundled Chromium via puppeteer-core).
@@ -136,11 +153,21 @@ def _marp_convert(
     Writes the deck plus the strict ``.marprc`` into ``workdir`` and runs
     ``marp deck.md -o <out_name>`` under the same safety flags used
     everywhere: ``html: false`` + ``looseYAML: false`` via ``--config-file``
-    and ``--no-html`` (raw HTML authored in the Markdown stays escaped text),
-    never ``--allow-local-files`` (it governs reading local files into the
-    deck, not writing the output; verified against ``marp --help``). The
-    output format is extension-driven: marp-cli infers PDF from the
+    and ``--no-html`` (raw HTML authored in the Markdown stays escaped text).
+    The output format is extension-driven: marp-cli infers PDF from the
     ``-o deck.pdf`` target (verified empirically; no ``--pdf`` flag needed).
+
+    ``allow_local_files`` appends ``--allow-local-files`` (the flag governs
+    reading local files into the deck, not writing the output; verified
+    against ``marp --help``). ONLY the html/pdf render conversions ever set
+    it, and only when the deck's ``#file:N`` images were materialized into
+    ``workdir`` first. The containment argument: the workdir is a throwaway
+    TemporaryDirectory whose only content is files we ourselves wrote (the
+    validated deck Markdown, the strict ``.marprc`` and our own downloaded,
+    type-sniffed, size-capped image blobs), so the path-traversal class the
+    flag guards against has no attack surface here. The browserless syntax
+    gate never sets it and keeps running imageless.
+
     Returns the output file bytes. Raises :class:`DeckError` with the
     marp-cli output included, so an upstream agent can self-correct from
     the error text.
@@ -161,6 +188,8 @@ def _marp_convert(
         str(marprc_path),
         "--no-html",
     ]
+    if allow_local_files:
+        argv.append("--allow-local-files")
     result = _run_marp(runner, argv, marp_timeout_s, stage)
     if result.returncode != 0 or not out_path.exists():
         raise DeckError(

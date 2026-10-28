@@ -1,11 +1,13 @@
 """marp-cli HTML gate + HTML/PDF renders: argv construction, safety, error
-surfacing."""
+surfacing, and the render-side image materialization."""
 
 from __future__ import annotations
 
+import io
 import subprocess
 
 import pytest
+from PIL import Image
 
 from marp_slides.deck_pipeline import (
     MARPRC_CONTENT,
@@ -13,6 +15,23 @@ from marp_slides.deck_pipeline import (
     marp_html_gate,
     render_deck_html,
     render_deck_pdf,
+)
+
+
+def png_bytes() -> bytes:
+    buf = io.BytesIO()
+    Image.new("RGB", (8, 8), "red").save(buf, "PNG")
+    return buf.getvalue()
+
+
+DECK_WITH_IMAGE = "---\nmarp: true\ntitle: t\n---\n\n# T\n\n![The diagram](#file:1)\n"
+
+#: Both background forms plus a content image: the render copy must carry
+#: the deck-wide directive in Marp's url(...) value form and the per-slide
+#: bg alt keyword untouched (marp applies its native background treatment).
+DECK_WITH_BACKGROUND = (
+    "---\nmarp: true\ntitle: t\nbackgroundImage: '#file:1'\n---\n\n"
+    "# T\n\ncontent\n\n![pic](#file:1)\n\n---\n\n## Two\n\n![bg cover](#file:2)\n"
 )
 
 
@@ -245,3 +264,108 @@ def test_pdf_argv_matches_gate_except_output_target(valid_deck, tmp_path) -> Non
 
     assert with_output(pdf_argv, str(tmp_path / "deck.html")) == gate_argv
     assert str(tmp_path / "deck.pdf") in pdf_argv
+
+
+# --- v0.1.x: renders materialize deck images into the workdir ---------------------
+
+
+def test_render_html_inlines_images_as_data_uris(tmp_path) -> None:
+    """With blobs the render copy handed to marp carries the bytes as an
+    inline data: URI (never #file:1), because marp-cli does not embed
+    workdir-relative images into its HTML output."""
+    import base64
+
+    runner = FakeRunner()
+    blob = png_bytes()
+    html = render_deck_html(
+        DECK_WITH_IMAGE, tmp_path, runner=runner, image_blobs={1: blob}
+    )
+    assert html == b"<html></html>"
+    (argv,) = runner.argvs
+    assert "--allow-local-files" not in argv  # nothing local left to read
+    assert "--no-html" in argv  # the strict flags still apply
+    uri = f"data:image/png;base64,{base64.b64encode(blob).decode()}"
+    assert f"![The diagram]({uri})" in (tmp_path / "deck.md").read_text()
+    assert "#file:1" not in (tmp_path / "deck.md").read_text()
+
+
+def test_render_pdf_inlines_images_as_data_uris(tmp_path) -> None:
+    import base64
+
+    runner = FakePdfRunner()
+    blob = png_bytes()
+    pdf = render_deck_pdf(
+        DECK_WITH_IMAGE, tmp_path, runner=runner, image_blobs={1: blob}
+    )
+    assert pdf == b"%PDF-1.7 fake"
+    (argv,) = runner.argvs
+    assert "--allow-local-files" not in argv
+    uri = f"data:image/png;base64,{base64.b64encode(blob).decode()}"
+    assert f"![The diagram]({uri})" in (tmp_path / "deck.md").read_text()
+
+
+@pytest.mark.parametrize("blobs", [None, {}])
+def test_render_without_blobs_stays_imageless_and_flagless(
+    valid_deck: str, tmp_path, blobs
+) -> None:
+    """No blobs (None or empty): nothing materialized, no local-files flag,
+    and deck.md is the markdown verbatim."""
+    html_runner, pdf_runner = FakeRunner(), FakePdfRunner()
+    render_deck_html(valid_deck, tmp_path, runner=html_runner, image_blobs=blobs)
+    render_deck_pdf(valid_deck, tmp_path, runner=pdf_runner, image_blobs=blobs)
+    for runner in (html_runner, pdf_runner):
+        (argv,) = runner.argvs
+        assert "--allow-local-files" not in argv
+    assert (tmp_path / "deck.md").read_text() == valid_deck
+    assert [p.name for p in tmp_path.iterdir() if p.name.startswith("file-")] == []
+
+
+def test_gate_never_takes_blobs_or_the_flag(valid_deck: str, tmp_path) -> None:
+    """The browserless syntax gate keeps its imageless, flagless contract:
+    it takes no image_blobs parameter at all (a #file:N deck gates on the
+    original markdown; the render materializes afterwards)."""
+    runner = FakeRunner()
+    marp_html_gate(DECK_WITH_IMAGE, tmp_path, runner=runner)
+    (argv,) = runner.argvs
+    assert "--allow-local-files" not in argv
+    assert "#file:1" in (tmp_path / "deck.md").read_text()
+
+
+# --- backgrounds ride the data-URI materialization -----------------------------------
+
+
+def test_render_html_inlines_backgrounds_as_data_uris(tmp_path) -> None:
+    """The deck-wide backgroundImage frontmatter value becomes Marp's
+    url(data:...) directive value and the per-slide '![bg cover]' alt
+    keyword survives verbatim in the render copy (verified against real
+    marp-cli: sections get data-background-image/background-size)."""
+    import base64
+
+    runner = FakeRunner()
+    blob = png_bytes()
+    render_deck_html(
+        DECK_WITH_BACKGROUND, tmp_path, runner=runner, image_blobs={1: blob, 2: blob}
+    )
+    (argv,) = runner.argvs
+    assert "--allow-local-files" not in argv  # data URIs, nothing local
+    uri = f"data:image/png;base64,{base64.b64encode(blob).decode()}"
+    rendered = (tmp_path / "deck.md").read_text()
+    assert f"backgroundImage: 'url({uri})'" in rendered
+    assert f"![bg cover]({uri})" in rendered
+    assert f"![pic]({uri})" in rendered
+    assert "#file:" not in rendered
+
+
+def test_render_pdf_inlines_backgrounds_as_data_uris(tmp_path) -> None:
+    import base64
+
+    runner = FakePdfRunner()
+    blob = png_bytes()
+    render_deck_pdf(
+        DECK_WITH_BACKGROUND, tmp_path, runner=runner, image_blobs={1: blob, 2: blob}
+    )
+    uri = f"data:image/png;base64,{base64.b64encode(blob).decode()}"
+    rendered = (tmp_path / "deck.md").read_text()
+    assert f"backgroundImage: 'url({uri})'" in rendered
+    assert f"![bg cover]({uri})" in rendered
+    assert "#file:" not in rendered

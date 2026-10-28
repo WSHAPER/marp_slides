@@ -39,7 +39,7 @@ def test_build_llm_prompt_contains_rules_and_request() -> None:
     prompt = build_llm_prompt("A deck about bees")
     assert prompt.startswith(DECK_SYSTEM_PROMPT.rstrip())
     assert prompt.rstrip().endswith("A deck about bees")
-    for rule in ("marp: true", "theme: default", "6 to 12 slides", "same language"):
+    for rule in ("marp: true", "Deck themes", "6 to 12 slides", "same language"):
         assert rule in prompt
 
 
@@ -112,3 +112,33 @@ def test_prompt_embeds_the_canonical_skeleton() -> None:
     # the skeleton's teaching points: directives right after the frontmatter,
     # blank line before the first title, blank-line + '---' separators
     assert "follow this shape exactly" in DECK_SYSTEM_PROMPT
+
+
+def test_system_prompt_teaches_the_frontmatter_theme_key() -> None:
+    """v0.1.x: the frontmatter rule takes a theme NAME picked from the
+    deck-themes section, not a fixed value (the choice instruction and the
+    three bundled names come from MARP_THEMES, pinned in test_theme.py)."""
+    assert "theme: <the name of the theme you picked>" in DECK_SYSTEM_PROMPT
+
+
+def test_system_prompt_teaches_background_images() -> None:
+    """Background images: both forms are taught with one example each, the
+    size-keyword set matches the validator, and the PPTX limitation is
+    stated so the model keeps backgrounds decorative."""
+    for fragment in (
+        "backgroundImage: '#file:N'",  # deck-wide frontmatter example
+        "![bg](#file:N)",  # per-slide example
+        "![bg cover](#file:N)",  # size-keyword example
+        "contain, fit and auto also work",  # the rest of the keyword set
+        "at most one background image per slide",
+        "editable PPTX build cannot show them",  # the PPTX limitation
+        "html and pdf output only",
+    ):
+        assert fragment in DECK_SYSTEM_PROMPT, f"prompt lost bg rule: {fragment}"
+    # the not-supported list teaches the unsupported bg keywords and keeps
+    # the frontmatter key allow-list current
+    assert "'![bg left]'" in DECK_SYSTEM_PROMPT
+    assert (
+        "frontmatter key other than marp, title, theme, paginate, "
+        "backgroundColor and backgroundImage" in DECK_SYSTEM_PROMPT
+    )

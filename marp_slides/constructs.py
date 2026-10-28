@@ -117,17 +117,74 @@ SUPPORTED_CONSTRUCTS: tuple[tuple[str, str], ...] = (
         ),
     ),
     (
+        "background_image",
+        (
+            "background images from the task's images, shown in html and pdf output "
+            "only (the editable PPTX build ignores them): deck-wide via the optional "
+            "frontmatter key \"backgroundImage: '#file:N'\", per-slide via "
+            "'![bg](#file:N)' on a line of its own, optionally with a size keyword "
+            "('![bg cover](#file:N)', also contain, fit, auto); N is the 1-based "
+            "position in the task's images input list, at most one per slide"
+        ),
+    ),
+    (
         "frontmatter",
         (
             "YAML frontmatter with exactly these keys: marp (must be true), title, theme "
-            "(must be 'default'), paginate (optional, true/false), backgroundColor "
-            "(optional, '#RRGGBB')"
+            "(one of the three bundled Marp themes), paginate (optional, true/false), "
+            "backgroundColor (optional, '#RRGGBB'), backgroundImage (optional, "
+            "'#file:N')"
         ),
     ),
 )
 
-ALLOWED_FRONTMATTER_KEYS = ("marp", "title", "theme", "paginate", "backgroundColor")
-ALLOWED_THEME = "default"
+ALLOWED_FRONTMATTER_KEYS = (
+    "marp",
+    "title",
+    "theme",
+    "paginate",
+    "backgroundColor",
+    "backgroundImage",
+)
+
+#: The ``auto`` theme input: the model picks the best-fitting theme and
+#: writes the chosen name into the frontmatter theme key.
+THEME_AUTO = "auto"
+
+#: The deck theme contract: the three themes bundled with marp-core, name +
+#: 1-2 sentence description. Single source of truth: the validator's
+#: allow-list and the deck-authoring prompt's theme instructions are both
+#: derived from it, so prompt and validation cannot disagree. Custom CSS,
+#: background-image themes and generated themes are out of scope.
+MARP_THEMES: tuple[tuple[str, str], ...] = (
+    (
+        "default",
+        (
+            "the classic light Marp theme: clean and businesslike, a safe fit for "
+            "reports, reviews and technical decks"
+        ),
+    ),
+    (
+        "gaia",
+        (
+            "a bold theme with strong accent colors and a distinct look, for "
+            "motivational, creative or marketing decks"
+        ),
+    ),
+    (
+        "uncover",
+        (
+            "a minimal centered theme with large type and generous spacing, for "
+            "storytelling, pitches and big statements"
+        ),
+    ),
+)
+
+#: Allowed frontmatter theme values (the MARP_THEMES names).
+ALLOWED_THEMES = tuple(name for name, _description in MARP_THEMES)
+
+#: Accepted ``theme`` task-input values: ``auto`` plus the theme names.
+THEME_VALUES = (THEME_AUTO, *ALLOWED_THEMES)
 
 #: Link schemes that can become native PowerPoint hyperlink runs. Everything
 #: else (javascript:, data:, mailto:, ftp:, schemeless relative URLs, ...) is
@@ -138,6 +195,11 @@ ALLOWED_LINK_SCHEMES = ("http", "https")
 #: case-insensitive (normalized to uppercase). Everything else ('#12345',
 #: '#1234567', 'red', 'rgb(...)') is rejected with an actionable message.
 _HEX_COLOR_RE = re.compile(r"^#([0-9A-Fa-f]{6})$")
+
+#: The deck-wide background image reference, exactly: ``#file:N`` as the
+#: VALUE of the frontmatter ``backgroundImage`` key (the same 1-based file-id
+#: reference as content images, so the images-input bounds check covers it).
+_FILE_REFERENCE_VALUE_RE = re.compile(r"^#file:(\d+)$")
 
 
 class UnsupportedConstructError(ValueError):
@@ -161,3 +223,30 @@ def validate_hex_color(value: object) -> str:
             "Named colors and rgb() values are not supported."
         )
     return match.group(1).upper()
+
+
+def validate_background_image_reference(value: object) -> int:
+    """Validate the frontmatter ``backgroundImage`` value; returns the 1-based
+    images-input index it references. Raises
+    :class:`UnsupportedConstructError` with an actionable message."""
+    if not isinstance(value, str):
+        raise UnsupportedConstructError(
+            "Unsupported construct: backgroundImage must be a QUOTED '#file:N' string "
+            "like \"backgroundImage: '#file:2'\" (an unquoted '#' starts a YAML "
+            f"comment), got {value!r}."
+        )
+    match = _FILE_REFERENCE_VALUE_RE.match(value.strip())
+    if match is None:
+        raise UnsupportedConstructError(
+            f"Unsupported construct: the backgroundImage value {value!r} does not "
+            "reference a task image. Use exactly '#file:N' (N is the 1-based "
+            "position in the task's images input), e.g. '#file:2'. Background "
+            "images from URLs or file paths are not supported."
+        )
+    index = int(match.group(1))
+    if index < 1:
+        raise UnsupportedConstructError(
+            f"Unsupported construct: the background image reference {value.strip()!r} "
+            "is not valid. N is 1-based, so the first image is '#file:1'."
+        )
+    return index

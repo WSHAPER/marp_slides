@@ -21,8 +21,9 @@ import yaml
 from .blocks import ParsedDeck
 from .constructs import (
     ALLOWED_FRONTMATTER_KEYS,
-    ALLOWED_THEME,
+    ALLOWED_THEMES,
     UnsupportedConstructError,
+    validate_background_image_reference,
     validate_hex_color,
 )
 from .directives import normalize_preamble_separators
@@ -157,7 +158,9 @@ def validate_deck(
             f"The generated deck is too large: {size} bytes (maximum is "
             f"{max_deck_bytes}). Please reduce the number of slides or their content."
         )
-    frontmatter, deck_background = _validate_frontmatter(markdown)
+    frontmatter, deck_background, deck_background_image = _validate_frontmatter(
+        markdown
+    )
     _reject_slide_count(markdown, max_slides)
     _reject_html(markdown)
     try:
@@ -165,6 +168,7 @@ def validate_deck(
             markdown,
             paginate=frontmatter.get("paginate") is True,
             background=deck_background,
+            background_image=deck_background_image,
         )
     except UnsupportedConstructError as exc:
         raise DeckError(str(exc)) from exc
@@ -179,9 +183,12 @@ def _reject_slide_count(markdown: str, max_slides: int) -> None:
         )
 
 
-def _validate_frontmatter(markdown: str) -> tuple[dict[str, Any], str | None]:
+def _validate_frontmatter(
+    markdown: str,
+) -> tuple[dict[str, Any], str | None, int | None]:
     """Parse and check the YAML frontmatter; returns (mapping, validated
-    deck-wide background color or None)."""
+    deck-wide background color or None, validated deck-wide background image
+    index or None)."""
     frontmatter_text, _body = split_frontmatter(markdown)
     if frontmatter_text is None:
         raise DeckError(
@@ -207,7 +214,8 @@ def _validate_frontmatter(markdown: str) -> tuple[dict[str, Any], str | None]:
     _reject_bad_theme(frontmatter.get("theme"))
     _reject_bad_paginate(frontmatter.get("paginate"))
     deck_background = _frontmatter_background(frontmatter)
-    return frontmatter, deck_background
+    deck_background_image = _frontmatter_background_image(frontmatter)
+    return frontmatter, deck_background, deck_background_image
 
 
 def _reject_bad_title(title: object) -> None:
@@ -234,10 +242,10 @@ def _reject_unknown_keys(frontmatter: dict[str, Any]) -> None:
 
 
 def _reject_bad_theme(theme: object) -> None:
-    if theme is not None and theme != ALLOWED_THEME:
+    if theme is not None and theme not in ALLOWED_THEMES:
         raise DeckError(
-            f"Invalid deck: theme {theme!r} is not supported; only theme: "
-            f"'{ALLOWED_THEME}' is."
+            f"Invalid deck: theme {theme!r} is not supported; use one of the three "
+            f"themes bundled with Marp: {list(ALLOWED_THEMES)}."
         )
 
 
@@ -254,5 +262,14 @@ def _frontmatter_background(frontmatter: dict[str, Any]) -> str | None:
         return None
     try:
         return validate_hex_color(frontmatter.get("backgroundColor"))
+    except UnsupportedConstructError as exc:
+        raise DeckError(f"Invalid deck: {exc}") from exc
+
+
+def _frontmatter_background_image(frontmatter: dict[str, Any]) -> int | None:
+    if "backgroundImage" not in frontmatter:
+        return None
+    try:
+        return validate_background_image_reference(frontmatter.get("backgroundImage"))
     except UnsupportedConstructError as exc:
         raise DeckError(f"Invalid deck: {exc}") from exc

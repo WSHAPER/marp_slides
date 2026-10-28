@@ -4,31 +4,37 @@ Everything in here is free of Nextcloud I/O: the deck-authoring system
 prompt (sourced from ``prompts/`` markdown and generated from the
 SUPPORTED_CONSTRUCTS single source of truth), prompt and output_format
 validation, extraction of Marp Markdown from raw LLM output, deck
-validation and the marp conversions (re-exported from their modules), and
-output file naming. The worker drives these pieces; nothing here knows
-about tasks or Nextcloud.
+validation and the marp conversions (the syntax gate re-exported from
+its module; the html/pdf renders composed here with the image
+materialization from :mod:`marp_slides.images`), and output file naming.
+The worker drives these pieces; nothing here knows about tasks or
+Nextcloud.
 """
 
 from __future__ import annotations
 
 import re
+import subprocess
 from collections.abc import Mapping
 from pathlib import Path
 from typing import Any
 
-from .constructs import SUPPORTED_CONSTRUCTS
+from .constructs import MARP_THEMES, SUPPORTED_CONSTRUCTS, THEME_AUTO, THEME_VALUES
+from .images import materialize_image_files
 from .marp_cli import (
     MARPRC_CONTENT,
+    Runner,
     marp_html_gate,
-    render_deck_html,
-    render_deck_pdf,
 )
+from .marp_cli import render_deck_html as marp_render_html
+from .marp_cli import render_deck_pdf as marp_render_pdf
 from .settings import OUTPUT_FORMAT_VALUES
 from .validator import DeckError, ValidatedDeck, count_slides, validate_deck
 
 __all__ = [
     "DECK_SKELETON",
     "DECK_SYSTEM_PROMPT",
+    "DECK_THEME_OVERRIDE_PROMPT",
     "MARPRC_CONTENT",
     "DeckError",
     "ValidatedDeck",
@@ -43,6 +49,8 @@ __all__ = [
     "validate_deck",
     "validate_output_format",
     "validate_prompt",
+    "validate_theme",
+    "validate_theme_override",
 ]
 
 _PROMPTS_DIR = Path(__file__).parent / "prompts"
@@ -56,6 +64,10 @@ def _supported_constructs_section() -> str:
     return "\n".join(f"- {label}" for _id, label in SUPPORTED_CONSTRUCTS)
 
 
+def _deck_themes_section() -> str:
+    return "\n".join(f"- {name}: {description}" for name, description in MARP_THEMES)
+
+
 #: Canonical deck skeleton embedded verbatim in the deck-authoring system
 #: prompt (a fixed example; the generated constructs list stays the single
 #: source of truth). It teaches exactly where the optional footer/header
@@ -65,24 +77,37 @@ def _supported_constructs_section() -> str:
 DECK_SKELETON = _load_prompt("deck_skeleton.md")
 
 #: The deck-authoring system prompt for the inner LLM. The "Supported
-#: constructs" section is generated from SUPPORTED_CONSTRUCTS (single source
-#: of truth shared with the validator), so prompt and validation cannot
+#: constructs" and "Deck themes" sections are generated from
+#: SUPPORTED_CONSTRUCTS and MARP_THEMES respectively (single sources of
+#: truth shared with the validator), so prompt and validation cannot
 #: disagree.
 DECK_SYSTEM_PROMPT = _load_prompt("deck_system_prompt.md").format(
     supported_constructs=_supported_constructs_section(),
+    deck_themes=_deck_themes_section(),
     deck_skeleton=DECK_SKELETON.strip(),
 )
 
+#: Per-task theme override clause (prompts/deck_theme_override.md), appended
+#: by :func:`build_llm_prompt` when the task's ``theme`` input is a hard
+#: user override rather than ``auto``.
+DECK_THEME_OVERRIDE_PROMPT = _load_prompt("deck_theme_override.md")
 
-# --- prompt / output_format -------------------------------------------------
+
+# --- prompt / output_format / theme -------------------------------------------
 
 
-def build_llm_prompt(user_prompt: str) -> str:
+def build_llm_prompt(user_prompt: str, theme: str = THEME_AUTO) -> str:
     """Combine the deck-authoring system prompt with the user prompt for the
-    nested ``core:text2text`` task."""
-    return (
-        f"{DECK_SYSTEM_PROMPT}\n\nUser's presentation request:\n{user_prompt.strip()}\n"
-    )
+    nested ``core:text2text`` task. ``theme`` is the task's validated theme
+    input: ``'auto'`` (the default) keeps the system prompt's
+    pick-the-best-fit rule; any other value appends the hard
+    user-requirement clause from prompts/deck_theme_override.md."""
+    system_prompt = DECK_SYSTEM_PROMPT
+    if theme != THEME_AUTO:
+        system_prompt = (
+            f"{system_prompt}\n\n{DECK_THEME_OVERRIDE_PROMPT.format(theme=theme)}"
+        )
+    return f"{system_prompt}\n\nUser's presentation request:\n{user_prompt.strip()}\n"
 
 
 def validate_prompt(prompt: object, max_chars: int = 8192) -> str:
@@ -122,6 +147,103 @@ def validate_output_format(
             "no ODP output."
         )
     return normalized
+
+
+def validate_theme(value: object, allowed: tuple[str, ...] = THEME_VALUES) -> str:
+    """Validate the optional ``theme`` input; returns the normalized value
+    (or ``'auto'`` default when absent, meaning the model picks the
+    best-fitting theme). The default derives from
+    :data:`marp_slides.constructs.THEME_VALUES` so the accepted set has
+    exactly one source."""
+    if value is None:
+        return THEME_AUTO
+    if not isinstance(value, str):
+        raise DeckError(
+            f"Invalid theme {value!r}: expected one of {list(allowed)} (or omit it)."
+        )
+    normalized = value.strip().lower()
+    if normalized not in allowed:
+        raise DeckError(
+            f"Unsupported theme {value!r}: expected one of {list(allowed)} "
+            "(or omit it). Only the three themes bundled with Marp are "
+            "supported; 'auto' (the default) lets the model pick the best fit."
+        )
+    return normalized
+
+
+def validate_theme_override(frontmatter: Mapping[str, Any], theme: str) -> None:
+    """Enforce a non-auto ``theme`` input against the deck: the frontmatter
+    theme key must equal the user's override. A mismatch raises a normal
+    retryable DeckError (an output-quality failure the model can correct),
+    so the worker runs this INSIDE the self-correcting loop; ``auto`` never
+    constrains the deck."""
+    if theme == THEME_AUTO:
+        return
+    deck_theme = frontmatter.get("theme")
+    if deck_theme == theme:
+        return
+    where = "is missing" if deck_theme is None else f"is {deck_theme!r}"
+    raise DeckError(
+        f"Invalid deck: the user requires theme '{theme}' but the deck's frontmatter "
+        f"theme {where}. Write 'theme: {theme}' into the frontmatter."
+    )
+
+
+# --- marp renders: compose image materialization ------------------------------
+
+
+def render_deck_html(
+    markdown: str,
+    workdir: str | Path,
+    marp_timeout_s: int = 120,
+    marp_bin: str = "marp",
+    runner: Runner = subprocess.run,
+    image_blobs: Mapping[int, bytes] | None = None,
+) -> bytes:
+    """Render a validated deck to the deliverable standalone HTML file
+    (browserless: Node only). When ``image_blobs`` carries the deck's
+    referenced images (1-based position -> validated bytes), they are
+    materialized into ``workdir`` and the markdown COPY handed to marp
+    references them there, with marp's local-files read enabled for that
+    throwaway workdir only; the caller's markdown string keeps ``#file:N``
+    (see :func:`marp_slides.marp_cli.render_deck_html` for the render
+    contract and the containment argument).
+    """
+    if image_blobs:
+        markdown = materialize_image_files(markdown, image_blobs)
+    return marp_render_html(
+        markdown,
+        workdir,
+        marp_timeout_s,
+        marp_bin,
+        runner,
+        allow_local_files=False,  # data URIs carry the bytes; nothing local to read
+    )
+
+
+def render_deck_pdf(
+    markdown: str,
+    workdir: str | Path,
+    marp_timeout_s: int = 120,
+    marp_bin: str = "marp",
+    runner: Runner = subprocess.run,
+    image_blobs: Mapping[int, bytes] | None = None,
+) -> bytes:
+    """Render a validated deck to the deliverable PDF document (Chromium
+    via puppeteer-core). Images materialize into ``workdir`` exactly as in
+    :func:`render_deck_html`; the caller's markdown string keeps
+    ``#file:N``.
+    """
+    if image_blobs:
+        markdown = materialize_image_files(markdown, image_blobs)
+    return marp_render_pdf(
+        markdown,
+        workdir,
+        marp_timeout_s,
+        marp_bin,
+        runner,
+        allow_local_files=False,  # data URIs carry the bytes; nothing local to read
+    )
 
 
 # --- LLM output extraction ----------------------------------------------------

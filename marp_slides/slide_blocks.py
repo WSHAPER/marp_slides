@@ -29,6 +29,16 @@ if TYPE_CHECKING:
     from .slides import SlideState
 
 IMAGE_LINE_RE = re.compile(r"^!\[(?P<alt>[^\]\n]*)\]\(#file:(?P<index>\d+)\)\s*$")
+
+#: Marp's background-image alt keyword: '![bg](#file:N)' places the image as
+#: the slide background instead of a content picture, optionally with one
+#: size keyword ('![bg cover](#file:N)'; contain, fit, auto likewise),
+#: case-insensitive. The prefix guard catches every other 'bg ...' alt
+#: ('bg left', 'bg 50%') so it rejects with the supported keyword list
+#: instead of silently degrading into a content picture.
+BACKGROUND_ALT_RE = re.compile(r"^bg(?:\s+(?:cover|contain|fit|auto))?$", re.IGNORECASE)
+BACKGROUND_ALT_PREFIX_RE = re.compile(r"^bg(?:\s|$)", re.IGNORECASE)
+
 BULLET_RE = re.compile(r"^(\s*)[-*+]\s+(.*)$")
 ORDERED_RE = re.compile(r"^(\s*)(?P<num>\d+)\.\s+(.*)$")
 QUOTE_RE = re.compile(r"^>\s?(.*)$")
@@ -124,8 +134,34 @@ def consume_image_line(state: SlideState, image: re.Match[str], i: int) -> int:
             f"'#file:{image.group('index')}' is not valid. N is 1-based, so the "
             "first image is '#file:1'."
         )
-    state.blocks.append(ImageBlock(alt=image.group("alt"), index=index))
+    alt = image.group("alt")
+    if BACKGROUND_ALT_PREFIX_RE.match(alt):
+        _consume_background_image(state, alt, index)
+        return i + 1
+    state.blocks.append(ImageBlock(alt=alt, index=index))
     return i + 1
+
+
+def _consume_background_image(state: SlideState, alt: str, index: int) -> None:
+    """A '![bg ...](#file:N)' line is slide chrome for the html/pdf renders,
+    never a content picture (python-pptx has no slide-background API): record
+    the 1-based index on the slide. Alt keywords other than the four size
+    keywords reject with the supported list, and at most one background
+    image is allowed per slide."""
+    if not BACKGROUND_ALT_RE.match(alt):
+        keyword = alt[len("bg") :].strip()
+        raise UnsupportedConstructError(
+            f"Unsupported construct on {state.where}: the background image keyword "
+            f"'{keyword}' is not supported. Use '![bg](#file:N)' on a line of its "
+            "own, optionally with one size keyword: '![bg cover](#file:N)' "
+            "(contain, fit and auto likewise)."
+        )
+    if state.background_image is not None:
+        raise UnsupportedConstructError(
+            f"Unsupported construct on {state.where}: only one background image is "
+            "allowed per slide. Remove the duplicate."
+        )
+    state.background_image = index
 
 
 def consume_list(state: SlideState, lines: list[str], i: int) -> int:

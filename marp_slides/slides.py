@@ -80,6 +80,7 @@ class SlideState:
         self.title_runs: tuple[Run, ...] = ()
         self.title_level = 0
         self.background: str | None = None
+        self.background_image: int | None = None
         self.columns: int | None = None
         self.slide_directives: Directives = {}
 
@@ -191,6 +192,7 @@ def _finish_slide(state: SlideState) -> ParsedSlide:
         blocks=tuple(state.blocks),
         notes=tuple(state.notes),
         background=state.background,
+        background_image=state.background_image,
         columns=state.columns,
         footer_override=state.slide_directives.get("footer"),
         header_override=state.slide_directives.get("header"),

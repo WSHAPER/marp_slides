@@ -132,12 +132,12 @@ def no_real_build(monkeypatch):
     monkeypatch.setattr(
         task_worker,
         "render_deck_html",
-        lambda md, wd, t, bin: b"<html>standalone</html>",
+        lambda md, wd, t, bin, image_blobs=None: b"<html>standalone</html>",
     )
     monkeypatch.setattr(
         task_worker,
         "render_deck_pdf",
-        lambda md, wd, t, bin: b"%PDF-1.7 standalone",
+        lambda md, wd, t, bin, image_blobs=None: b"%PDF-1.7 standalone",
     )
     monkeypatch.setattr(
         task_worker, "build_pptx", lambda deck, title, images=None: b"PK-editable"
@@ -221,7 +221,7 @@ def test_html_task_never_touches_pptx_builder_or_gate(
         calls.append("build")
         raise AssertionError("build_pptx must not run for html tasks")
 
-    def fake_render(md, wd, t, bin):
+    def fake_render(md, wd, t, bin, image_blobs=None):
         calls.append("render")
         return b"<html>standalone</html>"
 
@@ -243,7 +243,7 @@ def test_html_render_failure_not_retried(monkeypatch, settings, valid_deck) -> N
     fake, calls = make_scheduler([valid_deck])
     monkeypatch.setattr(task_worker, "schedule_and_wait", fake)
 
-    def failing(md, wd, t, bin):
+    def failing(md, wd, t, bin, image_blobs=None):
         raise DeckError("The generated deck failed Marp HTML rendering (exit code 1).")
 
     monkeypatch.setattr(task_worker, "render_deck_html", failing)
@@ -318,11 +318,11 @@ def test_pdf_task_gate_first_then_render_never_pptx(
     def fake_gate(md, wd, t, bin):
         calls.append("gate")
 
-    def fake_render_html(md, wd, t, bin):
+    def fake_render_html(md, wd, t, bin, image_blobs=None):
         calls.append("render_html")
         raise AssertionError("html render must not run for pdf tasks")
 
-    def fake_render(md, wd, t, bin):
+    def fake_render(md, wd, t, bin, image_blobs=None):
         calls.append("render_pdf")
         return b"%PDF-1.7 standalone"
 
@@ -348,7 +348,7 @@ def test_pdf_render_failure_not_retried(monkeypatch, settings, valid_deck) -> No
     fake, calls = make_scheduler([valid_deck])
     monkeypatch.setattr(task_worker, "schedule_and_wait", fake)
 
-    def failing(md, wd, t, bin):
+    def failing(md, wd, t, bin, image_blobs=None):
         raise DeckError("The generated deck failed Marp PDF rendering (exit code 1).")
 
     monkeypatch.setattr(task_worker, "render_deck_pdf", failing)
@@ -375,7 +375,7 @@ def test_pdf_gate_failure_skips_chromium_render(
     def failing(md, wd, t, bin):
         raise DeckError("The generated deck failed Marp validation (exit code 1).")
 
-    def forbidden(md, wd, t, bin):
+    def forbidden(md, wd, t, bin, image_blobs=None):
         raise AssertionError("Chromium render must not run after a gate failure")
 
     monkeypatch.setattr(task_worker, "marp_html_gate", failing)
@@ -833,6 +833,152 @@ def test_unreferenced_input_images_never_downloaded(monkeypatch, settings) -> No
     (result,) = api.results
     assert result["output"]["slide_deck"] == 42  # success, no fetch
     assert files.downloaded == []
+
+
+# --- v0.1.x: html/pdf renders materialize the deck images ----------------------
+
+
+def test_html_task_with_images_passes_blobs_to_render(monkeypatch, settings) -> None:
+    """The html render receives the fetched blobs (1-based -> bytes); the
+    rewrite to workdir file names happens INSIDE the render, so the worker
+    still hands it the retained markdown and the uploaded source keeps
+    '#file:N'."""
+    fake, _calls = make_scheduler([VALID_DECK_WITH_IMAGE])
+    monkeypatch.setattr(task_worker, "schedule_and_wait", fake)
+    blob = png_bytes()
+    files = FakeFilesAPI({101: fake_node(101)}, {101: blob})
+    nc, api = make_fake_nc(files=files)
+    seen: dict[str, object] = {}
+
+    def fake_render(md, wd, t, bin, image_blobs=None):
+        seen["markdown"] = md
+        seen["blobs"] = image_blobs
+        return b"<html>standalone</html>"
+
+    monkeypatch.setattr(task_worker, "render_deck_html", fake_render)
+    task_worker.process_task(
+        nc,
+        dict(TASK, input={"prompt": "x", "output_format": "html", "images": [101]}),
+        settings,
+    )
+    (result,) = api.results
+    assert result["output"]["slide_deck"] == 42
+    assert seen["blobs"] == {1: blob}
+    assert seen["markdown"] == VALID_DECK_WITH_IMAGE.strip()  # rewrite is render-local
+    assert files.downloaded == [101]
+    _, (src_name, src_bytes, src_mime) = api.uploads[1]
+    assert src_name == "Img-Deck.md" and src_mime == "text/markdown"
+    assert b"#file:1" in src_bytes  # the retained source keeps the file-id form
+
+
+def test_pdf_task_gates_imageless_then_renders_with_blobs(
+    monkeypatch, settings
+) -> None:
+    """The pdf path keeps its strict order: the browserless gate runs on the
+    original markdown (imageless, no local-files flag), then the render
+    receives the fetched blobs; the retained source keeps '#file:N'."""
+    fake, _calls = make_scheduler([VALID_DECK_WITH_IMAGE])
+    monkeypatch.setattr(task_worker, "schedule_and_wait", fake)
+    blob = png_bytes()
+    files = FakeFilesAPI({101: fake_node(101)}, {101: blob})
+    nc, api = make_fake_nc(files=files)
+    calls: list[str] = []
+    stripped = VALID_DECK_WITH_IMAGE.strip()  # extract_markdown strips the output
+
+    def fake_gate(md, wd, t, bin):
+        calls.append(f"gate:{md == stripped}")
+
+    def fake_render(md, wd, t, bin, image_blobs=None):
+        calls.append(f"render:{image_blobs == {1: blob}}:{md == stripped}")
+        return b"%PDF-1.7 standalone"
+
+    monkeypatch.setattr(task_worker, "marp_html_gate", fake_gate)
+    monkeypatch.setattr(task_worker, "render_deck_pdf", fake_render)
+    task_worker.process_task(
+        nc,
+        dict(TASK, input={"prompt": "x", "output_format": "pdf", "images": [101]}),
+        settings,
+    )
+    (result,) = api.results
+    assert result["output"]["slide_deck"] == 42
+    assert calls == ["gate:True", "render:True:True"]  # gate first, blobs, source md
+    _, (src_name, src_bytes, _mime) = api.uploads[1]
+    assert src_name == "Img-Deck.md"
+    assert b"#file:1" in src_bytes
+
+
+def test_html_image_fetch_failure_not_retried(monkeypatch, settings) -> None:
+    """Input-data failures stay unretryable on the html path too: a GIF
+    input file fails the task after exactly one LLM round."""
+    fake, calls = make_scheduler([VALID_DECK_WITH_IMAGE])
+    monkeypatch.setattr(task_worker, "schedule_and_wait", fake)
+    node = fake_node(101, mimetype="image/gif", name="a.gif")
+    files = FakeFilesAPI({101: node}, {101: png_bytes()})
+    nc, api = make_fake_nc(files=files)
+    task_worker.process_task(
+        nc,
+        dict(TASK, input={"prompt": "x", "output_format": "html", "images": [101]}),
+        settings,
+    )
+    assert len(calls) == 1
+    (result,) = api.results
+    assert result["output"] is None
+    assert "only PNG and JPEG" in result["user_facing_error_message"]
+
+
+# --- v0.1.x: the theme input threads through authoring --------------------------
+
+
+def test_theme_override_mismatch_retried_then_corrected(
+    monkeypatch, settings, caplog
+) -> None:
+    """A hard theme override the deck ignores is an output-quality failure:
+    the override clause rides BOTH prompts, the mismatch feeds the retry as
+    corrective feedback, and the corrected attempt ships."""
+    wrong = "---\nmarp: true\ntitle: t\ntheme: default\n---\n\n# T\n\nText only.\n"
+    right = wrong.replace("theme: default", "theme: gaia")
+    fake, calls = make_scheduler([wrong, right])
+    monkeypatch.setattr(task_worker, "schedule_and_wait", fake)
+    nc, api = make_fake_nc()
+    with caplog.at_level("WARNING", logger="marp_slides.task_worker"):
+        task_worker.process_task(
+            nc, dict(TASK, input={"prompt": "x", "theme": "gaia"}), settings
+        )
+    assert len(calls) == 2
+    for llm_input in (calls[0]["input"], calls[1]["input"]):
+        assert "requires the 'gaia' theme" in llm_input
+    assert "requires theme 'gaia'" in calls[1]["input"]  # corrective feedback
+    (result,) = api.results
+    assert result["output"] == {"slide_deck": 42, "slide_deck_source": 43}
+
+
+def test_invalid_theme_input_fails_before_any_llm_round(monkeypatch, settings) -> None:
+    fake, calls = make_scheduler(["unused"])
+    monkeypatch.setattr(task_worker, "schedule_and_wait", fake)
+    nc, api = make_fake_nc()
+    task_worker.process_task(
+        nc, dict(TASK, input={"prompt": "x", "theme": "neon"}), settings
+    )
+    assert calls == []
+    (result,) = api.results
+    assert result["output"] is None
+    assert "theme" in result["user_facing_error_message"]
+
+
+def test_auto_theme_never_constrains_the_pick(monkeypatch, settings) -> None:
+    """theme=auto (explicit or absent): no override clause in the prompt and
+    any bundled theme in the deck passes validation."""
+    deck = "---\nmarp: true\ntitle: t\ntheme: uncover\n---\n\n# T\n\nText only.\n"
+    fake, calls = make_scheduler([deck])
+    monkeypatch.setattr(task_worker, "schedule_and_wait", fake)
+    nc, api = make_fake_nc()
+    task_worker.process_task(
+        nc, dict(TASK, input={"prompt": "x", "theme": "auto"}), settings
+    )
+    assert len(calls) == 1
+    assert "requires the" not in calls[0]["input"]
+    (result,) = api.results
+    assert result["output"] == {"slide_deck": 42, "slide_deck_source": 43}
 
 
 # --- progress phases + total LLM time cap ---------------------------------------

@@ -3,6 +3,7 @@ sniffing and capped downloads through a fake nc_py_api files client."""
 
 from __future__ import annotations
 
+import base64
 import io
 from types import SimpleNamespace
 
@@ -13,7 +14,9 @@ from marp_slides.deck_pipeline import DeckError, validate_deck
 from marp_slides.images import (
     MAX_IMAGE_BYTES,
     fetch_image_blobs,
+    materialize_image_files,
     referenced_image_indices,
+    rewrite_file_references,
     sniff_image_content_type,
     validate_image_references,
     validate_images_slot,
@@ -226,3 +229,146 @@ def test_fetch_garbage_bytes_rejected() -> None:
     nc = make_fake_nc({3: node}, {3: b"\x00" * 64})
     with pytest.raises(DeckError, match="could not be read as an image"):
         fetch_image_blobs(nc, [3], [1])
+
+
+# --- render materialization (html/pdf output) ------------------------------------------
+
+
+def test_rewrite_only_indices_with_files() -> None:
+    markdown = "![a](#file:1)\n\n![b](#file:2)\n"
+    rewritten = rewrite_file_references(markdown, {1: "file-1.png"})
+    assert rewritten == "![a](file-1.png)\n\n![b](#file:2)\n"
+
+
+def test_rewrite_leaves_every_other_url_untouched() -> None:
+    markdown = (
+        "![remote](https://example.com/x.png)\n"
+        "[a plain link](#file:1)\n"
+        "[web](https://example.com)\n"
+        "<https://example.com/y.jpg>\n"
+        "plain #file:2 prose\n"
+    )
+    assert rewrite_file_references(markdown, {1: "file-1.png", 2: "file-2.jpg"}) == (
+        markdown
+    )
+
+
+def test_rewrite_preserves_alt_text_and_input_string() -> None:
+    markdown = "![The diagram](#file:1)\n"
+    rewritten = rewrite_file_references(markdown, {1: "file-1.jpg"})
+    assert rewritten == "![The diagram](file-1.jpg)\n"
+    assert markdown == "![The diagram](#file:1)\n"  # the input is never mutated
+
+
+def test_materialize_rewrites_copy_to_inline_data_uris(tmp_path) -> None:
+    png, jpg = png_bytes(), jpeg_bytes()
+    markdown = (
+        "---\nmarp: true\ntitle: t\n---\n\n# T\n\n![pic](#file:1)\n\n![foto](#file:2)\n"
+    )
+    rewritten = materialize_image_files(markdown, {1: png, 2: jpg})
+    # the deliverable must be self-contained: marp-cli does not embed
+    # workdir-relative images into its HTML, so the render copy carries
+    # the bytes inline instead
+    assert (
+        f"![pic](data:image/png;base64,{base64.b64encode(png).decode()})" in rewritten
+    )
+    assert (
+        f"![foto](data:image/jpeg;base64,{base64.b64encode(jpg).decode()})" in rewritten
+    )
+    assert "#file:" not in rewritten
+    assert "#file:1" in markdown  # the caller's string keeps the file-id form
+    assert list(tmp_path.iterdir()) == []  # nothing written to the workdir
+
+
+def test_materialize_empty_blobs_returns_markdown_unchanged(tmp_path) -> None:
+    markdown = "![a](#file:1)\n"
+    assert materialize_image_files(markdown, {}) == markdown
+    assert list(tmp_path.iterdir()) == []
+
+
+def test_materialize_garbage_blob_rejected(tmp_path) -> None:
+    with pytest.raises(DeckError, match="could not be read as an image"):
+        materialize_image_files("![a](#file:1)\n", {1: b"not image data"})
+    assert list(tmp_path.iterdir()) == []
+
+
+def test_materialize_unsupported_type_rejected(tmp_path) -> None:
+    with pytest.raises(DeckError, match="only PNG and JPEG"):
+        materialize_image_files("![a](#file:1)\n", {1: gif_bytes()})
+
+
+# --- background images: bounds + render materialization -------------------------------
+
+
+def bg_deck() -> object:
+    """A deck using every background form: deck-wide frontmatter key, one
+    per-slide '![bg cover]' line, plus one plain content image."""
+    markdown = (
+        "---\nmarp: true\ntitle: t\nbackgroundImage: '#file:1'\n---\n\n"
+        "# T\n\ntext with a content image\n\n![pic](#file:2)\n\n---\n\n"
+        "## Two\n\n![bg cover](#file:3)\n"
+    )
+    return validate_deck(markdown).deck
+
+
+def test_background_references_collected_with_content_images() -> None:
+    assert referenced_image_indices(bg_deck()) == [1, 2, 3]
+    assert validate_image_references(bg_deck(), [501, 502, 503]) == [1, 2, 3]
+
+
+def test_background_reference_out_of_bounds_rejected() -> None:
+    # both the frontmatter key and the '![bg]' alt reference are covered by
+    # the same bounds check as content images (retryable by the inner model)
+    deck = bg_deck()
+    with pytest.raises(DeckError, match=r"#file:3.*2 image\(s\)"):
+        validate_image_references(deck, [501, 502])
+    with pytest.raises(DeckError, match="no images were provided"):
+        validate_image_references(deck, [])
+
+
+def test_slide_bg_alone_downloads_through_referenced_indices() -> None:
+    deck = validate_deck(
+        "---\nmarp: true\ntitle: t\n---\n\n# T\n\n![bg](#file:1)\n"
+    ).deck
+    assert referenced_image_indices(deck) == [1]
+
+
+def test_materialize_rewrites_frontmatter_background_to_marp_url_form() -> None:
+    # Marp expects the directive VALUE 'url(data:...)' (verified against
+    # marp-cli 4.2.3 with the strict looseYAML:false rc)
+    blob = png_bytes()
+    markdown = "---\nmarp: true\ntitle: t\nbackgroundImage: '#file:1'\n---\n\n# T\n"
+    rewritten = materialize_image_files(markdown, {1: blob})
+    uri = f"data:image/png;base64,{base64.b64encode(blob).decode()}"
+    assert f"backgroundImage: 'url({uri})'" in rewritten
+    assert "#file:" not in rewritten
+    assert "#file:1" in markdown  # the caller's string keeps the file-id form
+
+
+def test_materialize_rewrites_frontmatter_double_quoted_and_commented() -> None:
+    blob = png_bytes()
+    uri = f"data:image/png;base64,{base64.b64encode(blob).decode()}"
+    rewritten = materialize_image_files(
+        '---\nmarp: true\ntitle: t\nbackgroundImage: "#file:1"  # watermark\n---\n\n# T\n',
+        {1: blob},
+    )
+    assert f"backgroundImage: 'url({uri})'  # watermark" in rewritten
+
+
+def test_materialize_rewrites_bg_alt_syntax_keeping_the_keyword() -> None:
+    blob = png_bytes()
+    uri = f"data:image/png;base64,{base64.b64encode(blob).decode()}"
+    markdown = "---\nmarp: true\ntitle: t\n---\n\n# T\n\n![bg cover](#file:1)\n"
+    rewritten = materialize_image_files(markdown, {1: blob})
+    assert f"![bg cover]({uri})" in rewritten
+    assert "#file:1" not in rewritten
+
+
+def test_materialize_leaves_background_reference_without_blob_strict() -> None:
+    markdown = (
+        "---\nmarp: true\ntitle: t\nbackgroundImage: '#file:1'\n---\n\n"
+        "# T\n\n![bg](#file:2)\n"
+    )
+    rewritten = materialize_image_files(markdown, {2: png_bytes()})
+    assert "backgroundImage: '#file:1'" in rewritten  # no blob: untouched
+    assert "![bg](data:image/png;base64," in rewritten

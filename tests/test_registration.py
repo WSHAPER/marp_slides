@@ -1,5 +1,5 @@
 """Registration contract: task type, provider, multi-value ENUM output_format
-slot, LIST_OF_FILES images slot, optional slide_deck_source output."""
+and theme slots, LIST_OF_FILES images slot, optional slide_deck_source output."""
 
 from __future__ import annotations
 
@@ -19,6 +19,9 @@ def test_task_type_shape() -> None:
     assert tt.id == TASK_TYPE_ID == "marp_slides:slide_deck_generation"
     assert [s.name for s in tt.input_shape] == ["prompt"]
     assert tt.input_shape[0].shape_type == ShapeType.TEXT
+    assert tt.input_shape[0].description == (
+        "What the presentation should be about and any requirements for it."
+    )
     # the required output stays exactly the PPTX; slide_deck_source is an
     # OPTIONAL output declared on the provider (merged into the task type by
     # the server from the provider registration)
@@ -36,9 +39,10 @@ def test_provider_shape() -> None:
     assert provider.expected_runtime == 120
     assert [s.name for s in provider.optional_input_shape] == [
         "output_format",
+        "theme",
         "images",
     ]
-    fmt_slot, images_slot = provider.optional_input_shape
+    fmt_slot, theme_slot, images_slot = provider.optional_input_shape
     assert fmt_slot.shape_type == ShapeType.ENUM
     enum_values = provider.optional_input_shape_enum_values["output_format"]
     # nc_py_api 0.30.3 ships optional_input_shape_enum_values as a LIST per
@@ -51,25 +55,57 @@ def test_provider_shape() -> None:
         OUTPUT_FORMAT_LABELS[value] for value in OUTPUT_FORMAT_VALUES
     ]
     assert all(v.name and v.name != v.value for v in enum_values)
-    assert provider.optional_input_shape_defaults == {"output_format": "pptx"}
+    assert provider.optional_input_shape_defaults == {
+        "output_format": "pptx",
+        "theme": "auto",
+    }
+    assert theme_slot.shape_type == ShapeType.ENUM
     assert images_slot.shape_type == ShapeType.LIST_OF_FILES
 
 
-def test_enum_description_states_all_formats() -> None:
+def test_theme_slot_enum_mirrors_the_constructs_constant() -> None:
+    """The theme ENUM values have ONE source: constructs.THEME_VALUES
+    (mirroring how the output_format ENUM derives from settings), so the
+    registered slot can never drift from the validator's allow-list."""
+    from marp_slides.constructs import THEME_AUTO, THEME_VALUES
+
     provider = task_definition.PROVIDER
-    (fmt_slot, _images) = provider.optional_input_shape
-    assert "'pptx'" in fmt_slot.description
-    assert "'pdf'" in fmt_slot.description
-    assert "ODP" in fmt_slot.description
+    values = provider.optional_input_shape_enum_values["theme"]
+    assert [v.value for v in values] == list(THEME_VALUES)
+    assert values[0].value == THEME_AUTO == "auto"
+    assert all(v.name and v.name != v.value for v in values)
+    assert values[0].name.startswith("Automatic")
 
 
-def test_images_slot_description_teaches_the_file_id_form() -> None:
+def test_theme_description_states_values_and_pptx_limit() -> None:
     provider = task_definition.PROVIDER
-    (_fmt, images_slot) = provider.optional_input_shape
-    assert "#file:N" in images_slot.description
-    assert "1-based" in images_slot.description
-    assert "5 MB" in images_slot.description
-    assert "SVG is not supported" in images_slot.description
+    (_fmt, theme_slot, _images) = provider.optional_input_shape
+    assert "'auto'" in theme_slot.description
+    for name in ("default", "gaia", "uncover"):
+        assert f"'{name}'" in theme_slot.description
+    assert "pptx output ignores the theme" in theme_slot.description
+
+
+def test_enum_description_is_one_clean_sentence() -> None:
+    provider = task_definition.PROVIDER
+    (fmt_slot, _theme, _images) = provider.optional_input_shape
+    # one short human sentence: the dropdown options already enumerate the
+    # formats, so the label only states the purpose and the default
+    assert fmt_slot.description == (
+        "Output file format for the deck; 'pptx' is the default."
+    )
+
+
+def test_images_slot_description_is_one_clean_sentence() -> None:
+    provider = task_definition.PROVIDER
+    (_fmt, _theme, images_slot) = provider.optional_input_shape
+    assert images_slot.description == (
+        "Optional images to place in the deck (PNG or JPEG, max 5 MB "
+        "each; SVG is not supported)."
+    )
+    # the '#file:N' reference syntax is LLM-facing and is taught where the
+    # model needs it (prompts/deck_system_prompt.md), not in the form label
+    assert "#file:" not in images_slot.description
 
 
 def test_optional_output_declares_slide_deck_source() -> None:
@@ -82,15 +118,19 @@ def test_optional_output_declares_slide_deck_source() -> None:
     assert "small edits" in slot.description
 
 
-def test_output_format_enum_values_carry_all_formats() -> None:
-    provider = task_definition.PROVIDER
-    fmt_slot = next(
-        s for s in provider.optional_input_shape if s.name == "output_format"
-    )
-    assert "'pptx'" in fmt_slot.description
-    assert "'html'" in fmt_slot.description
-    assert "'pdf'" in fmt_slot.description
-    assert "ODP" in fmt_slot.description
+def test_descriptions_do_not_pack_pipe_separated_examples() -> None:
+    # regression: the Assistant task form renders a ShapeDescriptor
+    # description verbatim as the field label and input hint, and no
+    # upstream convention splits pipe-separated examples, so canned
+    # examples packed behind " | " rendered as one long garbage label
+    descriptors = [
+        *task_definition.TASK_TYPE.input_shape,
+        *task_definition.TASK_TYPE.output_shape,
+        *task_definition.PROVIDER.optional_input_shape,
+        *task_definition.PROVIDER.optional_output_shape,
+    ]
+    assert all("|" not in slot.description for slot in descriptors)
+    assert all("\n" not in slot.description for slot in descriptors)
 
 
 def test_format_constants_are_consistent() -> None:

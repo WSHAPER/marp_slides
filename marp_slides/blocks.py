@@ -115,6 +115,11 @@ class ParsedSlide:
     #: Per-slide background override (validated 'RRGGBB') from a
     #: '<!-- backgroundColor: ... -->' comment; None = use the deck default.
     background: str | None = None
+    #: Per-slide background image ('![bg](#file:N)' with the bg alt keyword)
+    #: as the 1-based images-input index. html/pdf render only: python-pptx
+    #: has no slide-background API, so the native PPTX build ignores it by
+    #: construction (it is chrome here, never a content block).
+    background_image: int | None = None
     #: Two-column layout activation ('<!-- columns: 2 -->' as the slide's
     #: first content); 2 or None.
     columns: int | None = None
@@ -147,3 +152,8 @@ class ParsedDeck:
     #: Validated deck-wide background color as 'RRGGBB' (frontmatter
     #: backgroundColor) or None; per-slide directives may override it.
     background: str | None = None
+    #: Validated deck-wide background image (frontmatter backgroundImage,
+    #: '#file:N') as the 1-based images-input index, or None. html/pdf
+    #: render only: the native PPTX build has no background-image
+    #: equivalent and ignores it.
+    background_image: int | None = None

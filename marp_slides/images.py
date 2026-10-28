@@ -17,10 +17,23 @@ BEFORE anything reaches the builder:
   and must really be PNG or JPEG.
 
 Only images actually referenced by the deck are downloaded.
+
+The render split: the native PPTX build consumes the blobs directly as
+pictures, while the html/pdf renders rewrite a render-local COPY of the
+markdown to inline ``data:`` URIs carrying the downloaded bytes
+(:func:`materialize_image_files`); the retained deck source keeps its
+``#file:N`` references. Background images (the deck-wide ``backgroundImage``
+frontmatter key and per-slide ``![bg](#file:N)`` lines) share the same
+reference, download and rewrite machinery: they validate and download like
+content images but render only in html/pdf output — python-pptx has no
+slide-background API, so the native PPTX build ignores them.
 """
 
 from __future__ import annotations
 
+import base64
+import re
+from collections.abc import Mapping
 from typing import Any
 
 from PIL import UnidentifiedImageError
@@ -33,6 +46,26 @@ from .validator import DeckError
 MAX_IMAGE_BYTES = 5 * 1024 * 1024
 ALLOWED_IMAGE_MIME_TYPES = ("image/png", "image/jpeg")
 ALLOWED_IMAGE_CONTENT_TYPES = ("image/png", "image/jpeg")
+
+#: File extension for each sniffed-and-allowed content type, used when the
+#: html/pdf renders materialize blobs into the marp workdir (file-N.<ext>).
+IMAGE_FILE_EXTENSIONS = {"image/png": "png", "image/jpeg": "jpg"}
+
+#: The validated image construct, exactly: ``![alt](#file:N)``. The rewrite
+#: below only ever touches this shape (an image reference carrying a 1-based
+#: file-id target, background images included: their '![bg ...]' alt is
+#: preserved verbatim), never any other URL.
+_FILE_REFERENCE_RE = re.compile(r"!\[(?P<alt>[^\]]*)\]\(#file:(?P<index>\d+)\)")
+
+#: The deck-wide ``backgroundImage`` frontmatter line, exactly:
+#: ``backgroundImage: '#file:N'`` (optionally double-quoted, optionally with
+#: a trailing YAML comment). The rewrite wraps the data URI in Marp's
+#: ``url(...)`` directive-value syntax; anything else on the line is kept.
+_FRONTMATTER_BACKGROUND_IMAGE_RE = re.compile(
+    r"^(?P<prefix>backgroundImage\s*:\s*)(?P<quote>['\"]?)#file:(?P<index>\d+)"
+    r"(?P=quote)(?P<tail>.*)$",
+    re.MULTILINE,
+)
 
 
 def sniff_image_content_type(data: bytes) -> str:
@@ -72,8 +105,17 @@ def validate_images_slot(value: object) -> list[int]:
 
 
 def referenced_image_indices(deck: ParsedDeck) -> list[int]:
-    """The sorted, de-duplicated 1-based image positions the deck references."""
-    return sorted({block.index for block in _image_blocks(deck)})
+    """The sorted, de-duplicated 1-based image positions the deck references:
+    content images plus the deck-wide and per-slide background images."""
+    indices = {block.index for block in _image_blocks(deck)}
+    if deck.background_image is not None:
+        indices.add(deck.background_image)
+    indices.update(
+        slide.background_image
+        for slide in deck.slides
+        if slide.background_image is not None
+    )
+    return sorted(indices)
 
 
 def validate_image_references(deck: ParsedDeck, file_ids: list[int]) -> list[int]:
@@ -150,6 +192,78 @@ def fetch_image_blobs(
             )
         blobs[index] = data
     return blobs
+
+
+def rewrite_file_references(markdown: str, file_names: Mapping[int, str]) -> str:
+    """Rewrite ``![alt](#file:N)`` references to ``![alt](file-N.ext)`` for
+    the indices that have a materialized file. STRICT: only the exact image
+    construct is touched; any other URL (remote images, http links,
+    autolinks) is left alone, and so is a ``#file:N`` reference whose index
+    has no file. Returns a new string; the input keeps its ``#file:N``."""
+
+    def _sub(match: re.Match[str]) -> str:
+        name = file_names.get(int(match.group("index")))
+        if name is None:
+            return match.group(0)
+        return f"![{match.group('alt')}]({name})"
+
+    return _FILE_REFERENCE_RE.sub(_sub, markdown)
+
+
+def materialize_image_files(markdown: str, image_blobs: Mapping[int, bytes]) -> str:
+    """Return a copy of ``markdown`` whose ``#file:N`` references are
+    rewritten to inline ``data:`` URIs, ready to hand to marp for the
+    html/pdf renders (the native PPTX build inserts the same blobs as
+    pictures instead). The input string is never modified: the retained
+    deck source keeps ``#file:N``.
+
+    Data URIs, not workdir files: marp-cli 4.5.1 does not embed
+    markdown-referenced local images into its HTML output even with
+    ``--allow-local-files`` (verified empirically; the flag only allows
+    reading, and the emitted ``<img src>`` keeps the relative path to a
+    workdir that dies with the render), so the first materialization
+    design shipped standalone decks with dangling image references.
+    Inline URIs make the deliverable self-contained by construction and
+    the local-files flag unnecessary for the renders.
+
+    Background images ride along: a per-slide ``![bg](#file:N)`` rewrites
+    through the same image construct (the alt keyword is preserved, marp
+    applies its native background treatment), and the deck-wide
+    ``backgroundImage: '#file:N'`` frontmatter value becomes
+    ``backgroundImage: 'url(data:...)'``, the directive-value syntax Marp
+    expects (both verified against marp-cli 4.2.3 with the strict
+    ``looseYAML: false`` rc). The PPTX build never sees this copy.
+    """
+    file_names: dict[int, str] = {}
+    for index, blob in image_blobs.items():
+        content_type = sniff_image_content_type(blob)
+        if content_type not in IMAGE_FILE_EXTENSIONS:
+            raise DeckError(
+                f"Image {index} is a '{content_type}' image; only PNG and JPEG are "
+                "supported. Convert the image or remove the reference."
+            )
+        file_names[index] = (
+            f"data:{content_type};base64,{base64.b64encode(blob).decode('ascii')}"
+        )
+    rewritten = rewrite_file_references(markdown, file_names)
+    return _rewrite_background_image_directive(rewritten, file_names)
+
+
+def _rewrite_background_image_directive(
+    markdown: str, file_names: Mapping[int, str]
+) -> str:
+    """Rewrite the ``backgroundImage: '#file:N'`` frontmatter line to
+    ``backgroundImage: 'url(<data URI>)'``. STRICT: only the validated
+    directive-value shape is touched, and only when the index has a
+    materialized URI; the line is left alone otherwise."""
+
+    def _sub(match: re.Match[str]) -> str:
+        uri = file_names.get(int(match.group("index")))
+        if uri is None:
+            return match.group(0)
+        return f"{match.group('prefix')}'url({uri})'{match.group('tail')}"
+
+    return _FRONTMATTER_BACKGROUND_IMAGE_RE.sub(_sub, markdown)
 
 
 def _image_blocks(deck: ParsedDeck) -> list[ImageBlock]:

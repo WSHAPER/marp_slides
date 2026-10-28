@@ -20,6 +20,7 @@ from marp_slides.editable_pptx import (
     build_pptx,
     parse_deck,
 )
+from marp_slides.images import referenced_image_indices
 
 RICH_DECK = """---
 marp: true
@@ -139,6 +140,7 @@ def test_supported_construct_constant_shape() -> None:
         "deck_header",
         "slide_number",
         "background_color",
+        "background_image",
         "frontmatter",
     }
 
@@ -1987,3 +1989,78 @@ def test_parse_deck_structure(valid_deck: str) -> None:
     assert deck.slides[0].notes == ("Welcome everyone and set the agenda.",)
     assert deck.slides[0].needs_flow_layout is False
     assert deck.slides[0].blocks == ()
+
+
+# --- background images: html/pdf-only constructs, never content pictures -------------
+
+
+def test_bg_alt_parses_as_slide_chrome_not_a_picture() -> None:
+    # Marp's bg keyword in the alt text marks a background image: the parser
+    # files it as slide chrome (background_image index), never an ImageBlock
+    deck = "---\nmarp: true\ntitle: t\n---\n\n# T\n\n![bg](#file:2)\n\ntext\n"
+    validated = validate_deck(deck)
+    slide = validated.deck.slides[0]
+    assert slide.background_image == 2
+    assert [type(b).__name__ for b in slide.blocks] == ["Paragraph"]
+    assert slide.needs_flow_layout is False  # a background is not flow content
+    assert referenced_image_indices(validated.deck) == [2]
+
+
+@pytest.mark.parametrize("alt", ["bg", "bg cover", "bg contain", "bg fit", "bg auto"])
+def test_bg_size_keywords_accepted_case_insensitively(alt: str) -> None:
+    deck = f"---\nmarp: true\ntitle: t\n---\n\n# T\n\n![{alt.upper()}](#file:1)\n"
+    assert validate_deck(deck).deck.slides[0].background_image == 1
+
+
+def test_deck_level_background_image_frontmatter_accepted() -> None:
+    deck = "---\nmarp: true\ntitle: t\nbackgroundImage: '#file:2'\n---\n\n# T\n"
+    validated = validate_deck(deck)
+    assert validated.deck.background_image == 2
+    # pure validation checks SYNTAX only: the bounds check against the task's
+    # images list is the worker's job (same contract as content images)
+    assert referenced_image_indices(validated.deck) == [2]
+
+
+def test_background_image_alone_keeps_a_slide_a_title_slide() -> None:
+    # a slide whose only "content" is a background stays the deck's Title
+    # Slide layout in the PPTX build (the background is chrome, not content)
+    deck = "---\nmarp: true\ntitle: t\n---\n\n# T\n\n![bg](#file:1)\n"
+    validated = validate_deck(deck)
+    assert validated.deck.slides[0].blocks == ()
+
+
+def test_pptx_build_ignores_background_images() -> None:
+    # html/pdf-only: python-pptx has no slide-background API, so neither the
+    # deck-wide frontmatter key nor per-slide ![bg] lines become content
+    deck = (
+        "---\nmarp: true\ntitle: t\nbackgroundImage: '#file:1'\n---\n\n"
+        "# T\n\n![bg cover](#file:2)\n"
+    )
+    validated = validate_deck(deck)
+    prs = Presentation(
+        io.BytesIO(build_pptx(validated.deck, "T", {1: _png(80, 40), 2: _png(80, 40)}))
+    )
+    (slide,) = prs.slides
+    assert _pictures(slide) == []  # no picture anywhere: backgrounds ignored
+    assert "<p:bg>" not in slide._element.xml  # no background fill invented
+
+
+def test_bg_keyword_without_size_keyword_list_rejected() -> None:
+    # 'bg left' / 'bg 50%' look like supported syntax but have no supported
+    # equivalent: reject with the keyword list, never degrade into a picture
+    _rejected("# T\n\n![bg left](#file:1)\n", "background image keyword 'left'")
+    _rejected("# T\n\n![bg 50%](#file:1)\n", "cover")
+    _rejected("# T\n\n![bg](#file:1) extra\n", "line of their own")
+
+
+def test_duplicate_bg_image_per_slide_rejected() -> None:
+    _rejected("# T\n\n![bg](#file:1)\n\n![bg cover](#file:2)\n", "one background image")
+
+
+def test_background_image_comment_directive_rejected_with_forms() -> None:
+    # the comment form is rejected, but the message teaches the two
+    # supported forms (frontmatter key, ![bg] alt keyword)
+    _rejected(
+        "# T\n\n<!-- backgroundImage: url(x.png) -->\n",
+        "never a comment directive",
+    )

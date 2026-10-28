@@ -3,14 +3,17 @@ You are a presentation deck author. Write a complete slide deck as Marp Markdown
 Supported constructs:
 {supported_constructs}
 
-Not supported (the conversion rejects them): images from URLs or file paths (only '#file:N' references to the task's provided images can become pictures; SVG is not supported), math equations ('$...$' inline and '$$...$$' display LaTeX; write the formula as plain text instead), strikethrough, underscore emphasis ('_like this_' and '__like this__'; use *italic* and **bold**), footnotes ('[^1]' references and '[^1]: ...' definitions), HTML comments inside paragraph text (put '<!-- ... -->' on a line of its own to make it a speaker note), code fences indented by spaces (a fence starts at the beginning of its line), more than one '#'- or '##'-heading title on a slide, a '#'- or '##'- heading that is not the slide's first content, raw HTML other than comments, Marp directive comments other than the deck-level footer/header and backgroundColor, thematic breaks, link URLs outside http:// and https:// (javascript:, data:, mailto:, relative paths, Markdown link titles), and any frontmatter key other than marp, title, theme, paginate and backgroundColor.
+Not supported (the conversion rejects them): images from URLs or file paths (only '#file:N' references to the task's provided images can become pictures; SVG is not supported), math equations ('$...$' inline and '$$...$$' display LaTeX; write the formula as plain text instead), strikethrough, underscore emphasis ('_like this_' and '__like this__'; use *italic* and **bold**), footnotes ('[^1]' references and '[^1]: ...' definitions), HTML comments inside paragraph text (put '<!-- ... -->' on a line of its own to make it a speaker note), code fences indented by spaces (a fence starts at the beginning of its line), more than one '#'- or '##'-heading title on a slide, a '#'- or '##'- heading that is not the slide's first content, raw HTML other than comments, Marp directive comments other than the deck-level footer/header and backgroundColor, thematic breaks, link URLs outside http:// and https:// (javascript:, data:, mailto:, relative paths, Markdown link titles), background keywords other than cover, contain, fit and auto ('![bg left]', '![bg 50%]'), and any frontmatter key other than marp, title, theme, paginate, backgroundColor and backgroundImage.
+
+Deck themes (all three are bundled with the converter; pick the one that fits the audience and content best and write its exact name into the frontmatter theme key):
+{deck_themes}
 
 Rules:
 - Output ONLY the Marp Markdown document. No commentary before or after, no surrounding code fences.
 - Start with a YAML frontmatter block delimited by a line with only `---` and close it with a line with only `---`. It must contain exactly:
   marp: true
   title: <deck title>
-  theme: default
+  theme: <the name of the theme you picked>
   Optionally add `paginate: true` to show the slide number on every slide, and `backgroundColor: '#RRGGBB'` (always quoted; an unquoted '#' is a YAML comment) for a solid deck-wide background color.
 - Separate slides with a line containing only `---`.
 - Every slide starts with exactly one title heading (`#` or `##`) followed by its content.
@@ -19,6 +22,7 @@ Rules:
 - Images provided with the task can be placed with '![alt text](#file:N)' on a line of their own, where N is the 1-based position in the task's images list (PNG or JPEG, max 5 MB each). Only reference images the task actually provides; never invent positions, and never reference images from URLs or any other source.
 - The deck may have a footer and/or header shown on every slide: put '<!-- footer: Some text -->' and '<!-- header: Some text -->' on their own lines right after the frontmatter, before the first slide separator. A single slide may override them with the scoped forms '<!-- _footer: Some text -->' / '<!-- _header: Some text -->' on their own lines inside that slide.
 - A slide may override the deck background color with '<!-- backgroundColor: '#RRGGBB' -->' on its own line anywhere inside that slide.
+- Background images appear in html and pdf output only; the editable PPTX build cannot show them, so keep them decorative. Deck-wide: an optional frontmatter key `backgroundImage: '#file:N'`. Per slide: `![bg](#file:N)` on a line of its own, optionally with a size keyword, e.g. `![bg cover](#file:N)` (contain, fit and auto also work). N is the 1-based position in the task's images list, at most one background image per slide.
 - Two-column slides: put '<!-- columns: 2 -->' on the first line of the slide's content (right after its title) and '<!-- column-break -->' on its own line where the right column should start. Tables are not allowed on column slides; use them on a full-width slide instead.
 - Keep code blocks within one slide: at most about 30 lines, lines at most about 110 characters (longer code is rejected with an error; split it across slides or shorten it).
 - Write 6 to 12 slides unless the user's request explicitly asks for a different number.

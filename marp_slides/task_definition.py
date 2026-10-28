@@ -6,6 +6,11 @@ provider's optional shapes into the task type. Input and output shapes are
 the contract the Assistant UI renders; the field values come from the
 contract constants in :mod:`marp_slides.settings` so the registration, the
 validation and the tests share one source.
+
+Every ShapeDescriptor description is one short human sentence, with no
+pipes and no example lists: the Assistant task form renders it verbatim as
+the field label and (nc_py_api's ShapeDescriptor has no placeholder field)
+as the input hint, so anything longer ends up smeared across the form.
 """
 
 from __future__ import annotations
@@ -18,14 +23,28 @@ from nc_py_api.ex_app.providers.task_processing import (
     TaskType,
 )
 
+from .constructs import ALLOWED_THEMES, THEME_AUTO, THEME_VALUES
 from .settings import (
     EXPECTED_RUNTIME_S,
-    OUTPUT_FORMAT_DESCRIPTION,
     OUTPUT_FORMAT_LABELS,
     OUTPUT_FORMAT_VALUES,
     PROVIDER_ID,
     PROVIDER_NAME,
     TASK_TYPE_ID,
+)
+
+#: Display names for the theme ENUM slot values, derived from the
+#: constructs single source (one per THEME_VALUES entry).
+THEME_LABELS = {
+    THEME_AUTO: "Automatic: the model picks the best fit",
+} | {name: name.capitalize() for name in ALLOWED_THEMES}
+
+#: Description for the ``theme`` input slot (states the allowed values and
+#: that the pptx output ignores the theme).
+THEME_DESCRIPTION = (
+    "Deck theme for the html and pdf outputs: 'auto' (the default; the model "
+    f"picks the best-fitting of {list(ALLOWED_THEMES)}) or one of those theme "
+    "names to require it for the deck. The pptx output ignores the theme."
 )
 
 TASK_TYPE = TaskType(
@@ -43,12 +62,6 @@ TASK_TYPE = TaskType(
             name="prompt",
             description=(
                 "What the presentation should be about and any requirements for it."
-                " | Quarterly business review for the leadership team, highlights"
-                " and outlook"
-                " | Sales pitch for our new product line: problem, solution,"
-                " proof, pricing"
-                " | Project kickoff deck for stakeholders: goals, milestones,"
-                " risks, next steps"
             ),
             shape_type=ShapeType.TEXT,
         ),
@@ -74,15 +87,19 @@ PROVIDER = TaskProcessingProvider(
     optional_input_shape=[
         ShapeDescriptor(
             name="output_format",
-            description=OUTPUT_FORMAT_DESCRIPTION,
+            description=("Output file format for the deck; 'pptx' is the default."),
+            shape_type=ShapeType.ENUM,
+        ),
+        ShapeDescriptor(
+            name="theme",
+            description=THEME_DESCRIPTION,
             shape_type=ShapeType.ENUM,
         ),
         ShapeDescriptor(
             name="images",
             description=(
-                "Optional images to place in the deck. The generated deck references "
-                "them as '![alt text](#file:N)' where N is the 1-based position in "
-                "this list. PNG or JPEG, max 5 MB each (SVG is not supported)."
+                "Optional images to place in the deck (PNG or JPEG, max 5 MB "
+                "each; SVG is not supported)."
             ),
             shape_type=ShapeType.LIST_OF_FILES,
         ),
@@ -92,15 +109,22 @@ PROVIDER = TaskProcessingProvider(
             ShapeEnumValue(name=OUTPUT_FORMAT_LABELS[value], value=value)
             for value in OUTPUT_FORMAT_VALUES
         ],
+        "theme": [
+            ShapeEnumValue(name=THEME_LABELS[value], value=value)
+            for value in THEME_VALUES
+        ],
     },
-    optional_input_shape_defaults={"output_format": OUTPUT_FORMAT_VALUES[0]},
+    optional_input_shape_defaults={
+        "output_format": OUTPUT_FORMAT_VALUES[0],
+        "theme": THEME_AUTO,
+    },
     optional_output_shape=[
         ShapeDescriptor(
             name="slide_deck_source",
             description=(
-                "The deck source of truth: the final validated Marp Markdown "
-                "(<deckname>.md). Feeding it back together with the prompt lets a "
-                "later turn make small edits instead of re-authoring the whole deck."
+                "The deck's source of truth: the final validated Marp "
+                "Markdown (<deckname>.md), kept so a later turn can make "
+                "small edits."
             ),
             shape_type=ShapeType.FILE,
         ),

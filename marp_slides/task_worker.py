@@ -14,7 +14,16 @@ browser. When the inner-LLM output fails extraction or deck
 validation (sampling variance), ONE self-correcting retry is scheduled with
 the validation error as corrective feedback (``MARP_SLIDES_RETRY_LLM=false``
 disables it); gate/image-fetch/build/prompt failures are never retried. Deck images arrive as
-task file inputs (``![alt](#file:N)``). The final validated Marp Markdown is
+task file inputs (``![alt](#file:N)``): the PPTX build inserts them as
+native pictures, while the html/pdf renders materialize them into the
+throwaway marp workdir and hand marp a render-local markdown copy (the
+retained source keeps ``#file:N``). The optional ``theme`` input
+(``auto`` default) steers the deck theme: the authoring prompt teaches
+the model to pick the best-fitting of the three bundled Marp themes or
+carries the user's hard requirement (enforced against the frontmatter as
+a retryable deck failure); html and pdf render through the chosen theme
+while the native PPTX build ignores it (python-pptx has no theme
+surface). The final validated Marp Markdown is
 retained as ``slide_deck_source`` so a later turn can make small edits without
 a full recompute. Every failure path ends in ``report_result`` with an actionable
 ``user_facing_error_message``; deck failures additionally log a
@@ -53,8 +62,10 @@ from .deck_pipeline import (
     validate_deck,
     validate_output_format,
     validate_prompt,
+    validate_theme,
+    validate_theme_override,
 )
-from .editable_pptx import build_pptx
+from .editable_pptx import ParsedDeck, build_pptx
 from .images import (
     fetch_image_blobs,
     referenced_image_indices,
@@ -167,6 +178,7 @@ def _total_llm_cap_error(cap_s: int) -> DeckError:
 def _author_validated_deck(
     nc: NextcloudApp,
     prompt: str,
+    theme: str,
     settings: Settings,
     task_id: int,
     image_file_ids: list[int],
@@ -176,16 +188,17 @@ def _author_validated_deck(
     When the inner-LLM OUTPUT fails extraction or deck validation (sampling
     variance), ONE self-correcting retry is scheduled with the validation
     error appended as corrective feedback (unless ``settings.retry_llm`` is
-    off). The image-reference bounds check runs inside the loop too: a deck
-    referencing ``#file:N`` beyond the provided images list is an
-    output-quality failure the model can correct. The marp HTML gate, the
-    image downloads, the PPTX build and prompt/output_format/images-slot
-    validation are never retried here: those are not output-quality
-    failures. Both attempts share one total-time cap
-    (``settings.total_llm_timeout_s``): a round never gets more than the
-    remaining budget, and an exhausted budget fails the task with an
-    actionable timeout error. Raises the LAST attempt's DeckError when all
-    attempts fail.
+    off). The image-reference bounds check and the theme-override check run
+    inside the loop too: a deck referencing ``#file:N`` beyond the provided
+    images list, or one whose frontmatter theme ignores a hard user
+    override, are output-quality failures the model can correct. The marp
+    HTML gate, the image downloads, the PPTX build and
+    prompt/output_format/theme/images-slot validation are never retried
+    here: those are not output-quality failures. Both attempts share one
+    total-time cap (``settings.total_llm_timeout_s``): a round never gets
+    more than the remaining budget, and an exhausted budget fails the task
+    with an actionable timeout error. Raises the LAST attempt's DeckError
+    when all attempts fail.
     """
     attempts = 2 if settings.retry_llm else 1
     deadline = monotonic() + settings.total_llm_timeout_s
@@ -194,7 +207,7 @@ def _author_validated_deck(
         remaining = deadline - monotonic()
         if remaining <= 0:
             raise _total_llm_cap_error(settings.total_llm_timeout_s)
-        llm_input = build_llm_prompt(prompt)
+        llm_input = build_llm_prompt(prompt, theme)
         if attempt > 1:
             llm_input = (
                 f"{llm_input}\n\n"
@@ -214,6 +227,7 @@ def _author_validated_deck(
                 attempt_markdown, settings.max_deck_bytes, settings.max_slides
             )
             validate_image_references(validated.deck, image_file_ids)
+            validate_theme_override(validated.frontmatter, theme)
             return validated, attempt_markdown
         except DeckError as exc:
             last_error = exc
@@ -225,6 +239,26 @@ def _author_validated_deck(
                 log_excerpt=settings.log_excerpt,
             )
     raise last_error
+
+
+def _fetch_deck_images(
+    nc: NextcloudApp, task_id: int, deck: ParsedDeck, image_file_ids: list[int]
+) -> dict[int, bytes]:
+    """Download every image the deck references (shared by all three output
+    formats: the native PPTX build inserts the blobs as pictures, the
+    html/pdf renders materialize them into the marp workdir). Returns {}
+    for a text-only deck; download failures and cap violations raise
+    DeckError and are never retried."""
+    image_indices = referenced_image_indices(deck)
+    if not image_indices:
+        return {}
+    _report_progress(nc, task_id, 70.0, "fetch images")
+    LOGGER.info(
+        "Task %s: fetching %d deck image(s) via file ids",
+        task_id,
+        len(image_indices),
+    )
+    return fetch_image_blobs(nc, image_file_ids, image_indices)
 
 
 def _report_error(
@@ -244,7 +278,7 @@ def _report_error(
         LOGGER.exception("Failed to report error result for task %s", task_id)
 
 
-def process_task(  # noqa: PLR0912, PLR0915 - the 5%/50%/80% pipeline phases read best sequentially
+def process_task(  # noqa: PLR0915 - the 5%/50%/80% pipeline phases read best sequentially
     nc: NextcloudApp, task: Mapping[str, Any], settings: Settings
 ) -> None:
     """Run the full pipeline for one claimed task; never raises (all failures
@@ -268,34 +302,52 @@ def process_task(  # noqa: PLR0912, PLR0915 - the 5%/50%/80% pipeline phases rea
         nc.set_user(str(task["userId"]))
     try:
         output_format = validate_output_format(task_input.get("output_format"))
+        theme = validate_theme(task_input.get("theme"))
         prompt = validate_prompt(task_input.get("prompt"), settings.max_prompt_chars)
         image_file_ids = validate_images_slot(task_input.get("images"))
 
         validated, markdown = _author_validated_deck(
-            nc, prompt, settings, task_id, image_file_ids
+            nc, prompt, theme, settings, task_id, image_file_ids
         )
         frontmatter = validated.frontmatter
 
         with tempfile.TemporaryDirectory(prefix="marp_slides-") as workdir:
             if output_format == "html":
                 LOGGER.info("Task %s: rendering standalone HTML via marp", task_id)
+                image_blobs = _fetch_deck_images(
+                    nc, task_id, validated.deck, image_file_ids
+                )
                 file_bytes: bytes = render_deck_html(
-                    markdown, workdir, settings.marp_timeout_s, settings.marp_bin
+                    markdown,
+                    workdir,
+                    settings.marp_timeout_s,
+                    settings.marp_bin,
+                    image_blobs=image_blobs,
                 )
                 mime_type = HTML_MIME_TYPE
             elif output_format == "pdf":
                 # The browserless HTML gate runs FIRST so malformed Markdown
                 # never reaches Chromium; only then the (slow, browser-based)
-                # PDF render. Same strict flags, same timeout knob.
+                # PDF render. The gate stays imageless (and without the
+                # local-files flag): the render below materializes the
+                # deck's images into the same throwaway workdir. Same strict
+                # flags, same timeout knob.
                 LOGGER.info("Task %s: running marp HTML syntax gate", task_id)
                 marp_html_gate(
                     markdown, workdir, settings.marp_timeout_s, settings.marp_bin
+                )
+                image_blobs = _fetch_deck_images(
+                    nc, task_id, validated.deck, image_file_ids
                 )
                 LOGGER.info(
                     "Task %s: rendering PDF via marp + bundled Chromium", task_id
                 )
                 file_bytes = render_deck_pdf(
-                    markdown, workdir, settings.marp_timeout_s, settings.marp_bin
+                    markdown,
+                    workdir,
+                    settings.marp_timeout_s,
+                    settings.marp_bin,
+                    image_blobs=image_blobs,
                 )
                 mime_type = PDF_MIME_TYPE
             else:
@@ -304,16 +356,9 @@ def process_task(  # noqa: PLR0912, PLR0915 - the 5%/50%/80% pipeline phases rea
                     markdown, workdir, settings.marp_timeout_s, settings.marp_bin
                 )
 
-                image_blobs: dict[int, bytes] = {}
-                image_indices = referenced_image_indices(validated.deck)
-                if image_indices:
-                    _report_progress(nc, task_id, 70.0, "fetch images")
-                    LOGGER.info(
-                        "Task %s: fetching %d deck image(s) via file ids",
-                        task_id,
-                        len(image_indices),
-                    )
-                    image_blobs = fetch_image_blobs(nc, image_file_ids, image_indices)
+                image_blobs = _fetch_deck_images(
+                    nc, task_id, validated.deck, image_file_ids
+                )
 
                 _report_progress(nc, task_id, 80.0, "build")
                 LOGGER.info("Task %s: building native editable PPTX", task_id)

@@ -80,7 +80,11 @@ def build_pptx(
     ``images`` maps the deck's file-id references (``#file:N``, 1-based) to
     the downloaded picture bytes; it may be None/empty for decks without
     image references (the worker guarantees consistency via
-    :func:`marp_slides.images.validate_image_references`)."""
+    :func:`marp_slides.images.validate_image_references`). Background images
+    (the deck-wide ``backgroundImage`` frontmatter key, per-slide
+    ``![bg](#file:N)`` lines) are html/pdf-only constructs: the parser files
+    them as deck/slide chrome, never blocks, so this build ignores them by
+    construction even though ``images`` may carry their blobs."""
     prs = Presentation()
     prs.slide_width = Emu(SLIDE_WIDTH_EMU)
     prs.slide_height = Emu(SLIDE_HEIGHT_EMU)

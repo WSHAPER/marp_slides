@@ -31,9 +31,13 @@ from .builder import build_pptx
 from .constructs import (
     ALLOWED_FRONTMATTER_KEYS,
     ALLOWED_LINK_SCHEMES,
-    ALLOWED_THEME,
+    ALLOWED_THEMES,
+    MARP_THEMES,
     SUPPORTED_CONSTRUCTS,
+    THEME_AUTO,
+    THEME_VALUES,
     UnsupportedConstructError,
+    validate_background_image_reference,
     validate_hex_color,
 )
 from .directives import normalize_preamble_separators
@@ -51,9 +55,12 @@ from .parser import parse_deck, split_slides
 __all__ = [
     "ALLOWED_FRONTMATTER_KEYS",
     "ALLOWED_LINK_SCHEMES",
-    "ALLOWED_THEME",
+    "ALLOWED_THEMES",
+    "MARP_THEMES",
     "MAX_CODE_LINES",
     "SUPPORTED_CONSTRUCTS",
+    "THEME_AUTO",
+    "THEME_VALUES",
     # Geometry aliases kept for the test suite's import surface
     "_COLUMN_WIDTH_PT",
     "_CONTENT_WIDTH_PT",
@@ -78,6 +85,7 @@ __all__ = [
     "parse_deck",
     "parse_inline",
     "split_slides",
+    "validate_background_image_reference",
     "validate_hex_color",
 ]
 

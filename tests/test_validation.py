@@ -107,6 +107,47 @@ def test_unknown_frontmatter_key_rejected() -> None:
         validate_deck(deck)
 
 
+# --- frontmatter backgroundImage (deck-wide background image) ------------------------
+
+
+def test_background_image_frontmatter_accepted_and_flows_to_deck() -> None:
+    deck = "---\nmarp: true\ntitle: x\nbackgroundImage: '#file:2'\n---\n\n# Hello\n"
+    validated = validate_deck(deck)
+    assert validated.frontmatter["backgroundImage"] == "#file:2"
+    assert validated.deck.background_image == 2
+
+
+def test_background_image_double_quoted_value_accepted() -> None:
+    deck = '---\nmarp: true\ntitle: x\nbackgroundImage: "#file:1"\n---\n\n# Hello\n'
+    assert validate_deck(deck).deck.background_image == 1
+
+
+def test_background_image_non_string_rejected_with_quoting_hint() -> None:
+    # an unquoted '#' is a YAML comment, so the value parses as None/42: the
+    # message teaches the quoted form (same pitfall as backgroundColor)
+    deck = "---\nmarp: true\ntitle: x\nbackgroundImage: #file:1\n---\n\n# Hello\n"
+    with pytest.raises(DeckError, match="QUOTED '#file:N' string"):
+        validate_deck(deck)
+    deck = "---\nmarp: true\ntitle: x\nbackgroundImage: 42\n---\n\n# Hello\n"
+    with pytest.raises(DeckError, match="QUOTED '#file:N' string"):
+        validate_deck(deck)
+
+
+@pytest.mark.parametrize(
+    "value", ["https://example.com/bg.png", "bg.png", "#file:", "file:1"]
+)
+def test_background_image_non_file_reference_shape_rejected(value: str) -> None:
+    deck = f"---\nmarp: true\ntitle: x\nbackgroundImage: '{value}'\n---\n\n# Hello\n"
+    with pytest.raises(DeckError, match="Use exactly '#file:N'"):
+        validate_deck(deck)
+
+
+def test_background_image_zero_reference_rejected() -> None:
+    deck = "---\nmarp: true\ntitle: x\nbackgroundImage: '#file:0'\n---\n\n# Hello\n"
+    with pytest.raises(DeckError, match="1-based"):
+        validate_deck(deck)
+
+
 def test_paginate_frontmatter_flows_to_parsed_deck() -> None:
     deck = "---\nmarp: true\npaginate: true\n---\n\n# Hello\n"
     validated = validate_deck(deck)
@@ -114,9 +155,38 @@ def test_paginate_frontmatter_flows_to_parsed_deck() -> None:
     assert validated.deck.paginate is True
 
 
-def test_theme_other_than_default_rejected() -> None:
-    deck = "---\nmarp: true\ntitle: x\ntheme: gaia\n---\n\n# Hello\n"
-    with pytest.raises(DeckError, match="gaia"):
+@pytest.mark.parametrize("theme", ["default", "gaia", "uncover"])
+def test_bundled_themes_accepted(theme: str) -> None:
+    deck = f"---\nmarp: true\ntitle: x\ntheme: {theme}\n---\n\n# Hello\n"
+    assert validate_deck(deck).frontmatter["theme"] == theme
+
+
+def test_theme_absent_still_allowed() -> None:
+    validated = validate_deck("---\nmarp: true\ntitle: x\n---\n\n# Hello\n")
+    assert "theme" not in validated.frontmatter
+
+
+def test_unknown_theme_rejected_listing_the_bundled_three() -> None:
+    deck = "---\nmarp: true\ntitle: x\ntheme: dark\n---\n\n# Hello\n"
+    with pytest.raises(DeckError) as excinfo:
+        validate_deck(deck)
+    message = str(excinfo.value)
+    assert "'dark'" in message
+    for name in ("default", "gaia", "uncover"):
+        assert f"'{name}'" in message
+
+
+def test_theme_matching_is_case_sensitive() -> None:
+    # marp resolves theme names case-sensitively; only the exact lowercase
+    # bundled names are the contract (the prompt teaches them verbatim)
+    deck = "---\nmarp: true\ntitle: x\ntheme: Gaia\n---\n\n# Hello\n"
+    with pytest.raises(DeckError, match="Gaia"):
+        validate_deck(deck)
+
+
+def test_non_string_theme_rejected() -> None:
+    deck = "---\nmarp: true\ntitle: x\ntheme: 42\n---\n\n# Hello\n"
+    with pytest.raises(DeckError, match="theme 42"):
         validate_deck(deck)
 
 

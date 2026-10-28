@@ -300,6 +300,13 @@ def _reject_marp_directive(note: str, where: str) -> None:
             "comment directive. Put 'paginate: true' in the YAML frontmatter at the top "
             "of the deck (next to marp/title/theme) to number every slide."
         )
+    if name.lower() == "backgroundimage":
+        raise UnsupportedConstructError(
+            f"Unsupported construct on {where}: 'backgroundImage' is never a comment "
+            "directive. Set a deck-wide background image as the frontmatter key "
+            "\"backgroundImage: '#file:N'\", or a per-slide one with "
+            "'![bg](#file:N)' on a line of its own inside the slide."
+        )
     raise UnsupportedConstructError(
         f"Unsupported construct on {where}: Marp directive comments ('{note.split(':', 1)[0]}: ...') "
         "have no native PowerPoint equivalent. Remove the directive."
