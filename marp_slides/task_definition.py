@@ -7,6 +7,11 @@ the contract the Assistant UI renders; the field values come from the
 contract constants in :mod:`marp_slides.settings` so the registration, the
 validation and the tests share one source.
 
+Two task types ship side by side: the authoring task
+(``TASK_TYPE``/``PROVIDER``; prompt in, LLM-authored deck out) and the
+deterministic re-render task (``RE_RENDER_TASK_TYPE``/``RE_RENDER_PROVIDER``;
+Markdown source in, the same validation and rendering out, no LLM).
+
 Every ShapeDescriptor description is one short human sentence, with no
 pipes and no example lists: the Assistant task form renders it verbatim as
 the field label and (nc_py_api's ShapeDescriptor has no placeholder field)
@@ -30,6 +35,10 @@ from .settings import (
     OUTPUT_FORMAT_VALUES,
     PROVIDER_ID,
     PROVIDER_NAME,
+    RE_RENDER_EXPECTED_RUNTIME_S,
+    RE_RENDER_PROVIDER_ID,
+    RE_RENDER_PROVIDER_NAME,
+    RE_RENDER_TASK_TYPE_ID,
     TASK_TYPE_ID,
 )
 
@@ -47,6 +56,18 @@ THEME_DESCRIPTION = (
     "names to require it for the deck. The pptx output ignores the theme."
 )
 
+#: The ``output_format`` ENUM slot values, shared verbatim by both providers
+#: so the re-render dropdown can never drift from the authoring one.
+OUTPUT_FORMAT_ENUM_VALUES = [
+    ShapeEnumValue(name=OUTPUT_FORMAT_LABELS[value], value=value)
+    for value in OUTPUT_FORMAT_VALUES
+]
+
+#: Description for the ``output_format`` slot, shared by both providers.
+OUTPUT_FORMAT_SLOT_DESCRIPTION = (
+    "Output file format for the deck; 'pptx' is the default."
+)
+
 TASK_TYPE = TaskType(
     id=TASK_TYPE_ID,
     name="Generate a slide deck",
@@ -59,7 +80,7 @@ TASK_TYPE = TaskType(
     ),
     input_shape=[
         ShapeDescriptor(
-            name="prompt",
+            name="input",
             description=(
                 "What the presentation should be about and any requirements for it."
             ),
@@ -87,7 +108,7 @@ PROVIDER = TaskProcessingProvider(
     optional_input_shape=[
         ShapeDescriptor(
             name="output_format",
-            description=("Output file format for the deck; 'pptx' is the default."),
+            description=OUTPUT_FORMAT_SLOT_DESCRIPTION,
             shape_type=ShapeType.ENUM,
         ),
         ShapeDescriptor(
@@ -105,10 +126,7 @@ PROVIDER = TaskProcessingProvider(
         ),
     ],
     optional_input_shape_enum_values={
-        "output_format": [
-            ShapeEnumValue(name=OUTPUT_FORMAT_LABELS[value], value=value)
-            for value in OUTPUT_FORMAT_VALUES
-        ],
+        "output_format": OUTPUT_FORMAT_ENUM_VALUES,
         "theme": [
             ShapeEnumValue(name=THEME_LABELS[value], value=value)
             for value in THEME_VALUES
@@ -125,6 +143,87 @@ PROVIDER = TaskProcessingProvider(
                 "The deck's source of truth: the final validated Marp "
                 "Markdown (<deckname>.md), kept so a later turn can make "
                 "small edits."
+            ),
+            shape_type=ShapeType.FILE,
+        ),
+    ],
+)
+
+#: The deterministic re-render task type: renders an edited Marp Markdown
+#: source through the same validation and rendering pipeline as the
+#: authoring task, with no language model involved. This is the second half
+#: of the edit-source-then-re-render flow: the authoring task retains the
+#: deck source, a later turn edits it (by hand or by a chat LLM) and feeds
+#: it back here.
+RE_RENDER_TASK_TYPE = TaskType(
+    id=RE_RENDER_TASK_TYPE_ID,
+    name="Re-render a slide deck",
+    description=(
+        "Renders an existing Marp Markdown deck source into a fresh "
+        "deliverable without a language model: the same validation and the "
+        "same rendering as the generation task, deterministically. Edit the "
+        "retained Markdown source and re-render to update the deck."
+    ),
+    input_shape=[
+        ShapeDescriptor(
+            name="markdown",
+            description=(
+                "The complete Marp Markdown deck source to re-render, "
+                "including the frontmatter block."
+            ),
+            shape_type=ShapeType.TEXT,
+        ),
+    ],
+    output_shape=[
+        ShapeDescriptor(
+            name="slide_deck",
+            description=(
+                "The re-rendered presentation file: a PPTX (default), a "
+                "standalone HTML file or a PDF document, following "
+                "output_format."
+            ),
+            shape_type=ShapeType.FILE,
+        ),
+    ],
+)
+
+#: The deterministic re-render provider: synchronous (the render cost only,
+#: no authoring round), so the expected runtime is 10 seconds instead of
+#: the authoring task's 120.
+RE_RENDER_PROVIDER = TaskProcessingProvider(
+    id=RE_RENDER_PROVIDER_ID,
+    name=RE_RENDER_PROVIDER_NAME,
+    task_type=RE_RENDER_TASK_TYPE_ID,
+    expected_runtime=RE_RENDER_EXPECTED_RUNTIME_S,
+    optional_input_shape=[
+        ShapeDescriptor(
+            name="output_format",
+            description=OUTPUT_FORMAT_SLOT_DESCRIPTION,
+            shape_type=ShapeType.ENUM,
+        ),
+        ShapeDescriptor(
+            name="file_references",
+            description=(
+                "Optional Nextcloud files the markdown references as images "
+                "with '#file:N' (PNG or JPEG, max 5 MB each; SVG is not "
+                "supported)."
+            ),
+            shape_type=ShapeType.LIST_OF_FILES,
+        ),
+    ],
+    optional_input_shape_enum_values={
+        "output_format": OUTPUT_FORMAT_ENUM_VALUES,
+    },
+    optional_input_shape_defaults={
+        "output_format": OUTPUT_FORMAT_VALUES[0],
+    },
+    optional_output_shape=[
+        ShapeDescriptor(
+            name="slide_deck_source",
+            description=(
+                "The deck's source of truth: the validated Marp Markdown "
+                "echoed back (<deckname>.md), so a later turn can keep "
+                "editing it."
             ),
             shape_type=ShapeType.FILE,
         ),

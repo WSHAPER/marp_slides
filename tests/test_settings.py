@@ -23,7 +23,7 @@ def test_defaults_from_empty_env() -> None:
     assert s.app_port == DEFAULT_APP_PORT == 9090
     assert s.marp_timeout_s == DEFAULT_MARP_TIMEOUT_S == 120
     assert s.llm_timeout_s == DEFAULT_LLM_TIMEOUT_S == 300
-    assert s.total_llm_timeout_s == DEFAULT_TOTAL_LLM_TIMEOUT_S == 480
+    assert s.total_llm_timeout_s == DEFAULT_TOTAL_LLM_TIMEOUT_S == 900
     assert s.max_prompt_chars == DEFAULT_MAX_PROMPT_CHARS == 8192
     assert s.max_deck_bytes == DEFAULT_MAX_DECK_BYTES == 1024 * 1024
     assert s.max_slides == DEFAULT_MAX_SLIDES == 60

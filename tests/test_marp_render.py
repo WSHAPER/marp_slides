@@ -16,6 +16,7 @@ from marp_slides.deck_pipeline import (
     render_deck_html,
     render_deck_pdf,
 )
+from marp_slides.theming import ThemingValues
 
 
 def png_bytes() -> bytes:
@@ -369,3 +370,148 @@ def test_render_pdf_inlines_backgrounds_as_data_uris(tmp_path) -> None:
     assert f"backgroundImage: 'url({uri})'" in rendered
     assert f"![bg cover]({uri})" in rendered
     assert "#file:" not in rendered
+
+
+# --- the instance-branded theme rides every conversion path ---------------------
+
+
+def deck_with_theme(theme: str | None = None) -> str:
+    """A minimal validated deck shape whose frontmatter theme key is
+    ``theme`` (omitted entirely when None)."""
+    theme_line = f"theme: {theme}\n" if theme is not None else ""
+    return f"---\nmarp: true\ntitle: t\n{theme_line}---\n\n# T\n"
+
+
+#: Sample instance theming values as the worker derives them from
+#: nc.capabilities["theming"] (hex strings preserved).
+NC_THEMING = ThemingValues.from_capabilities(
+    {
+        "color": "#00679e",
+        "color-text": "#ffffff",
+        "color-element-bright": "#00679e",
+        "color-element-dark": "#004a75",
+        "background": "",
+        "background-text": "#ffffff",
+        "slogan": "A safe home for all your data",
+        "name": "Nextcloud",
+        "cacheBuster": "7",
+    }
+)
+
+THEME_CSS_NAME = "nextcloud-theme.css"
+
+
+@pytest.mark.parametrize(
+    ("render", "runner_factory"),
+    [
+        ("gate", FakeRunner),
+        ("html", FakeRunner),
+        ("pdf", FakePdfRunner),
+    ],
+)
+def test_nextcloud_deck_with_theming_gets_theme_set(tmp_path, render, runner_factory):
+    """Theming values + a deck that selected the nextcloud theme: every
+    conversion path writes nextcloud-theme.css into the workdir, registers
+    it with --theme-set pointing at that file, and keeps the strict flags.
+    """
+    runner = runner_factory()
+    deck = deck_with_theme("nextcloud")
+    if render == "gate":
+        marp_html_gate(deck, tmp_path, runner=runner, theming_values=NC_THEMING)
+    elif render == "html":
+        render_deck_html(deck, tmp_path, runner=runner, theming_values=NC_THEMING)
+    else:
+        render_deck_pdf(deck, tmp_path, runner=runner, theming_values=NC_THEMING)
+    (argv,) = runner.argvs
+    assert "--no-html" in argv  # the strict flags stay untouched
+    assert "--allow-local-files" not in argv
+    theme_path = tmp_path / THEME_CSS_NAME
+    assert argv[argv.index("--theme-set") + 1] == str(theme_path)
+    assert theme_path.is_file()
+    css = theme_path.read_text()
+    assert css.startswith("/*! @theme nextcloud */")
+    assert "#00679e" in css  # the instance's own branding values
+
+
+@pytest.mark.parametrize("theme", ["default", "gaia", "uncover", None])
+@pytest.mark.parametrize(
+    ("render", "runner_factory"),
+    [
+        ("gate", FakeRunner),
+        ("html", FakeRunner),
+        ("pdf", FakePdfRunner),
+    ],
+)
+def test_builtin_theme_deck_never_gets_theme_set(
+    tmp_path, theme, render, runner_factory
+):
+    """A deck under a built-in theme (or with no theme key) never gets
+    --theme-set, no matter that theming values are available: the branded
+    CSS only applies to a deck that actually selected the nextcloud theme."""
+    runner = runner_factory()
+    deck = deck_with_theme(theme)
+    if render == "gate":
+        marp_html_gate(deck, tmp_path, runner=runner, theming_values=NC_THEMING)
+    elif render == "html":
+        render_deck_html(deck, tmp_path, runner=runner, theming_values=NC_THEMING)
+    else:
+        render_deck_pdf(deck, tmp_path, runner=runner, theming_values=NC_THEMING)
+    (argv,) = runner.argvs
+    assert "--theme-set" not in argv
+    assert not (tmp_path / THEME_CSS_NAME).exists()
+
+
+@pytest.mark.parametrize(
+    ("render", "runner_factory"),
+    [
+        ("gate", FakeRunner),
+        ("html", FakeRunner),
+        ("pdf", FakePdfRunner),
+    ],
+)
+def test_missing_theming_values_means_no_theme_set(tmp_path, render, runner_factory):
+    """Theming values None (no capabilities available): nothing written,
+    nothing flagged — even for a deck whose theme IS nextcloud."""
+    runner = runner_factory()
+    deck = deck_with_theme("nextcloud")
+    if render == "gate":
+        marp_html_gate(deck, tmp_path, runner=runner, theming_values=None)
+    elif render == "html":
+        render_deck_html(deck, tmp_path, runner=runner, theming_values=None)
+    else:
+        render_deck_pdf(deck, tmp_path, runner=runner, theming_values=None)
+    (argv,) = runner.argvs
+    assert "--theme-set" not in argv
+    assert not (tmp_path / THEME_CSS_NAME).exists()
+
+
+def test_theme_set_identical_across_gate_html_pdf(tmp_path) -> None:
+    """Gate/render parity under theming: the branded theme rides ALL THREE
+    paths identically — the gate argv equals the HTML argv outright, the
+    PDF argv modulo the ``-o`` target — so no output format can render a
+    theme the gate never checked."""
+    gate_runner, html_runner, pdf_runner = (
+        FakeRunner(),
+        FakeRunner(),
+        FakePdfRunner(),
+    )
+    deck = deck_with_theme("nextcloud")
+    marp_html_gate(deck, tmp_path, runner=gate_runner, theming_values=NC_THEMING)
+    render_deck_html(deck, tmp_path, runner=html_runner, theming_values=NC_THEMING)
+    render_deck_pdf(deck, tmp_path, runner=pdf_runner, theming_values=NC_THEMING)
+    gate_argv, html_argv, pdf_argv = (
+        gate_runner.argvs[0],
+        html_runner.argvs[0],
+        pdf_runner.argvs[0],
+    )
+    assert gate_argv == html_argv
+
+    def with_output(argv: list[str], new_out: str) -> list[str]:
+        swapped = list(argv)
+        swapped[swapped.index("-o") + 1] = new_out
+        return swapped
+
+    assert with_output(pdf_argv, str(tmp_path / "deck.html")) == gate_argv
+    for argv in (gate_argv, html_argv, pdf_argv):
+        assert argv.count("--theme-set") == 1
+        assert argv[argv.index("--theme-set") + 1].endswith(THEME_CSS_NAME)

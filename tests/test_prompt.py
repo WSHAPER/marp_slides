@@ -123,22 +123,47 @@ def test_system_prompt_teaches_the_frontmatter_theme_key() -> None:
 
 def test_system_prompt_teaches_background_images() -> None:
     """Background images: both forms are taught with one example each, the
-    size-keyword set matches the validator, and the PPTX limitation is
-    stated so the model keeps backgrounds decorative."""
+    keyword set matches the validator (splits, vertical, scale, w:/h:
+    lengths), and the PPTX limitation is stated so the model keeps
+    backgrounds decorative."""
     for fragment in (
         "backgroundImage: '#file:N'",  # deck-wide frontmatter example
         "![bg](#file:N)",  # per-slide example
         "![bg cover](#file:N)",  # size-keyword example
         "contain, fit and auto also work",  # the rest of the keyword set
+        "![bg left:33%](#file:N)",  # sized split example
+        "![bg left w:50%](#file:N)",  # combined direction + length example
         "at most one background image per slide",
         "editable PPTX build cannot show them",  # the PPTX limitation
         "html and pdf output only",
     ):
         assert fragment in DECK_SYSTEM_PROMPT, f"prompt lost bg rule: {fragment}"
-    # the not-supported list teaches the unsupported bg keywords and keeps
-    # the frontmatter key allow-list current
-    assert "'![bg left]'" in DECK_SYSTEM_PROMPT
+    # the not-supported list keeps the frontmatter key allow-list current
+    # (the extended bg keywords and the style keys are no longer forbidden)
     assert (
         "frontmatter key other than marp, title, theme, paginate, "
-        "backgroundColor and backgroundImage" in DECK_SYSTEM_PROMPT
+        "backgroundColor, backgroundImage, backgroundSize, backgroundPosition "
+        "and backgroundRepeat" in DECK_SYSTEM_PROMPT
     )
+
+
+def test_system_prompt_teaches_background_style_keys() -> None:
+    """The deck-wide backgroundSize/backgroundPosition/backgroundRepeat keys
+    are taught as quoted CSS value strings alongside backgroundImage."""
+    for fragment in (
+        "backgroundSize: 'cover'",
+        "backgroundPosition: 'center'",
+        "backgroundRepeat: 'no-repeat'",
+    ):
+        assert fragment in DECK_SYSTEM_PROMPT, f"prompt lost style key: {fragment}"
+
+
+def test_system_prompt_teaches_inline_image_sizing() -> None:
+    """w:/h: sizing keywords ride along in the alt text of content images,
+    with the PPTX native-size caveat stated."""
+    for fragment in (
+        "![w:200px](#file:N)",
+        "h:, width: and height: likewise",
+        "inserts the picture at its native size",
+    ):
+        assert fragment in DECK_SYSTEM_PROMPT, f"prompt lost sizing rule: {fragment}"

@@ -15,6 +15,7 @@ from __future__ import annotations
 import re
 
 from .blocks import (
+    BackgroundImageSpec,
     Block,
     CodeBlock,
     ColumnBreak,
@@ -81,6 +82,7 @@ class SlideState:
         self.title_level = 0
         self.background: str | None = None
         self.background_image: int | None = None
+        self.background_image_spec: BackgroundImageSpec | None = None
         self.columns: int | None = None
         self.slide_directives: Directives = {}
 
@@ -193,6 +195,7 @@ def _finish_slide(state: SlideState) -> ParsedSlide:
         notes=tuple(state.notes),
         background=state.background,
         background_image=state.background_image,
+        background_image_spec=state.background_image_spec,
         columns=state.columns,
         footer_override=state.slide_directives.get("footer"),
         header_override=state.slide_directives.get("header"),

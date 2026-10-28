@@ -118,11 +118,17 @@ def referenced_image_indices(deck: ParsedDeck) -> list[int]:
     return sorted(indices)
 
 
-def validate_image_references(deck: ParsedDeck, file_ids: list[int]) -> list[int]:
-    """Check every ``#file:N`` reference against the images actually provided
-    with the task. Returns the sorted referenced indices. The bounds error is
-    an output-quality failure of the deck (correctable by the inner LLM), so
-    the worker runs it INSIDE the self-correcting retry loop."""
+def validate_image_references(
+    deck: ParsedDeck, file_ids: list[int], *, require_complete: bool = False
+) -> list[int]:
+    """Validate the deck's ``#file:N`` references against the task's images.
+
+    Bounds check (always): every referenced index must be in 1..N.
+    Completeness check (opt-in via ``require_complete=True``): every index
+    in 1..N must appear at least once, so no provided image is silently
+    dropped. The completeness check is deck-level only (never per-slide,
+    where a single slide referencing one image is correct).
+    """
     indices = referenced_image_indices(deck)
     provided = len(file_ids)
     for index in indices:
@@ -137,6 +143,16 @@ def validate_image_references(deck: ParsedDeck, file_ids: list[int]) -> list[int
                 f"Unsupported construct in the deck: it references '#file:{index}', "
                 f"{detail}. Reference only images that were provided, or remove the "
                 "image reference."
+            )
+    if require_complete and provided > 0:
+        missing = sorted(set(range(1, provided + 1)) - set(indices))
+        if missing:
+            detail = ", ".join(f"#file:{m}" for m in missing)
+            raise DeckError(
+                f"Invalid deck: {len(missing)} of {provided} provided image(s) "
+                f"are never referenced in the deck ({detail}). Every image "
+                "attached to the task MUST appear on at least one slide. "
+                "Add slides or content that reference the missing images."
             )
     return indices
 

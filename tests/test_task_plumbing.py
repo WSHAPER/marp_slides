@@ -1,8 +1,13 @@
-"""Task result plumbing with a fake NextcloudApp (no network, no docker)."""
+"""Task result plumbing with a fake NextcloudApp (no network, no docker).
+
+The inner LLM is faked as a stream of ``core:text2text`` outputs: the FIRST
+call returns the Phase 1 outline JSON, every later call returns one slide
+Markdown attempt (a failed slide consumes a second output for its retry)."""
 
 from __future__ import annotations
 
 import io
+import json
 from dataclasses import replace
 from types import SimpleNamespace
 
@@ -12,6 +17,7 @@ from PIL import Image
 from marp_slides import task_worker
 from marp_slides.deck_pipeline import DeckError
 from marp_slides.ocs_tasks import NestedTaskError
+from marp_slides.outline import assemble_deck, parse_outline
 from marp_slides.settings import (
     HTML_MIME_TYPE,
     MARKDOWN_MIME_TYPE,
@@ -19,6 +25,7 @@ from marp_slides.settings import (
     PPTX_MIME_TYPE,
     Settings,
 )
+from marp_slides.theming import THEME_NAME, THEMING_DEFAULTS, ThemingValues
 
 TASK = {
     "id": 5,
@@ -29,9 +36,46 @@ TASK = {
     "input": {"prompt": "a deck about bees", "output_format": "pptx"},
 }
 
-VALID_DECK_WITH_IMAGE = (
-    "---\nmarp: true\ntitle: Img Deck\ntheme: default\n---\n\n"
-    "# Img Deck\n\n---\n\n## Diagram\n\n![The diagram](#file:1)\n"
+#: The default 3-slide Phase 1 plan (matching the slide outputs below).
+OUTLINE = {
+    "title": "Quarterly Review",
+    "theme": "default",
+    "slides": [
+        {"title": "Quarterly Review", "summary": "Open the deck.", "has_image": False},
+        {"title": "Results", "summary": "Revenue and churn.", "has_image": False},
+        {"title": "Next steps", "summary": "Two actions.", "has_image": False},
+    ],
+}
+OUTLINE_JSON = json.dumps(OUTLINE, indent=2)
+
+#: One valid Markdown attempt per planned slide.
+SLIDES_OK = [
+    "# Quarterly Review\n\n<!-- Welcome everyone and set the agenda. -->",
+    "## Results\n\n- Revenue up 12%\n- Churn down 3 points",
+    "## Next steps\n\n1. Ship the new onboarding\n2. Hire two engineers",
+]
+
+#: What the worker must retain as the deck source: the assembled deck.
+ASSEMBLED = assemble_deck(parse_outline(OUTLINE_JSON), SLIDES_OK)
+
+#: An image-deck variant (slide 2 planned with the task's one image).
+IMG_OUTLINE_JSON = json.dumps(
+    {
+        "title": "Img Deck",
+        "theme": "default",
+        "slides": [
+            {"title": "Img Deck", "summary": "Open.", "has_image": False},
+            {"title": "Diagram", "summary": "The diagram.", "has_image": True},
+        ],
+    },
+    indent=2,
+)
+IMG_SLIDES_OK = [
+    "# Img Deck\n\nOpening paragraph.",
+    "## Diagram\n\n![The diagram](#file:1)",
+]
+IMG_ASSEMBLED = assemble_deck(
+    parse_outline(IMG_OUTLINE_JSON, image_count=1), IMG_SLIDES_OK
 )
 
 
@@ -107,11 +151,16 @@ def fake_node(
 
 def make_fake_nc(
     files: FakeFilesAPI | None = None,
+    capabilities: object | None = None,
 ) -> tuple[SimpleNamespace, FakeTaskProcessingAPI]:
+    """The fake app client: task-processing + files APIs and the session
+    capabilities dict (defaulting to empty; ``capabilities["theming"]`` is
+    what the branded-theme fetch reads)."""
     api = FakeTaskProcessingAPI()
     nc = SimpleNamespace(
         providers=SimpleNamespace(task_processing=api),
         files=files,
+        capabilities=capabilities if capabilities is not None else {},
         set_user=lambda user_id: (
             None
         ),  # impersonation: recorded implicitly, DAV auth models it
@@ -144,46 +193,90 @@ def no_real_build(monkeypatch):
     )
 
 
+# --- the two-phase inner-LLM fake -------------------------------------------------
+
+
+def make_llm(outputs: list[str]):
+    """Fake schedule_and_wait returning the given outputs in order (one per
+    LLM round: outline first, then slide attempts as consumed); records the
+    nested-task inputs so tests can inspect prompts and feedback."""
+    calls: list[dict] = []
+
+    def fake(nc, task_type, task_input, **kwargs):
+        calls.append(task_input)
+        return {"output": outputs[len(calls) - 1]}
+
+    return fake, calls
+
+
+def deck_scheduler(slides: list[str] | None = None, outline_json: str = OUTLINE_JSON):
+    """A fake whose happy path is: outline round, then one round per slide
+    (a slide retry consumes the next extra output)."""
+    stream = [outline_json, *(slides if slides is not None else SLIDES_OK)]
+    return make_llm(stream)
+
+
+SUCCESS_OUTPUT = {"slide_deck": 42, "slide_deck_source": 43}
+
+
 def test_success_reports_slide_deck_and_source(monkeypatch, settings) -> None:
-    monkeypatch.setattr(
-        task_worker,
-        "schedule_and_wait",
-        lambda *a, **kw: {
-            "output": __import__("tests.conftest", fromlist=["VALID_DECK"]).VALID_DECK
-        },
-    )
+    fake, _calls = deck_scheduler()
+    monkeypatch.setattr(task_worker, "schedule_and_wait", fake)
     nc, api = make_fake_nc()
     task_worker.process_task(nc, TASK, settings)
     assert api.results == [
         {
             "task_id": 5,
-            "output": {"slide_deck": 42, "slide_deck_source": 43},
+            "output": SUCCESS_OUTPUT,
             "error_message": None,
             "user_facing_error_message": None,
         }
     ]
-    # the PPTX is uploaded first, the retained deck source (validated Marp
-    # Markdown, same stem, .md + text/markdown) right alongside it
+    # the PPTX is uploaded first, the retained deck source (the assembled
+    # validated Marp Markdown, same stem, .md + text/markdown) right after
     assert [(t, f[0], f[2]) for t, f in api.uploads] == [
         (5, "Quarterly-Review.pptx", PPTX_MIME_TYPE),
         (5, "Quarterly-Review.md", MARKDOWN_MIME_TYPE),
     ]
-    from tests.conftest import VALID_DECK
-
     assert api.uploads[0][1][1] == b"PK-editable"
-    # the retained source is the extracted markdown verbatim (strip() is
-    # extract_markdown's only touch)
-    assert api.uploads[1][1][1] == VALID_DECK.strip().encode("utf-8")
+    assert api.uploads[1][1][1] == ASSEMBLED.encode("utf-8")
     assert api.progress  # progress was reported
+
+
+def test_success_uses_one_llm_call_per_slide(monkeypatch, settings) -> None:
+    """The happy path costs exactly 1 + N nested LLM rounds (no whole-deck
+    re-authoring anymore)."""
+    fake, calls = deck_scheduler()
+    monkeypatch.setattr(task_worker, "schedule_and_wait", fake)
+    nc, api = make_fake_nc()
+    task_worker.process_task(nc, TASK, settings)
+    assert len(calls) == 1 + len(OUTLINE["slides"])
+    (result,) = api.results
+    assert result["output"] == SUCCESS_OUTPUT
+
+
+def test_phase_prompts_carry_request_plan_and_scope(monkeypatch, settings) -> None:
+    """Round 1 asks for the JSON outline from the user request; rounds 2..N
+    ask for exactly one slide each, scoped by the plan."""
+    fake, calls = deck_scheduler()
+    monkeypatch.setattr(task_worker, "schedule_and_wait", fake)
+    nc, _api = make_fake_nc()
+    task_worker.process_task(nc, TASK, settings)
+    outline_prompt, *slide_prompts = [call["input"] for call in calls]
+    assert "a deck about bees" in outline_prompt
+    assert "JSON object" in outline_prompt
+    assert 'Write ONLY slide 2 of 3: "Results".' in slide_prompts[1]
+    for prompt in slide_prompts:
+        assert "a deck about bees" not in prompt  # slides see the plan, not the prompt
+        assert "deck plan" in prompt
 
 
 # --- output_format=html tasks ship a standalone HTML file ---------------
 
 
-def test_html_task_reports_html_file(monkeypatch, settings, valid_deck) -> None:
-    monkeypatch.setattr(
-        task_worker, "schedule_and_wait", lambda *a, **kw: {"output": valid_deck}
-    )
+def test_html_task_reports_html_file(monkeypatch, settings) -> None:
+    fake, _calls = deck_scheduler()
+    monkeypatch.setattr(task_worker, "schedule_and_wait", fake)
     nc, api = make_fake_nc()
     task_worker.process_task(
         nc,
@@ -191,7 +284,7 @@ def test_html_task_reports_html_file(monkeypatch, settings, valid_deck) -> None:
         settings,
     )
     (result,) = api.results
-    assert result["output"] == {"slide_deck": 42, "slide_deck_source": 43}
+    assert result["output"] == SUCCESS_OUTPUT
     task_id, uploaded = api.uploads[0]
     assert task_id == 5
     filename, payload, mime = uploaded
@@ -203,14 +296,11 @@ def test_html_task_reports_html_file(monkeypatch, settings, valid_deck) -> None:
     assert mime == HTML_MIME_TYPE == "text/html"
 
 
-def test_html_task_never_touches_pptx_builder_or_gate(
-    monkeypatch, settings, valid_deck
-) -> None:
+def test_html_task_never_touches_pptx_builder_or_gate(monkeypatch, settings) -> None:
     """The html path renders with marp directly (the render IS the gate) and
     must not invoke the syntax gate or python-pptx at all."""
-    monkeypatch.setattr(
-        task_worker, "schedule_and_wait", lambda *a, **kw: {"output": valid_deck}
-    )
+    fake, _calls = deck_scheduler()
+    monkeypatch.setattr(task_worker, "schedule_and_wait", fake)
     calls: list[str] = []
 
     def forbidden_gate(md, wd, t, bin):
@@ -235,12 +325,12 @@ def test_html_task_never_touches_pptx_builder_or_gate(
         settings,
     )
     (result,) = api.results
-    assert result["output"] == {"slide_deck": 42, "slide_deck_source": 43}
+    assert result["output"] == SUCCESS_OUTPUT
     assert calls == ["render"]
 
 
-def test_html_render_failure_not_retried(monkeypatch, settings, valid_deck) -> None:
-    fake, calls = make_scheduler([valid_deck])
+def test_html_render_failure_not_retried(monkeypatch, settings) -> None:
+    fake, calls = deck_scheduler()
     monkeypatch.setattr(task_worker, "schedule_and_wait", fake)
 
     def failing(md, wd, t, bin, image_blobs=None):
@@ -253,18 +343,15 @@ def test_html_render_failure_not_retried(monkeypatch, settings, valid_deck) -> N
         dict(TASK, input={"prompt": "a deck about bees", "output_format": "html"}),
         settings,
     )
-    assert len(calls) == 1  # render failures are not output-quality failures
+    assert len(calls) == 4  # 1 outline + 3 slides: render failures never retry
     (result,) = api.results
     assert result["output"] is None
     assert "Marp HTML rendering" in result["user_facing_error_message"]
 
 
-def test_html_output_format_normalization_end_to_end(
-    monkeypatch, settings, valid_deck
-) -> None:
-    monkeypatch.setattr(
-        task_worker, "schedule_and_wait", lambda *a, **kw: {"output": valid_deck}
-    )
+def test_html_output_format_normalization_end_to_end(monkeypatch, settings) -> None:
+    fake, _calls = deck_scheduler()
+    monkeypatch.setattr(task_worker, "schedule_and_wait", fake)
     nc, api = make_fake_nc()
     task_worker.process_task(
         nc,
@@ -280,10 +367,9 @@ def test_html_output_format_normalization_end_to_end(
 # --- output_format=pdf: gate first, then the Chromium render ------------
 
 
-def test_pdf_task_reports_pdf_file(monkeypatch, settings, valid_deck) -> None:
-    monkeypatch.setattr(
-        task_worker, "schedule_and_wait", lambda *a, **kw: {"output": valid_deck}
-    )
+def test_pdf_task_reports_pdf_file(monkeypatch, settings) -> None:
+    fake, _calls = deck_scheduler()
+    monkeypatch.setattr(task_worker, "schedule_and_wait", fake)
     nc, api = make_fake_nc()
     task_worker.process_task(
         nc,
@@ -291,7 +377,7 @@ def test_pdf_task_reports_pdf_file(monkeypatch, settings, valid_deck) -> None:
         settings,
     )
     (result,) = api.results
-    assert result["output"] == {"slide_deck": 42, "slide_deck_source": 43}
+    assert result["output"] == SUCCESS_OUTPUT
     task_id, uploaded = api.uploads[0]
     assert task_id == 5
     filename, payload, mime = uploaded
@@ -304,15 +390,12 @@ def test_pdf_task_reports_pdf_file(monkeypatch, settings, valid_deck) -> None:
     assert src_name == "Quarterly-Review.md" and src_mime == "text/markdown"
 
 
-def test_pdf_task_gate_first_then_render_never_pptx(
-    monkeypatch, settings, valid_deck
-) -> None:
+def test_pdf_task_gate_first_then_render_never_pptx(monkeypatch, settings) -> None:
     """The pdf path runs the browserless HTML gate BEFORE the Chromium render
     (malformed markdown never reaches the browser) and never touches
     python-pptx."""
-    monkeypatch.setattr(
-        task_worker, "schedule_and_wait", lambda *a, **kw: {"output": valid_deck}
-    )
+    fake, _calls = deck_scheduler()
+    monkeypatch.setattr(task_worker, "schedule_and_wait", fake)
     calls: list[str] = []
 
     def fake_gate(md, wd, t, bin):
@@ -340,12 +423,12 @@ def test_pdf_task_gate_first_then_render_never_pptx(
         settings,
     )
     (result,) = api.results
-    assert result["output"] == {"slide_deck": 42, "slide_deck_source": 43}
+    assert result["output"] == SUCCESS_OUTPUT
     assert calls == ["gate", "render_pdf"]  # strict order, gate first
 
 
-def test_pdf_render_failure_not_retried(monkeypatch, settings, valid_deck) -> None:
-    fake, calls = make_scheduler([valid_deck])
+def test_pdf_render_failure_not_retried(monkeypatch, settings) -> None:
+    fake, calls = deck_scheduler()
     monkeypatch.setattr(task_worker, "schedule_and_wait", fake)
 
     def failing(md, wd, t, bin, image_blobs=None):
@@ -358,18 +441,16 @@ def test_pdf_render_failure_not_retried(monkeypatch, settings, valid_deck) -> No
         dict(TASK, input={"prompt": "a deck about bees", "output_format": "pdf"}),
         settings,
     )
-    assert len(calls) == 1  # render failures are gate-class, never retried
+    assert len(calls) == 4  # render failures are gate-class, never retried
     (result,) = api.results
     assert result["output"] is None
     assert "Marp PDF rendering" in result["user_facing_error_message"]
 
 
-def test_pdf_gate_failure_skips_chromium_render(
-    monkeypatch, settings, valid_deck
-) -> None:
+def test_pdf_gate_failure_skips_chromium_render(monkeypatch, settings) -> None:
     """A gate failure surfaces BEFORE the (expensive) browser render is ever
     spawned, and like every gate failure it is not retried."""
-    fake, calls = make_scheduler([valid_deck])
+    fake, calls = deck_scheduler()
     monkeypatch.setattr(task_worker, "schedule_and_wait", fake)
 
     def failing(md, wd, t, bin):
@@ -386,18 +467,15 @@ def test_pdf_gate_failure_skips_chromium_render(
         dict(TASK, input={"prompt": "a deck about bees", "output_format": "pdf"}),
         settings,
     )
-    assert len(calls) == 1
+    assert len(calls) == 4
     (result,) = api.results
     assert result["output"] is None
     assert "failed Marp validation" in result["user_facing_error_message"]
 
 
-def test_pdf_output_format_normalization_end_to_end(
-    monkeypatch, settings, valid_deck
-) -> None:
-    monkeypatch.setattr(
-        task_worker, "schedule_and_wait", lambda *a, **kw: {"output": valid_deck}
-    )
+def test_pdf_output_format_normalization_end_to_end(monkeypatch, settings) -> None:
+    fake, _calls = deck_scheduler()
+    monkeypatch.setattr(task_worker, "schedule_and_wait", fake)
     nc, api = make_fake_nc()
     task_worker.process_task(
         nc,
@@ -428,19 +506,18 @@ def test_missing_prompt_reports_user_facing_error(monkeypatch, settings) -> None
     assert "prompt" in result["user_facing_error_message"]
 
 
-def test_invalid_markdown_error_includes_parser_output(
-    monkeypatch, settings, valid_deck
-) -> None:
-    monkeypatch.setattr(
-        task_worker,
-        "schedule_and_wait",
-        lambda *a, **kw: {"output": "---\nmarp: true\ntitle: [oops\n---\n\n# Hi\n"},
-    )
+def test_slide_construct_error_surfaces_verbatim(monkeypatch, settings) -> None:
+    """A slide the construct validator rejects fails the task with the
+    validator's own actionable message (no gate ever sees it)."""
+    bad = "# Bad\n\nCost is $x^2$ today"
+    slides = [SLIDES_OK[0], bad, bad]  # slide 2 fails both attempts
+    fake, _calls = deck_scheduler(slides)
+    monkeypatch.setattr(task_worker, "schedule_and_wait", fake)
     nc, api = make_fake_nc()
     task_worker.process_task(nc, TASK, settings)
     (result,) = api.results
     assert result["output"] is None
-    assert "Parser output" in result["user_facing_error_message"]
+    assert "math equations are not supported" in result["user_facing_error_message"]
 
 
 def test_nested_llm_failure_surfaces_error_text(monkeypatch, settings) -> None:
@@ -460,11 +537,8 @@ def test_unexpected_exception_reports_generic_error(monkeypatch, settings) -> No
     def explode(deck, title, images=None):
         raise RuntimeError("pptx library exploded")
 
-    monkeypatch.setattr(
-        task_worker,
-        "schedule_and_wait",
-        lambda *a, **kw: {"output": "---\nmarp: true\n---\n\n# x\n"},
-    )
+    fake, _calls = deck_scheduler()
+    monkeypatch.setattr(task_worker, "schedule_and_wait", fake)
     monkeypatch.setattr(task_worker, "build_pptx", explode)
     nc, api = make_fake_nc()
     task_worker.process_task(nc, TASK, settings)
@@ -473,12 +547,9 @@ def test_unexpected_exception_reports_generic_error(monkeypatch, settings) -> No
     assert "pptx library exploded" in result["error_message"]
 
 
-def test_deck_error_from_gate_or_build_surfaces(
-    monkeypatch, settings, valid_deck
-) -> None:
-    monkeypatch.setattr(
-        task_worker, "schedule_and_wait", lambda *a, **kw: {"output": valid_deck}
-    )
+def test_deck_error_from_gate_or_build_surfaces(monkeypatch, settings) -> None:
+    fake, _calls = deck_scheduler()
+    monkeypatch.setattr(task_worker, "schedule_and_wait", fake)
 
     def failing(md, wd, t, bin):
         raise DeckError("The generated deck failed Marp validation (exit code 1).")
@@ -490,41 +561,38 @@ def test_deck_error_from_gate_or_build_surfaces(
     assert "failed Marp validation" in result["user_facing_error_message"]
 
 
-def test_deck_failure_logs_extracted_markdown_excerpt(
+def test_slide_failure_logs_extracted_markdown_excerpt(
     monkeypatch, settings, caplog
 ) -> None:
-    """Diagnosability: deck failures log a 240-char excerpt of the
-    EXTRACTED markdown (deck content only, never the user prompt), newlines
-    escaped so the record stays a single WARNING line."""
-    bad_deck = "---\nmarp: true\n---\n<!-- footer: F -->\n---\n# T\n\n### ###\n"
-    monkeypatch.setattr(
-        task_worker,
-        "schedule_and_wait",
-        lambda *a, **kw: {"output": "Here is your deck:\n\n" + bad_deck},
-    )
+    """Diagnosability: a failed slide attempt logs a 240-char excerpt of the
+    EXTRACTED slide markdown (deck content only, never the user prompt),
+    newlines escaped so the record stays a single WARNING line."""
+    slides = [SLIDES_OK[0], "# Bad slide\n\n### ###", SLIDES_OK[1], SLIDES_OK[2]]
+    fake, _calls = deck_scheduler(slides)
+    monkeypatch.setattr(task_worker, "schedule_and_wait", fake)
     nc, api = make_fake_nc()
     with caplog.at_level("WARNING", logger="marp_slides.task_worker"):
         task_worker.process_task(nc, TASK, settings)
     (result,) = api.results
-    assert result["output"] is None  # the deck genuinely failed
-    warning = next(
+    assert result["output"] == SUCCESS_OUTPUT  # the retry corrected the slide
+    attempt1 = next(
         r
         for r in caplog.records
-        if r.levelname == "WARNING" and "extracted markdown starts" in r.getMessage()
+        if r.levelname == "WARNING" and "slide 2 attempt 1 failed" in r.getMessage()
     )
-    message = warning.getMessage()
+    message = attempt1.getMessage()
     excerpt = message.split("extracted markdown starts: ", 1)[1]
-    assert excerpt.startswith("---\\nmarp: true")  # prose stripped, \n escaped
+    assert excerpt.startswith("# Bad slide\\n\\n### ###")  # \n escaped
     assert "\n" not in excerpt  # single log line
     assert len(excerpt) <= 240
     assert "bees" not in message  # the user prompt never leaks
 
 
-def test_deck_failure_before_extraction_logs_no_excerpt(
+def test_slide_failure_before_extraction_logs_no_excerpt(
     monkeypatch, settings, caplog
 ) -> None:
     monkeypatch.setattr(
-        task_worker, "schedule_and_wait", lambda *a, **kw: {"output": ""}
+        task_worker, "schedule_and_wait", lambda *a, **kw: {"output": "  "}
     )
     nc, _api = make_fake_nc()
     with caplog.at_level("WARNING", logger="marp_slides.task_worker"):
@@ -539,12 +607,9 @@ def test_log_excerpt_off_suppresses_excerpt_keeps_error_line(
     """F6: MARP_SLIDES_LOG_EXCERPT=false keeps the WARNING error line (what
     failed, which task) but drops the 240-char markdown excerpt: deck
     content never reaches docker logs in privacy-sensitive deployments."""
-    bad_deck = "---\nmarp: true\n---\n<!-- footer: F -->\n---\n# T\n\n### ###\n"
-    monkeypatch.setattr(
-        task_worker,
-        "schedule_and_wait",
-        lambda *a, **kw: {"output": "Here is your deck:\n\n" + bad_deck},
-    )
+    slides = [SLIDES_OK[0], "# Bad slide\n\n### ###", SLIDES_OK[1], SLIDES_OK[2]]
+    fake, _calls = deck_scheduler(slides)
+    monkeypatch.setattr(task_worker, "schedule_and_wait", fake)
     nc, _api = make_fake_nc()
     quiet = replace(settings, log_excerpt=False)
     with caplog.at_level("WARNING", logger="marp_slides.task_worker"):
@@ -552,7 +617,7 @@ def test_log_excerpt_off_suppresses_excerpt_keeps_error_line(
     warnings = [r.getMessage() for r in caplog.records if r.levelname == "WARNING"]
     assert warnings  # the error line itself still logs
     assert not any("extracted markdown starts" in w for w in warnings)
-    assert not any("marp: true" in w for w in warnings)  # no deck content at all
+    assert not any("### ###" in w for w in warnings)  # no deck content at all
 
 
 def test_llm_empty_output_is_actionable(monkeypatch, settings) -> None:
@@ -566,8 +631,6 @@ def test_llm_empty_output_is_actionable(monkeypatch, settings) -> None:
 
 
 def test_loop_processes_until_stop(monkeypatch, settings) -> None:
-    from tests.conftest import VALID_DECK
-
     nc, api = make_fake_nc()
     state = {"calls": 0}
 
@@ -580,9 +643,8 @@ def test_loop_processes_until_stop(monkeypatch, settings) -> None:
 
     api.next_task = fake_next_task
     monkeypatch.setattr(task_worker, "NextcloudApp", lambda: nc)
-    monkeypatch.setattr(
-        task_worker, "schedule_and_wait", lambda *a, **kw: {"output": VALID_DECK}
-    )
+    fake, _calls = deck_scheduler()
+    monkeypatch.setattr(task_worker, "schedule_and_wait", fake)
     monkeypatch.setattr(task_worker, "_wait_for_tasks", lambda interval: None)
     task_worker.APP_ENABLED.set()
     try:
@@ -591,10 +653,7 @@ def test_loop_processes_until_stop(monkeypatch, settings) -> None:
         task_worker.THREAD_STOP_EVENT.clear()
         task_worker.APP_ENABLED.clear()
     assert state["calls"] == 2
-    assert api.results and api.results[0]["output"] == {
-        "slide_deck": 42,
-        "slide_deck_source": 43,
-    }
+    assert api.results and api.results[0]["output"] == SUCCESS_OUTPUT
 
 
 def test_loop_survives_network_errors(monkeypatch, settings) -> None:
@@ -620,88 +679,91 @@ def test_loop_survives_network_errors(monkeypatch, settings) -> None:
     assert calls["n"] == 3
 
 
-# --- one self-correcting inner-LLM retry -------------------------------------
+# --- per-slide self-correcting retry -------------------------------------
 
 
-def make_scheduler(outputs: list[str]):
-    """Fake schedule_and_wait returning the given outputs in order; records
-    the nested-task inputs so tests can inspect the corrective feedback."""
-    calls: list[dict] = []
-
-    def fake(nc, task_type, task_input, **kwargs):
-        calls.append(task_input)
-        return {"output": outputs[len(calls) - 1]}
-
-    return fake, calls
-
-
-BAD_DECK_EMPTY_SUBHEADING = (
-    "---\nmarp: true\n---\n<!-- footer: F -->\n---\n# T\n\n### ###\n"
-)
-
-
-def test_first_fail_second_pass_retries_once(
-    monkeypatch, settings, valid_deck, caplog
-) -> None:
-    fake, calls = make_scheduler([BAD_DECK_EMPTY_SUBHEADING, valid_deck])
+def test_bad_slide_retries_only_itself(monkeypatch, settings, caplog) -> None:
+    """A slide that fails validation once retries ITSELF with the validation
+    error as corrective feedback: the other slides are never re-authored."""
+    slides = [SLIDES_OK[0], "## Bad\n\n### ###", SLIDES_OK[1], SLIDES_OK[2]]
+    fake, calls = deck_scheduler(slides)
     monkeypatch.setattr(task_worker, "schedule_and_wait", fake)
     nc, api = make_fake_nc()
     with caplog.at_level("WARNING", logger="marp_slides.task_worker"):
         task_worker.process_task(nc, TASK, settings)
     (result,) = api.results
-    assert result["output"] == {
-        "slide_deck": 42,
-        "slide_deck_source": 43,
-    }  # second attempt shipped
-    assert len(calls) == 2
-    from marp_slides.deck_pipeline import build_llm_prompt
-
-    base = build_llm_prompt("a deck about bees")
-    assert calls[0]["input"] == base  # first round: unchanged prompt
-    # retry round: same system+user prompt plus the corrective feedback
-    assert calls[1]["input"].startswith(base)
-    assert "Your previous attempt failed validation:" in calls[1]["input"]
-    assert "subheading is empty" in calls[1]["input"]
-    assert calls[1]["input"].endswith("Return ONLY the corrected complete deck.")
-    # the failed first attempt is logged with its number + excerpt rule
-    attempt1 = next(
-        r for r in caplog.records if "deck attempt 1 failed" in r.getMessage()
-    )
-    assert "extracted markdown starts" in attempt1.getMessage()
-    assert not any("deck attempt 2 failed" in r.getMessage() for r in caplog.records)
+    assert result["output"] == SUCCESS_OUTPUT  # corrected slide shipped
+    assert len(calls) == 5  # outline + slide 1 + slide 2 twice + slide 3
+    retry_input = calls[3]["input"]  # slide 2's second attempt
+    assert retry_input.startswith(calls[2]["input"].split("\n\nThe deck plan")[0])
+    assert "Your previous attempt for this slide failed validation:" in retry_input
+    assert "subheading is empty" in retry_input
+    assert retry_input.endswith("Return ONLY the corrected slide.")
+    assert api.uploads[1][1][1] == ASSEMBLED.encode("utf-8")  # full deck retained
+    messages = [r.getMessage() for r in caplog.records]
+    assert any("slide 2 attempt 1 failed" in m for m in messages)
+    assert not any("slide 2 attempt 2 failed" in m for m in messages)
 
 
-def test_second_fail_reports_second_attempt_error(
+def test_slide_failing_twice_reports_second_attempt_error(
     monkeypatch, settings, caplog
 ) -> None:
-    bad_no_frontmatter = "Here is a deck without frontmatter.\n\n# Title\n"
-    fake, calls = make_scheduler([BAD_DECK_EMPTY_SUBHEADING, bad_no_frontmatter])
+    slides = [
+        SLIDES_OK[0],
+        "## Bad\n\n### ###",
+        "# Still bad\n\n### ###",
+        SLIDES_OK[2],
+    ]
+    fake, calls = deck_scheduler(slides)
     monkeypatch.setattr(task_worker, "schedule_and_wait", fake)
     nc, api = make_fake_nc()
     with caplog.at_level("WARNING", logger="marp_slides.task_worker"):
         task_worker.process_task(nc, TASK, settings)
-    assert len(calls) == 2  # exactly one retry, then give up
+    assert len(calls) == 4  # outline + slide 1 + slide 2's two failed attempts
     (result,) = api.results
     assert result["output"] is None
-    assert "frontmatter" in result["user_facing_error_message"]  # 2nd attempt
-    assert "subheading" not in result["user_facing_error_message"]  # not 1st
+    assert "subheading is empty" in result["user_facing_error_message"]  # 2nd attempt
     messages = [r.getMessage() for r in caplog.records]
-    assert any("deck attempt 1 failed" in m for m in messages)
-    assert any("deck attempt 2 failed" in m for m in messages)
+    assert any("slide 2 attempt 1 failed" in m for m in messages)
+    assert any("slide 2 attempt 2 failed" in m for m in messages)
 
 
-def test_first_pass_single_schedule(monkeypatch, settings, valid_deck) -> None:
-    fake, calls = make_scheduler([valid_deck])
+def test_multi_slide_response_rejected_and_corrected(monkeypatch, settings) -> None:
+    """A slide round that answers with the WHOLE deck is rejected (exactly
+    one slide expected) and the retry corrects it."""
+    whole_deck_attempt = ASSEMBLED
+    slides = [SLIDES_OK[0], whole_deck_attempt, SLIDES_OK[1], SLIDES_OK[2]]
+    fake, calls = deck_scheduler(slides)
     monkeypatch.setattr(task_worker, "schedule_and_wait", fake)
     nc, api = make_fake_nc()
     task_worker.process_task(nc, TASK, settings)
-    assert len(calls) == 1
+    assert len(calls) == 5
+    assert "exactly one" in calls[3]["input"]  # corrective feedback
     (result,) = api.results
-    assert result["output"] == {"slide_deck": 42, "slide_deck_source": 43}
+    assert result["output"] == SUCCESS_OUTPUT
 
 
-def test_gate_failure_not_retried(monkeypatch, settings, valid_deck) -> None:
-    fake, calls = make_scheduler([valid_deck])
+def test_deck_footer_directive_in_slide_retried(monkeypatch, settings) -> None:
+    """The assembly owns deck-level footer/header directives; a slide that
+    carries one anyway is an output-quality failure corrected on retry."""
+    slides = [
+        SLIDES_OK[0],
+        "## Results\n\n- up 12%\n\n<!-- footer: mine -->",
+        SLIDES_OK[1],
+        SLIDES_OK[2],
+    ]
+    fake, calls = deck_scheduler(slides)
+    monkeypatch.setattr(task_worker, "schedule_and_wait", fake)
+    nc, api = make_fake_nc()
+    task_worker.process_task(nc, TASK, settings)
+    assert len(calls) == 5
+    assert "deck-level footer/header" in calls[3]["input"]
+    (result,) = api.results
+    assert result["output"] == SUCCESS_OUTPUT
+
+
+def test_gate_failure_not_retried(monkeypatch, settings) -> None:
+    fake, calls = deck_scheduler()
     monkeypatch.setattr(task_worker, "schedule_and_wait", fake)
 
     def failing(md, wd, t, bin):
@@ -710,13 +772,13 @@ def test_gate_failure_not_retried(monkeypatch, settings, valid_deck) -> None:
     monkeypatch.setattr(task_worker, "marp_html_gate", failing)
     nc, api = make_fake_nc()
     task_worker.process_task(nc, TASK, settings)
-    assert len(calls) == 1  # gate failures are not output-quality failures
+    assert len(calls) == 4  # gate failures are not output-quality failures
     (result,) = api.results
     assert "failed Marp validation" in result["user_facing_error_message"]
 
 
-def test_build_failure_not_retried(monkeypatch, settings, valid_deck) -> None:
-    fake, calls = make_scheduler([valid_deck])
+def test_build_failure_not_retried(monkeypatch, settings) -> None:
+    fake, calls = deck_scheduler()
     monkeypatch.setattr(task_worker, "schedule_and_wait", fake)
 
     def exploding(deck, title, images=None):
@@ -725,19 +787,17 @@ def test_build_failure_not_retried(monkeypatch, settings, valid_deck) -> None:
     monkeypatch.setattr(task_worker, "build_pptx", exploding)
     nc, api = make_fake_nc()
     task_worker.process_task(nc, TASK, settings)
-    assert len(calls) == 1
+    assert len(calls) == 4
     (result,) = api.results
     assert "pptx builder" in result["user_facing_error_message"]
 
 
-def test_build_value_error_maps_to_deck_failure(
-    monkeypatch, settings, valid_deck
-) -> None:
+def test_build_value_error_maps_to_deck_failure(monkeypatch, settings) -> None:
     """lxml raises a bare ValueError for non-XML-compatible strings (e.g.
     control characters a validator gap let through); it must land on the
     deck-failure path with the builder's own explanation, not the generic
     internal-error path, and never be retried."""
-    fake, calls = make_scheduler([valid_deck])
+    fake, calls = deck_scheduler()
     monkeypatch.setattr(task_worker, "schedule_and_wait", fake)
 
     def exploding(deck, title, images=None):
@@ -749,7 +809,7 @@ def test_build_value_error_maps_to_deck_failure(
     monkeypatch.setattr(task_worker, "build_pptx", exploding)
     nc, api = make_fake_nc()
     task_worker.process_task(nc, TASK, settings)
-    assert len(calls) == 1  # build failures are never retried
+    assert len(calls) == 4  # build failures are never retried
     (result,) = api.results
     assert result["output"] is None
     assert "could not be built" in result["user_facing_error_message"]
@@ -757,19 +817,22 @@ def test_build_value_error_maps_to_deck_failure(
     assert "internal error" not in result["user_facing_error_message"]
 
 
-def test_retry_disabled_by_knob(monkeypatch, valid_deck) -> None:
-    fake, calls = make_scheduler([BAD_DECK_EMPTY_SUBHEADING, valid_deck])
+def test_retry_disabled_by_knob(monkeypatch, settings) -> None:
+    """MARP_SLIDES_RETRY_LLM=false: every phase gets exactly one attempt, so
+    a bad slide fails the task instead of retrying."""
+    slides = [SLIDES_OK[0], "## Bad\n\n### ###", SLIDES_OK[2]]
+    fake, calls = deck_scheduler(slides)
     monkeypatch.setattr(task_worker, "schedule_and_wait", fake)
     nc, api = make_fake_nc()
     task_worker.process_task(nc, TASK, Settings(retry_llm=False))
-    assert len(calls) == 1  # knob off: no second round
+    assert len(calls) == 3  # outline + slide 1 + slide 2: no second attempts
     (result,) = api.results
     assert result["output"] is None
     assert "subheading is empty" in result["user_facing_error_message"]
 
 
 def test_prompt_failure_schedules_nothing(monkeypatch, settings) -> None:
-    fake, calls = make_scheduler(["unused"])
+    fake, calls = deck_scheduler(["unused"])
     monkeypatch.setattr(task_worker, "schedule_and_wait", fake)
     nc, api = make_fake_nc()
     task_worker.process_task(nc, dict(TASK, input={}), settings)
@@ -791,13 +854,71 @@ def test_task_without_usable_id_is_dropped_not_leaked(monkeypatch, settings) -> 
     assert api.results == []  # nothing to report to; nothing raised either
 
 
+# --- outline retry semantics ---------------------------------------------
+
+
+def test_bad_outline_json_retried_then_corrected(monkeypatch, settings) -> None:
+    """An outline round that is not valid JSON retries once with the parse
+    error as corrective feedback; the corrected outline ships."""
+    fake, calls = deck_scheduler()
+    outputs = ["Sure! How about ten slides about bees?", OUTLINE_JSON, *SLIDES_OK]
+    fake, calls = make_llm(outputs)
+    monkeypatch.setattr(task_worker, "schedule_and_wait", fake)
+    nc, api = make_fake_nc()
+    task_worker.process_task(nc, TASK, settings)
+    assert len(calls) == 5
+    assert "Your previous outline failed validation:" in calls[1]["input"]
+    assert "not valid JSON" in calls[1]["input"]
+    (result,) = api.results
+    assert result["output"] == SUCCESS_OUTPUT
+
+
+def test_outline_failing_twice_fails_task(monkeypatch, settings, caplog) -> None:
+    fake, _c = make_llm(["no json here", "still no json"])
+    monkeypatch.setattr(task_worker, "schedule_and_wait", fake)
+    nc, api = make_fake_nc()
+    with caplog.at_level("WARNING", logger="marp_slides.task_worker"):
+        task_worker.process_task(nc, TASK, settings)
+    (result,) = api.results
+    assert result["output"] is None
+    assert "not valid JSON" in result["user_facing_error_message"]
+    messages = [r.getMessage() for r in caplog.records]
+    assert any("outline attempt 1 failed" in m for m in messages)
+    assert any("outline attempt 2 failed" in m for m in messages)
+
+
+def test_outline_has_image_without_images_corrected(monkeypatch, settings) -> None:
+    """A plan that marks a slide has_image with no images provided fails
+    outline validation and the retry corrects the flag."""
+    bad = json.dumps(
+        {
+            "title": "Quarterly Review",
+            "theme": "default",
+            "slides": [
+                {"title": "Quarterly Review", "summary": "Open.", "has_image": True},
+                {"title": "Results", "summary": "Revenue.", "has_image": False},
+                {"title": "Next steps", "summary": "Two actions.", "has_image": False},
+            ],
+        },
+        indent=2,
+    )
+    fake, calls = make_llm([bad, OUTLINE_JSON, *SLIDES_OK])
+    monkeypatch.setattr(task_worker, "schedule_and_wait", fake)
+    nc, api = make_fake_nc()
+    task_worker.process_task(nc, TASK, settings)
+    assert len(calls) == 5
+    assert "provides no images" in calls[1]["input"]
+    (result,) = api.results
+    assert result["output"] == SUCCESS_OUTPUT
+
+
 # --- images via NC file ids + source retention ------------------------------
 
 
 def test_success_with_images_downloads_and_builds_with_blobs(
     monkeypatch, settings
 ) -> None:
-    fake, _calls = make_scheduler([VALID_DECK_WITH_IMAGE])
+    fake, _calls = deck_scheduler(IMG_SLIDES_OK, outline_json=IMG_OUTLINE_JSON)
     monkeypatch.setattr(task_worker, "schedule_and_wait", fake)
     blob = png_bytes()
     files = FakeFilesAPI({101: fake_node(101)}, {101: blob})
@@ -813,17 +934,21 @@ def test_success_with_images_downloads_and_builds_with_blobs(
         nc, dict(TASK, input={"prompt": "x", "images": [101]}), settings
     )
     (result,) = api.results
-    assert result["output"] == {"slide_deck": 42, "slide_deck_source": 43}
+    assert result["output"] == SUCCESS_OUTPUT
     assert built["images"] == {1: blob}  # 1-based position -> downloaded bytes
     assert files.downloaded == [101]  # only the referenced file was fetched
     assert api.uploads[0][1][1] == b"PK-with-picture"
 
 
-def test_unreferenced_input_images_never_downloaded(monkeypatch, settings) -> None:
-    # the LLM wrote a text-only deck: the provided images stay untouched
-    from tests.conftest import VALID_DECK
-
-    fake, _calls = make_scheduler([VALID_DECK])
+def test_deck_ignoring_provided_image_fails_after_re_authoring(
+    monkeypatch, settings
+) -> None:
+    """The deck-level completeness gate: a text-only deck with an image
+    provided fails validation on every authoring attempt (the fake stream
+    never corrects it), downloads nothing, and surfaces the completeness
+    error to the user."""
+    stream = [OUTLINE_JSON, *SLIDES_OK, OUTLINE_JSON, *SLIDES_OK]
+    fake, calls = make_llm(stream)
     monkeypatch.setattr(task_worker, "schedule_and_wait", fake)
     files = FakeFilesAPI({101: fake_node(101)}, {101: png_bytes()})
     nc, api = make_fake_nc(files=files)
@@ -831,8 +956,36 @@ def test_unreferenced_input_images_never_downloaded(monkeypatch, settings) -> No
         nc, dict(TASK, input={"prompt": "x", "images": [101]}), settings
     )
     (result,) = api.results
-    assert result["output"]["slide_deck"] == 42  # success, no fetch
-    assert files.downloaded == []
+    assert result["output"] is None
+    assert "never referenced" in result["user_facing_error_message"]
+    assert len(calls) == 2 * (1 + len(SLIDES_OK))  # two full authoring attempts
+    # the first attempt plans blind, the retry's outline round carries the
+    # completeness error as corrective feedback
+    assert "never referenced" not in calls[0]["input"]
+    assert "never referenced" in calls[1 + len(SLIDES_OK)]["input"]
+    assert files.downloaded == []  # no deck ever shipped, nothing fetched
+
+
+def test_missing_image_retry_re_authors_until_complete(monkeypatch, settings) -> None:
+    """The completeness failure is self-correcting: the second authoring
+    attempt re-plans (its outline round sees the error as feedback, the
+    plan marks a slide has_image) and the corrected deck ships."""
+    stream = [OUTLINE_JSON, *SLIDES_OK, IMG_OUTLINE_JSON, *IMG_SLIDES_OK]
+    fake, calls = make_llm(stream)
+    monkeypatch.setattr(task_worker, "schedule_and_wait", fake)
+    blob = png_bytes()
+    files = FakeFilesAPI({101: fake_node(101)}, {101: blob})
+    nc, api = make_fake_nc(files=files)
+    task_worker.process_task(
+        nc, dict(TASK, input={"prompt": "x", "images": [101]}), settings
+    )
+    (result,) = api.results
+    assert result["output"] == SUCCESS_OUTPUT
+    retry_outline_input = calls[1 + len(SLIDES_OK)]["input"]
+    assert "never referenced" in retry_outline_input
+    assert '"has_image": true' in retry_outline_input  # the feedback teaches the fix
+    assert files.downloaded == [101]  # the corrected deck fetched its image
+    assert api.uploads[1][1][1] == IMG_ASSEMBLED.encode("utf-8")
 
 
 # --- v0.1.x: html/pdf renders materialize the deck images ----------------------
@@ -841,9 +994,9 @@ def test_unreferenced_input_images_never_downloaded(monkeypatch, settings) -> No
 def test_html_task_with_images_passes_blobs_to_render(monkeypatch, settings) -> None:
     """The html render receives the fetched blobs (1-based -> bytes); the
     rewrite to workdir file names happens INSIDE the render, so the worker
-    still hands it the retained markdown and the uploaded source keeps
+    still hands it the assembled markdown and the uploaded source keeps
     '#file:N'."""
-    fake, _calls = make_scheduler([VALID_DECK_WITH_IMAGE])
+    fake, _calls = deck_scheduler(IMG_SLIDES_OK, outline_json=IMG_OUTLINE_JSON)
     monkeypatch.setattr(task_worker, "schedule_and_wait", fake)
     blob = png_bytes()
     files = FakeFilesAPI({101: fake_node(101)}, {101: blob})
@@ -864,7 +1017,7 @@ def test_html_task_with_images_passes_blobs_to_render(monkeypatch, settings) -> 
     (result,) = api.results
     assert result["output"]["slide_deck"] == 42
     assert seen["blobs"] == {1: blob}
-    assert seen["markdown"] == VALID_DECK_WITH_IMAGE.strip()  # rewrite is render-local
+    assert seen["markdown"] == IMG_ASSEMBLED
     assert files.downloaded == [101]
     _, (src_name, src_bytes, src_mime) = api.uploads[1]
     assert src_name == "Img-Deck.md" and src_mime == "text/markdown"
@@ -875,21 +1028,20 @@ def test_pdf_task_gates_imageless_then_renders_with_blobs(
     monkeypatch, settings
 ) -> None:
     """The pdf path keeps its strict order: the browserless gate runs on the
-    original markdown (imageless, no local-files flag), then the render
+    assembled markdown (imageless, no local-files flag), then the render
     receives the fetched blobs; the retained source keeps '#file:N'."""
-    fake, _calls = make_scheduler([VALID_DECK_WITH_IMAGE])
+    fake, _calls = deck_scheduler(IMG_SLIDES_OK, outline_json=IMG_OUTLINE_JSON)
     monkeypatch.setattr(task_worker, "schedule_and_wait", fake)
     blob = png_bytes()
     files = FakeFilesAPI({101: fake_node(101)}, {101: blob})
     nc, api = make_fake_nc(files=files)
     calls: list[str] = []
-    stripped = VALID_DECK_WITH_IMAGE.strip()  # extract_markdown strips the output
 
     def fake_gate(md, wd, t, bin):
-        calls.append(f"gate:{md == stripped}")
+        calls.append(f"gate:{md == IMG_ASSEMBLED}")
 
     def fake_render(md, wd, t, bin, image_blobs=None):
-        calls.append(f"render:{image_blobs == {1: blob}}:{md == stripped}")
+        calls.append(f"render:{image_blobs == {1: blob}}:{md == IMG_ASSEMBLED}")
         return b"%PDF-1.7 standalone"
 
     monkeypatch.setattr(task_worker, "marp_html_gate", fake_gate)
@@ -909,8 +1061,8 @@ def test_pdf_task_gates_imageless_then_renders_with_blobs(
 
 def test_html_image_fetch_failure_not_retried(monkeypatch, settings) -> None:
     """Input-data failures stay unretryable on the html path too: a GIF
-    input file fails the task after exactly one LLM round."""
-    fake, calls = make_scheduler([VALID_DECK_WITH_IMAGE])
+    input file fails the task without any extra LLM round."""
+    fake, calls = deck_scheduler(IMG_SLIDES_OK, outline_json=IMG_OUTLINE_JSON)
     monkeypatch.setattr(task_worker, "schedule_and_wait", fake)
     node = fake_node(101, mimetype="image/gif", name="a.gif")
     files = FakeFilesAPI({101: node}, {101: png_bytes()})
@@ -920,7 +1072,7 @@ def test_html_image_fetch_failure_not_retried(monkeypatch, settings) -> None:
         dict(TASK, input={"prompt": "x", "output_format": "html", "images": [101]}),
         settings,
     )
-    assert len(calls) == 1
+    assert len(calls) == 3  # outline + 2 slides: fetch failures never retry
     (result,) = api.results
     assert result["output"] is None
     assert "only PNG and JPEG" in result["user_facing_error_message"]
@@ -932,28 +1084,30 @@ def test_html_image_fetch_failure_not_retried(monkeypatch, settings) -> None:
 def test_theme_override_mismatch_retried_then_corrected(
     monkeypatch, settings, caplog
 ) -> None:
-    """A hard theme override the deck ignores is an output-quality failure:
-    the override clause rides BOTH prompts, the mismatch feeds the retry as
-    corrective feedback, and the corrected attempt ships."""
-    wrong = "---\nmarp: true\ntitle: t\ntheme: default\n---\n\n# T\n\nText only.\n"
-    right = wrong.replace("theme: default", "theme: gaia")
-    fake, calls = make_scheduler([wrong, right])
+    """A hard theme override the outline ignores is an output-quality
+    failure: the override clause rides BOTH outline prompts, the mismatch
+    feeds the outline retry as corrective feedback, and the corrected plan
+    ships with the user's theme in the assembled frontmatter."""
+    wrong = OUTLINE_JSON
+    right = json.dumps(dict(OUTLINE, theme="gaia"), indent=2)
+    fake, calls = make_llm([wrong, right, *SLIDES_OK])
     monkeypatch.setattr(task_worker, "schedule_and_wait", fake)
     nc, api = make_fake_nc()
     with caplog.at_level("WARNING", logger="marp_slides.task_worker"):
         task_worker.process_task(
             nc, dict(TASK, input={"prompt": "x", "theme": "gaia"}), settings
         )
-    assert len(calls) == 2
+    assert len(calls) == 5
     for llm_input in (calls[0]["input"], calls[1]["input"]):
         assert "requires the 'gaia' theme" in llm_input
     assert "requires theme 'gaia'" in calls[1]["input"]  # corrective feedback
     (result,) = api.results
-    assert result["output"] == {"slide_deck": 42, "slide_deck_source": 43}
+    assert result["output"] == SUCCESS_OUTPUT
+    assert b"theme: gaia" in api.uploads[1][1][1]  # assembled frontmatter
 
 
 def test_invalid_theme_input_fails_before_any_llm_round(monkeypatch, settings) -> None:
-    fake, calls = make_scheduler(["unused"])
+    fake, calls = make_llm(["unused"])
     monkeypatch.setattr(task_worker, "schedule_and_wait", fake)
     nc, api = make_fake_nc()
     task_worker.process_task(
@@ -966,48 +1120,284 @@ def test_invalid_theme_input_fails_before_any_llm_round(monkeypatch, settings) -
 
 
 def test_auto_theme_never_constrains_the_pick(monkeypatch, settings) -> None:
-    """theme=auto (explicit or absent): no override clause in the prompt and
-    any bundled theme in the deck passes validation."""
-    deck = "---\nmarp: true\ntitle: t\ntheme: uncover\n---\n\n# T\n\nText only.\n"
-    fake, calls = make_scheduler([deck])
+    """theme=auto (explicit or absent): no override clause in the outline
+    prompt and any bundled theme in the plan passes validation."""
+    outline = json.dumps(dict(OUTLINE, theme="uncover"), indent=2)
+    fake, calls = make_llm([outline, *SLIDES_OK])
     monkeypatch.setattr(task_worker, "schedule_and_wait", fake)
     nc, api = make_fake_nc()
     task_worker.process_task(
         nc, dict(TASK, input={"prompt": "x", "theme": "auto"}), settings
     )
-    assert len(calls) == 1
+    assert len(calls) == 4
     assert "requires the" not in calls[0]["input"]
     (result,) = api.results
-    assert result["output"] == {"slide_deck": 42, "slide_deck_source": 43}
+    assert result["output"] == SUCCESS_OUTPUT
+
+
+# --- v0.2: the branded nextcloud theme fetches the instance theming -------------
+
+
+#: A realistic theming section as it arrives in nc.capabilities (live-shape
+#: values from the nc35 stack; hex color strings, absolute background URL,
+#: cache-buster string).
+NC_THEMING_CAPS = {
+    "color": "#0082c9",
+    "color-text": "#ffffff",
+    "color-element-bright": "#0082c9",
+    "color-element-dark": "#004a75",
+    "background": "http://nextcloud.local:8350/apps/theming/img/background/flow.webp",
+    "background-text": "#ffffff",
+    "slogan": "A safe home for all your data",
+    "name": "Nextcloud",
+    "cacheBuster": "5041b5db",
+}
+
+#: The default plan with the branded theme picked.
+NC_OUTLINE_JSON = json.dumps(dict(OUTLINE, theme=THEME_NAME), indent=2)
+
+
+class UnreadableCapabilities:
+    """A capabilities object whose read fails at fetch time (network gone,
+    session broken): the branded-theme resolution must survive it."""
+
+    def get(self, key, default=None):
+        raise RuntimeError("capabilities unavailable")
+
+
+def nc_deck_scheduler():
+    """The happy-path fake with the branded theme in the plan."""
+    return deck_scheduler(SLIDES_OK, outline_json=NC_OUTLINE_JSON)
+
+
+def test_nextcloud_theme_passes_instance_theming_to_html_render(
+    monkeypatch, settings
+) -> None:
+    """theme=nextcloud + html: the worker reads nc.capabilities['theming']
+    at task time and hands the parsed ThemingValues to the render (the
+    render pipeline writes the branded theme CSS from them)."""
+    fake, _calls = nc_deck_scheduler()
+    monkeypatch.setattr(task_worker, "schedule_and_wait", fake)
+    nc, api = make_fake_nc(capabilities={"theming": NC_THEMING_CAPS})
+    seen: dict[str, object] = {}
+
+    def fake_render(md, wd, t, bin, image_blobs=None, theming_values=None):
+        seen["theming_values"] = theming_values
+        return b"<html>standalone</html>"
+
+    monkeypatch.setattr(task_worker, "render_deck_html", fake_render)
+    task_worker.process_task(
+        nc,
+        dict(
+            TASK, input={"prompt": "x", "theme": "nextcloud", "output_format": "html"}
+        ),
+        settings,
+    )
+    (result,) = api.results
+    assert result["output"] == SUCCESS_OUTPUT
+    values = seen["theming_values"]
+    assert isinstance(values, ThemingValues)
+    assert values.color == "#0082c9"
+    assert values.background.startswith("http://nextcloud.local")
+    assert values.slogan == "A safe home for all your data"
+    assert values.cache_buster == "5041b5db"
+    # the assembled deck actually asks for the branded theme
+    assert b"theme: nextcloud" in api.uploads[1][1][1]
+
+
+def test_nextcloud_theme_without_theming_section_falls_back_to_defaults(
+    monkeypatch, settings, caplog
+) -> None:
+    """Empty capabilities (no 'theming' section): the branded render still
+    happens with the module's stock defaults — a theming gap is logged,
+    never a task failure."""
+    fake, _calls = nc_deck_scheduler()
+    monkeypatch.setattr(task_worker, "schedule_and_wait", fake)
+    nc, api = make_fake_nc(capabilities={})
+    seen: dict[str, object] = {}
+
+    def fake_render(md, wd, t, bin, image_blobs=None, theming_values=None):
+        seen["theming_values"] = theming_values
+        return b"<html>standalone</html>"
+
+    monkeypatch.setattr(task_worker, "render_deck_html", fake_render)
+    with caplog.at_level("WARNING", logger="marp_slides.task_worker"):
+        task_worker.process_task(
+            nc,
+            dict(
+                TASK,
+                input={"prompt": "x", "theme": "nextcloud", "output_format": "html"},
+            ),
+            settings,
+        )
+    (result,) = api.results
+    assert result["output"] == SUCCESS_OUTPUT
+    assert seen["theming_values"] == ThemingValues.from_capabilities({})
+    assert seen["theming_values"].color == THEMING_DEFAULTS["color"]
+    messages = [r.getMessage() for r in caplog.records if r.levelname == "WARNING"]
+    assert any("no theming capabilities" in m for m in messages)
+
+
+def test_nextcloud_theme_capabilities_failure_never_fails_task(
+    monkeypatch, settings, caplog
+) -> None:
+    """A capabilities read that RAISES is absorbed the same way as an
+    empty one: stock-default branding, task success, the reason logged."""
+    fake, _calls = nc_deck_scheduler()
+    monkeypatch.setattr(task_worker, "schedule_and_wait", fake)
+    nc, api = make_fake_nc(capabilities=UnreadableCapabilities())
+    seen: dict[str, object] = {}
+
+    def fake_render(md, wd, t, bin, image_blobs=None, theming_values=None):
+        seen["theming_values"] = theming_values
+        return b"<html>standalone</html>"
+
+    monkeypatch.setattr(task_worker, "render_deck_html", fake_render)
+    with caplog.at_level("WARNING", logger="marp_slides.task_worker"):
+        task_worker.process_task(
+            nc,
+            dict(
+                TASK,
+                input={"prompt": "x", "theme": "nextcloud", "output_format": "html"},
+            ),
+            settings,
+        )
+    (result,) = api.results
+    assert result["output"] == SUCCESS_OUTPUT
+    assert seen["theming_values"] == ThemingValues.from_capabilities({})
+    messages = [r.getMessage() for r in caplog.records if r.levelname == "WARNING"]
+    assert any("could not read theming capabilities" in m for m in messages)
+
+
+def test_nextcloud_theme_pdf_gates_and_renders_with_theming(
+    monkeypatch, settings
+) -> None:
+    """The pdf path keeps gate/render parity for the branded theme: BOTH
+    marp calls receive the same ThemingValues (the browserless gate must
+    accept the generated theme before Chromium applies it)."""
+    fake, _calls = nc_deck_scheduler()
+    monkeypatch.setattr(task_worker, "schedule_and_wait", fake)
+    nc, api = make_fake_nc(capabilities={"theming": NC_THEMING_CAPS})
+    calls: list[tuple[str, object]] = []
+
+    def fake_gate(md, wd, t, bin, theming_values=None):
+        calls.append(("gate", theming_values))
+
+    def fake_render(md, wd, t, bin, image_blobs=None, theming_values=None):
+        calls.append(("pdf", theming_values))
+        return b"%PDF-1.7 standalone"
+
+    monkeypatch.setattr(task_worker, "marp_html_gate", fake_gate)
+    monkeypatch.setattr(task_worker, "render_deck_pdf", fake_render)
+    task_worker.process_task(
+        nc,
+        dict(TASK, input={"prompt": "x", "theme": "nextcloud", "output_format": "pdf"}),
+        settings,
+    )
+    (result,) = api.results
+    assert result["output"] == SUCCESS_OUTPUT
+    assert [step for step, _values in calls] == ["gate", "pdf"]  # gate first
+    gate_values, pdf_values = calls[0][1], calls[1][1]
+    assert isinstance(gate_values, ThemingValues)
+    assert gate_values is pdf_values  # one fetch, both marp calls
+
+
+def test_nextcloud_theme_pptx_logs_that_pptx_ignores_it(
+    monkeypatch, settings, caplog
+) -> None:
+    """theme=nextcloud + pptx: the native PPTX build stays theme-less as
+    before (python-pptx has no theme surface), the marp gate still gets
+    the branded values (it must accept the generated theme), and a log
+    line states the split for docker-log readers."""
+    fake, _calls = nc_deck_scheduler()
+    monkeypatch.setattr(task_worker, "schedule_and_wait", fake)
+    nc, api = make_fake_nc(capabilities={"theming": NC_THEMING_CAPS})
+    gate_values: list[object] = []
+
+    def fake_gate(md, wd, t, bin, theming_values=None):
+        gate_values.append(theming_values)
+
+    monkeypatch.setattr(task_worker, "marp_html_gate", fake_gate)
+    with caplog.at_level("INFO", logger="marp_slides.task_worker"):
+        task_worker.process_task(
+            nc, dict(TASK, input={"prompt": "x", "theme": "nextcloud"}), settings
+        )
+    (result,) = api.results
+    assert result["output"] == SUCCESS_OUTPUT  # pptx built as usual
+    assert api.uploads[0][1][1] == b"PK-editable"
+    assert isinstance(gate_values[0], ThemingValues)  # gate still branded
+    messages = [r.getMessage() for r in caplog.records]
+    assert any(
+        "theme nextcloud affects html/pdf only; pptx output ignores it" in m
+        for m in messages
+    )
+
+
+def test_bundled_theme_renders_without_theming_kwargs(monkeypatch, settings) -> None:
+    """A bundled theme (the default path) must not carry the branded-theme
+    payload: the render kwargs stay exactly as before the nextcloud theme
+    existed, even when theming capabilities ARE available."""
+    fake, _calls = deck_scheduler()
+    monkeypatch.setattr(task_worker, "schedule_and_wait", fake)
+    nc, api = make_fake_nc(capabilities={"theming": NC_THEMING_CAPS})
+    seen: dict[str, object] = {}
+
+    def fake_render(md, wd, t, bin, image_blobs=None, **kwargs):
+        seen["kwargs"] = kwargs
+        return b"<html>standalone</html>"
+
+    monkeypatch.setattr(task_worker, "render_deck_html", fake_render)
+    task_worker.process_task(
+        nc, dict(TASK, input={"prompt": "x", "output_format": "html"}), settings
+    )
+    (result,) = api.results
+    assert result["output"] == SUCCESS_OUTPUT
+    assert seen["kwargs"] == {}
 
 
 # --- progress phases + total LLM time cap ---------------------------------------
 
 
-def test_progress_phases_reported_with_names(monkeypatch, settings, caplog) -> None:
-    """Progress phases: 5 (author) when the LLM round starts, 50 (validate)
-    when its output is checked, 80 (build) for the PPTX build, 100 (done)
-    after the result is reported, each phase named in its log line."""
-    from tests.conftest import VALID_DECK
+def test_progress_phases_reported_with_names(monkeypatch, settings) -> None:
+    """Progress: 5 (Generating outline), 10 (outline ready), 10 + N/M * 80
+    before each slide's round, 95 (build/render), 100 (done); the image
+    fetch reports 92 on the paths that need it."""
+    fake, _calls = deck_scheduler()
+    monkeypatch.setattr(task_worker, "schedule_and_wait", fake)
+    nc, api = make_fake_nc()
+    task_worker.process_task(nc, TASK, settings)
+    (result,) = api.results
+    assert result["output"] == SUCCESS_OUTPUT
+    assert api.progress[0] == pytest.approx(5.0)
+    assert api.progress[-1] == pytest.approx(100.0)
 
-    fake, _calls = make_scheduler([VALID_DECK])
+
+def test_progress_reports_fetch_images_between_slides_and_done(
+    monkeypatch, settings
+) -> None:
+    fake, _calls = deck_scheduler(IMG_SLIDES_OK, outline_json=IMG_OUTLINE_JSON)
     monkeypatch.setattr(task_worker, "schedule_and_wait", fake)
     files = FakeFilesAPI({101: fake_node(101)}, {101: png_bytes()})
     nc, api = make_fake_nc(files=files)
     task_worker.process_task(
-        nc, dict(TASK, input={"prompt": "x", "images": [101]}), settings
+        nc,
+        dict(TASK, input={"prompt": "x", "output_format": "html", "images": [101]}),
+        settings,
     )
     (result,) = api.results
-    assert result["output"]["slide_deck"] == 42  # success, no fetch
-    assert files.downloaded == []
+    assert result["output"]["slide_deck"] == 42
+    assert api.progress[0] == pytest.approx(5.0)
+    assert api.progress[-1] == pytest.approx(100.0)
 
 
 def test_image_reference_out_of_bounds_is_retried_then_corrects(
     monkeypatch, settings, caplog
 ) -> None:
-    bad = "---\nmarp: true\ntitle: t\n---\n\n# T\n\n---\n\n## D\n\n![x](#file:2)\n"
-    good = VALID_DECK_WITH_IMAGE
-    fake, calls = make_scheduler([bad, good])
+    bad = "## Diagram\n\n![x](#file:2)"
+    good = "## Diagram\n\n![x](#file:1)"
+    fake, calls = deck_scheduler(
+        [IMG_SLIDES_OK[0], bad, good], outline_json=IMG_OUTLINE_JSON
+    )
     monkeypatch.setattr(task_worker, "schedule_and_wait", fake)
     files = FakeFilesAPI({101: fake_node(101)}, {101: png_bytes()})
     nc, api = make_fake_nc(files=files)
@@ -1015,29 +1405,45 @@ def test_image_reference_out_of_bounds_is_retried_then_corrects(
         task_worker.process_task(
             nc, dict(TASK, input={"prompt": "x", "images": [101]}), settings
         )
-    assert len(calls) == 2  # bounds failures are output-quality: one retry
-    assert "#file:2" in calls[1]["input"]  # corrective feedback names the ref
+    assert len(calls) == 4  # outline + slide 1 + slide 2 twice
+    assert "#file:2" in calls[3]["input"]  # corrective feedback names the ref
     (result,) = api.results
-    assert result["output"]["slide_deck"] == 42  # corrected attempt shipped
+    assert result["output"]["slide_deck"] == 42  # corrected slide shipped
 
 
 def test_image_reference_without_images_input_fails_actionably(
     monkeypatch, settings
 ) -> None:
-    bad = VALID_DECK_WITH_IMAGE
-    good = "---\nmarp: true\ntitle: t\n---\n\n# T\n\nText only.\n"
-    fake, calls = make_scheduler([bad, good])
+    """A slide referencing #file:N with no images input is an output-quality
+    failure of THAT slide: one corrective retry, then success without it."""
+    outline = json.dumps(
+        {
+            "title": "Quarterly Review",
+            "theme": "default",
+            "slides": [
+                {"title": "Quarterly Review", "summary": "Open.", "has_image": False},
+                {"title": "Diagram", "summary": "The diagram.", "has_image": False},
+            ],
+        },
+        indent=2,
+    )
+    slides = [
+        "# Quarterly Review\n\nOpening.",
+        "## Diagram\n\n![x](#file:1)",
+        "## Diagram\n\nA text-only description of the diagram.",
+    ]
+    fake, calls = make_llm([outline, *slides])
     monkeypatch.setattr(task_worker, "schedule_and_wait", fake)
     nc, api = make_fake_nc()
     task_worker.process_task(nc, dict(TASK, input={"prompt": "x"}), settings)
-    assert len(calls) == 2
+    assert len(calls) == 4  # outline + slide 1 + slide 2 twice
     (result,) = api.results
     assert result["output"] is not None  # retry removed the reference
 
 
 def test_image_fetch_failure_not_retried(monkeypatch, settings) -> None:
     # a GIF input file is an INPUT-DATA failure: no LLM retry can fix it
-    fake, calls = make_scheduler([VALID_DECK_WITH_IMAGE])
+    fake, calls = deck_scheduler(IMG_SLIDES_OK, outline_json=IMG_OUTLINE_JSON)
     monkeypatch.setattr(task_worker, "schedule_and_wait", fake)
     node = fake_node(101, mimetype="image/gif", name="a.gif")
     files = FakeFilesAPI({101: node}, {101: png_bytes()})
@@ -1045,14 +1451,14 @@ def test_image_fetch_failure_not_retried(monkeypatch, settings) -> None:
     task_worker.process_task(
         nc, dict(TASK, input={"prompt": "x", "images": [101]}), settings
     )
-    assert len(calls) == 1
+    assert len(calls) == 3
     (result,) = api.results
     assert result["output"] is None
     assert "only PNG and JPEG" in result["user_facing_error_message"]
 
 
 def test_invalid_images_slot_fails_before_any_llm_round(monkeypatch, settings) -> None:
-    fake, calls = make_scheduler(["unused"])
+    fake, calls = make_llm(["unused"])
     monkeypatch.setattr(task_worker, "schedule_and_wait", fake)
     nc, api = make_fake_nc()
     task_worker.process_task(
@@ -1063,41 +1469,33 @@ def test_invalid_images_slot_fails_before_any_llm_round(monkeypatch, settings) -
     assert "'images'" in result["user_facing_error_message"]
 
 
-def test_total_llm_cap_across_attempts(monkeypatch, settings, caplog) -> None:
-    """The 480 s cap spans BOTH attempts: with the budget already burnt by a
-    slow first round, the retry is refused with the actionable timeout
-    error naming the knob."""
-    from tests.conftest import VALID_DECK
-
-    fake, calls = make_scheduler([VALID_DECK])
-    monkeypatch.setattr(task_worker, "schedule_and_wait", fake)
-
+def test_total_llm_cap_across_all_calls(monkeypatch, settings, caplog) -> None:
+    """The 900 s cap spans EVERY LLM call (outline + slides): with the
+    budget already burnt by the outline round, the first slide round is
+    refused with the actionable timeout error naming the knob."""
     clock = {"now": 0.0}
 
     def fake_monotonic() -> float:
         return clock["now"]
 
-    def failing_round(nc_, task_type, task_input, **kwargs):
-        clock["now"] += 481.0  # the first round consumed the whole cap
-        return {"output": BAD_DECK_EMPTY_SUBHEADING}
+    def slow_outline(nc_, task_type, task_input, **kwargs):
+        clock["now"] += 901.0  # the outline round consumed the whole cap
+        return {"output": OUTLINE_JSON}
 
     monkeypatch.setattr(task_worker, "monotonic", fake_monotonic)
-    monkeypatch.setattr(task_worker, "schedule_and_wait", failing_round)
+    monkeypatch.setattr(task_worker, "schedule_and_wait", slow_outline)
     nc, api = make_fake_nc()
     with caplog.at_level("WARNING", logger="marp_slides.task_worker"):
         task_worker.process_task(nc, TASK, settings)
-    assert len(calls) == 0  # the recorder was replaced; exactly one real round ran
     (result,) = api.results
     assert result["output"] is None
-    assert "total time cap of 480 seconds" in result["user_facing_error_message"]
+    assert "total time cap of 900 seconds" in result["user_facing_error_message"]
     assert "MARP_SLIDES_TOTAL_LLM_TIMEOUT" in result["user_facing_error_message"]
 
 
-def test_retry_gets_only_the_remaining_budget(monkeypatch, settings) -> None:
-    """Round 2 never gets more than the remaining total budget (300 s per
-    round vs. what is left of the cap)."""
-    from tests.conftest import VALID_DECK
-
+def test_every_round_gets_only_the_remaining_budget(monkeypatch, settings) -> None:
+    """No round ever gets more than the remaining total budget (300 s per
+    round vs. what is left of the shared cap)."""
     timeouts: list[int] = []
     clock = {"now": 0.0}
 
@@ -1107,20 +1505,17 @@ def test_retry_gets_only_the_remaining_budget(monkeypatch, settings) -> None:
     def fake_schedule(nc_, task_type, task_input, **kwargs):
         timeouts.append(kwargs.get("timeout_s"))
         if len(timeouts) == 1:
-            clock["now"] += 400.0  # first round burnt 400 of the 480 s cap
-            return {"output": BAD_DECK_EMPTY_SUBHEADING}
-        return {"output": VALID_DECK}
+            clock["now"] += 850.0  # the outline burnt 850 of the 900 s cap
+            return {"output": OUTLINE_JSON}
+        return {"output": SLIDES_OK[len(timeouts) - 2]}
 
     monkeypatch.setattr(task_worker, "monotonic", fake_monotonic)
     monkeypatch.setattr(task_worker, "schedule_and_wait", fake_schedule)
     nc, api = make_fake_nc()
     task_worker.process_task(nc, TASK, settings)
-    assert timeouts == [300, 80]  # round 1: full per-round cap; round 2: rest
+    assert timeouts == [300, 50, 50, 50]  # outline: full cap; slides: the rest
     (result,) = api.results
-    assert result["output"] == {
-        "slide_deck": 42,
-        "slide_deck_source": 43,
-    }  # retry still succeeded (source retention union)
+    assert result["output"] == SUCCESS_OUTPUT
 
 
 def test_cap_knob_respected(monkeypatch, settings) -> None:
@@ -1131,7 +1526,7 @@ def test_cap_knob_respected(monkeypatch, settings) -> None:
 
     def fake_schedule(nc_, task_type, task_input, **kwargs):
         clock["now"] += 11.0
-        return {"output": BAD_DECK_EMPTY_SUBHEADING}
+        return {"output": OUTLINE_JSON}
 
     monkeypatch.setattr(task_worker, "monotonic", fake_monotonic)
     monkeypatch.setattr(task_worker, "schedule_and_wait", fake_schedule)
@@ -1139,3 +1534,103 @@ def test_cap_knob_respected(monkeypatch, settings) -> None:
     task_worker.process_task(nc, TASK, Settings(retry_llm=True, total_llm_timeout_s=10))
     (result,) = api.results
     assert "total time cap of 10 seconds" in result["user_facing_error_message"]
+
+
+# --- repair wiring, result ordering and nested-stall resilience ----------------
+# (regression tests for the three worker fixes validated live on tasks
+# 522/544/554/561/572/583: per-slide repair on the final attempt, the
+# done-progress ping before report_result, and the stalled-round reschedule)
+
+
+def test_final_attempt_slide_is_heurastically_repaired(monkeypatch) -> None:
+    """A repairable slide on the LAST attempt (retry_llm off, so the only
+    attempt has no retry left) is rescued by the wrap-repair-unwrap round
+    instead of failing the whole deck - the wiring gap observed live on
+    task 522, where slide 8's '# Title' + '## Subtitle' died unrepaired."""
+    outline = json.dumps(
+        {
+            "title": "T",
+            "theme": "default",
+            "slides": [{"title": "S", "summary": "", "has_image": False}],
+        }
+    )
+    fake, calls = deck_scheduler(
+        slides=["# S\n\n## Sub heading\n\n- one point"], outline_json=outline
+    )
+    monkeypatch.setattr(task_worker, "schedule_and_wait", fake)
+    nc, api = make_fake_nc()
+    task_worker.process_task(nc, TASK, Settings(retry_llm=False))
+    assert api.results[0]["output"] == SUCCESS_OUTPUT
+    assert len(calls) == 2  # outline + the one repaired slide round, no retry
+    source_md = api.uploads[1][1][1].decode("utf-8")  # (name, bytes, mime)
+    assert "### Sub heading" in source_md  # deterministic demotion shipped
+
+
+def test_done_progress_precedes_reported_result(monkeypatch) -> None:
+    """The 100% 'done' progress ping must be the last call BEFORE
+    report_result: Nextcloud's setTaskProgress resets a finished task
+    back to RUNNING, so a ping after the result resurrects it as a
+    zombie (observed live on task 544: output stored, status RUNNING)."""
+    fake, _calls = deck_scheduler()
+    monkeypatch.setattr(task_worker, "schedule_and_wait", fake)
+    nc, api = make_fake_nc()
+    events: list[tuple[str, object]] = []
+    real_progress = api.set_progress
+    real_result = api.report_result
+
+    def progress(task_id: int, value: float) -> None:
+        events.append(("progress", value))
+        real_progress(task_id, value)
+
+    def result(task_id: int, output=None, **kwargs):
+        events.append(("result", output))
+        return real_result(task_id, output, **kwargs)
+
+    api.set_progress = progress
+    api.report_result = result
+    task_worker.process_task(nc, TASK, Settings())
+    assert events[-2] == ("progress", 100.0)
+    assert events[-1][0] == "result"
+    assert api.results[0]["output"] == SUCCESS_OUTPUT
+
+
+def test_stalled_nested_round_is_rescheduled_once(monkeypatch) -> None:
+    """A nested round whose inner task stalls into the round timeout (the
+    executor hiccup observed live on task 554: inner task RUNNING at
+    progress 0 forever) is rescheduled once on a fresh task id instead
+    of failing the deck - task 572 survived exactly this stall live."""
+    stream, calls = deck_scheduler()
+    stalled = {"fired": False}
+
+    def fake(nc, task_type, task_input, **kwargs):
+        if not stalled["fired"]:
+            stalled["fired"] = True
+            raise NestedTaskError(
+                "The internal core:text2text task did not finish within 300 seconds."
+            )
+        return stream(nc, task_type, task_input, **kwargs)
+
+    monkeypatch.setattr(task_worker, "schedule_and_wait", fake)
+    nc, api = make_fake_nc()
+    task_worker.process_task(nc, TASK, Settings())
+    assert api.results[0]["output"] == SUCCESS_OUTPUT
+    assert len(calls) == 4  # the stall round + outline + 3 slide rounds
+
+
+def test_model_side_nested_failure_is_not_rescheduled(monkeypatch) -> None:
+    """Only the timeout flavor is retried: a model-side nested failure
+    (blank output) propagates immediately - one round, task failed with
+    the actionable message, no pointless reschedule."""
+    calls: list[dict] = []
+
+    def fake(nc, task_type, task_input, **kwargs):
+        calls.append(task_input)
+        return {"output": "   "}  # blank: _schedule_llm_round_once raises
+
+    monkeypatch.setattr(task_worker, "schedule_and_wait", fake)
+    nc, api = make_fake_nc()
+    task_worker.process_task(nc, TASK, Settings())
+    (result,) = api.results
+    assert result["output"] is None
+    assert "returned no text" in result["user_facing_error_message"]
+    assert len(calls) == 1

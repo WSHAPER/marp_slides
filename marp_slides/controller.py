@@ -10,8 +10,13 @@ from fastapi import FastAPI, Request
 from nc_py_api import NextcloudApp
 from nc_py_api.ex_app import AppAPIAuthMiddleware, set_handlers
 
-from .settings import PROVIDER_ID, Settings
-from .task_definition import PROVIDER, TASK_TYPE
+from .settings import PROVIDER_ID, RE_RENDER_PROVIDER_ID, Settings
+from .task_definition import (
+    PROVIDER,
+    RE_RENDER_PROVIDER,
+    RE_RENDER_TASK_TYPE,
+    TASK_TYPE,
+)
 from .task_worker import (
     APP_ENABLED,
     THREAD_STOP_EVENT,
@@ -27,6 +32,9 @@ def enabled_handler(enabled: bool, nc: NextcloudApp) -> str:
     try:
         if enabled:
             nc.providers.task_processing.register(PROVIDER, TASK_TYPE)
+            nc.providers.task_processing.register(
+                RE_RENDER_PROVIDER, RE_RENDER_TASK_TYPE
+            )
             APP_ENABLED.set()
             if THREAD_STOP_EVENT.is_set():
                 # If the threads were previously stopped, we start them again,
@@ -35,6 +43,7 @@ def enabled_handler(enabled: bool, nc: NextcloudApp) -> str:
         else:
             APP_ENABLED.clear()
             nc.providers.task_processing.unregister(PROVIDER_ID)
+            nc.providers.task_processing.unregister(RE_RENDER_PROVIDER_ID)
             stop_bg_thread()
     except Exception as exc:
         LOGGER.exception("Error in enabled handler")

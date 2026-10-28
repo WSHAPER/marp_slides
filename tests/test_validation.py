@@ -148,6 +148,82 @@ def test_background_image_zero_reference_rejected() -> None:
         validate_deck(deck)
 
 
+# --- frontmatter background style keys (backgroundSize/Position/Repeat) ---------
+
+
+@pytest.mark.parametrize(
+    "key,value",
+    [
+        ("backgroundSize", "cover"),
+        ("backgroundSize", "contain"),
+        ("backgroundSize", "auto"),
+        ("backgroundPosition", "center"),
+        ("backgroundPosition", "top left"),
+        ("backgroundRepeat", "no-repeat"),
+        ("backgroundRepeat", "repeat-x"),
+    ],
+)
+def test_background_style_keys_accepted_as_strings(key: str, value: str) -> None:
+    # string values only: Marp owns the CSS grammar, the validator does not
+    # inspect the value content
+    deck = f"---\nmarp: true\ntitle: x\n{key}: '{value}'\n---\n\n# Hello\n"
+    validated = validate_deck(deck)
+    assert validated.frontmatter[key] == value
+
+
+def test_background_style_keys_accepted_unquoted_plain_words() -> None:
+    # single plain words parse as YAML strings without quotes too
+    deck = (
+        "---\nmarp: true\ntitle: x\nbackgroundSize: cover\n"
+        "backgroundPosition: center\nbackgroundRepeat: no-repeat\n---\n\n# Hello\n"
+    )
+    validated = validate_deck(deck)
+    assert validated.frontmatter["backgroundSize"] == "cover"
+    assert validated.frontmatter["backgroundPosition"] == "center"
+    assert validated.frontmatter["backgroundRepeat"] == "no-repeat"
+
+
+@pytest.mark.parametrize(
+    "key,bad",
+    [
+        ("backgroundSize", "42"),  # YAML int
+        ("backgroundSize", "4.5"),  # YAML float
+        ("backgroundPosition", "true"),  # YAML boolean
+        ("backgroundRepeat", "no"),  # YAML 1.1 boolean spelling!
+        ("backgroundRepeat", "[cover, contain]"),  # YAML sequence
+        ("backgroundSize", "{x: y}"),  # YAML mapping
+    ],
+)
+def test_background_style_non_string_rejected_with_quoting_hint(
+    key: str, bad: str
+) -> None:
+    deck = f"---\nmarp: true\ntitle: x\n{key}: {bad}\n---\n\n# Hello\n"
+    with pytest.raises(DeckError, match="QUOTED text string"):
+        validate_deck(deck)
+
+
+def test_background_style_error_names_the_key_and_an_example() -> None:
+    deck = "---\nmarp: true\ntitle: x\nbackgroundSize: 42\n---\n\n# Hello\n"
+    with pytest.raises(DeckError) as excinfo:
+        validate_deck(deck)
+    message = str(excinfo.value)
+    assert "backgroundSize" in message
+    assert "backgroundSize: 'cover'" in message
+
+
+def test_background_style_keys_compose_with_background_image() -> None:
+    # the keys exist to tune the deck-wide background image: all together
+    # the deck validates and the value strings pass through untouched
+    deck = (
+        "---\nmarp: true\ntitle: x\nbackgroundImage: '#file:1'\n"
+        "backgroundSize: 'cover'\nbackgroundPosition: 'center'\n"
+        "backgroundRepeat: 'no-repeat'\n---\n\n# Hello\n"
+    )
+    validated = validate_deck(deck)
+    assert validated.deck.background_image == 1
+    assert validated.frontmatter["backgroundSize"] == "cover"
+
+
 def test_paginate_frontmatter_flows_to_parsed_deck() -> None:
     deck = "---\nmarp: true\npaginate: true\n---\n\n# Hello\n"
     validated = validate_deck(deck)

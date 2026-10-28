@@ -2045,11 +2045,15 @@ def test_pptx_build_ignores_background_images() -> None:
     assert "<p:bg>" not in slide._element.xml  # no background fill invented
 
 
-def test_bg_keyword_without_size_keyword_list_rejected() -> None:
-    # 'bg left' / 'bg 50%' look like supported syntax but have no supported
-    # equivalent: reject with the keyword list, never degrade into a picture
-    _rejected("# T\n\n![bg left](#file:1)\n", "background image keyword 'left'")
-    _rejected("# T\n\n![bg 50%](#file:1)\n", "cover")
+def test_bg_keyword_forms_parse_as_chrome_never_pictures() -> None:
+    # 'bg left' / 'bg 50%' were rejects before the extended keyword set;
+    # now every keyword form files as slide chrome (background_image index),
+    # never a content picture — and trailing text still rejects
+    for alt in ("bg left", "bg right", "bg vertical", "bg left:33%", "bg 50%"):
+        deck = f"---\nmarp: true\ntitle: t\n---\n\n# T\n\n![{alt}](#file:1)\n"
+        slide = validate_deck(deck).deck.slides[0]
+        assert slide.background_image == 1
+        assert slide.blocks == ()
     _rejected("# T\n\n![bg](#file:1) extra\n", "line of their own")
 
 

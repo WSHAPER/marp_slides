@@ -11,9 +11,11 @@ at the exact line that leaves the allow-list.
 from __future__ import annotations
 
 import re
+from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
 from .blocks import (
+    BackgroundImageSpec,
     BlockQuote,
     ImageBlock,
     ListBlock,
@@ -30,14 +32,26 @@ if TYPE_CHECKING:
 
 IMAGE_LINE_RE = re.compile(r"^!\[(?P<alt>[^\]\n]*)\]\(#file:(?P<index>\d+)\)\s*$")
 
-#: Marp's background-image alt keyword: '![bg](#file:N)' places the image as
-#: the slide background instead of a content picture, optionally with one
-#: size keyword ('![bg cover](#file:N)'; contain, fit, auto likewise),
-#: case-insensitive. The prefix guard catches every other 'bg ...' alt
-#: ('bg left', 'bg 50%') so it rejects with the supported keyword list
-#: instead of silently degrading into a content picture.
-BACKGROUND_ALT_RE = re.compile(r"^bg(?:\s+(?:cover|contain|fit|auto))?$", re.IGNORECASE)
-BACKGROUND_ALT_PREFIX_RE = re.compile(r"^bg(?:\s|$)", re.IGNORECASE)
+#: Marp's image keywords live in the alt text of '![alt](#file:N)' as
+#: whitespace-separated tokens. A LEADING 'bg' token marks a slide
+#: background image (Marp's rule); the tokens behind it are keyword
+#: directives — size keywords, split directions, scale percentages and
+#: w:/h: length options — and every token the grammar below does not
+#: recognize stays human-readable alt text. The leading-position guard
+#: keeps alts like 'photo bg' or 'left arrow' content-picture alt text:
+#: only an unambiguous leading 'bg' turns a line into slide chrome.
+_BG_TOKEN_RE = re.compile(r"^bg$", re.IGNORECASE)
+_SPLIT_TOKEN_RE = re.compile(
+    r"^(?P<direction>left|right):(?P<split>\d+%)$", re.IGNORECASE
+)
+_DIRECTION_TOKEN_RE = re.compile(r"^(?P<direction>left|right|vertical)$", re.IGNORECASE)
+_SIZE_KEYWORD_TOKEN_RE = re.compile(
+    r"^(?P<size>cover|contain|fit|auto)$", re.IGNORECASE
+)
+_SCALE_TOKEN_RE = re.compile(r"^(?P<scale>\d+%)$")
+_LENGTH_TOKEN_RE = re.compile(
+    r"^(?P<kind>w|width|h|height):(?P<value>.+)$", re.IGNORECASE
+)
 
 BULLET_RE = re.compile(r"^(\s*)[-*+]\s+(.*)$")
 ORDERED_RE = re.compile(r"^(\s*)(?P<num>\d+)\.\s+(.*)$")
@@ -126,6 +140,85 @@ def parse_table(
     return TableBlock(rows=tuple(rows))
 
 
+@dataclass(frozen=True)
+class ParsedImageAlt:
+    """One image alt text split into its Marp keyword directives and the
+    human-readable remainder (what the model wrote, minus the keywords)."""
+
+    alt: str
+    background: BackgroundImageSpec | None = None
+    width: str | None = None
+    height: str | None = None
+
+
+def parse_image_alt(alt: str) -> ParsedImageAlt:
+    """Split an '![alt](#file:N)' alt string into Marp keywords and human
+    alt text. A leading ``bg`` token marks a background image: its keyword
+    tokens are parsed into a :class:`BackgroundImageSpec` and everything
+    unrecognized stays alt text. Without ``bg`` the image is a content
+    picture and only w:/h: sizing tokens are keywords, so plain alts such
+    as 'auto scale' or 'left arrow' never change meaning."""
+    tokens = alt.split()
+    if tokens and _BG_TOKEN_RE.match(tokens[0]) is not None:
+        return _parse_background_alt(tokens[1:])
+    return _parse_content_alt(tokens)
+
+
+def _parse_content_alt(tokens: list[str]) -> ParsedImageAlt:
+    alt_tokens: list[str] = []
+    width: str | None = None
+    height: str | None = None
+    for token in tokens:
+        length = _LENGTH_TOKEN_RE.match(token)
+        if length is None:
+            alt_tokens.append(token)
+        elif _is_width(length.group("kind")):
+            width = length.group("value")
+        else:
+            height = length.group("value")
+    return ParsedImageAlt(alt=" ".join(alt_tokens), width=width, height=height)
+
+
+def _parse_background_alt(tokens: list[str]) -> ParsedImageAlt:
+    alt_tokens: list[str] = []
+    direction: str | None = None
+    split: str | None = None
+    size: str | None = None
+    width: str | None = None
+    height: str | None = None
+    for token in tokens:
+        split_match = _SPLIT_TOKEN_RE.match(token)
+        direction_match = _DIRECTION_TOKEN_RE.match(token)
+        size_match = _SIZE_KEYWORD_TOKEN_RE.match(token)
+        scale_match = _SCALE_TOKEN_RE.match(token)
+        length_match = _LENGTH_TOKEN_RE.match(token)
+        if split_match is not None:
+            direction = split_match.group("direction").lower()
+            split = split_match.group("split")
+        elif direction_match is not None:
+            direction = direction_match.group("direction").lower()
+        elif size_match is not None:
+            size = size_match.group("size").lower()
+        elif scale_match is not None:
+            size = scale_match.group("scale")
+        elif length_match is not None and _is_width(length_match.group("kind")):
+            width = length_match.group("value")
+        elif length_match is not None:
+            height = length_match.group("value")
+        else:
+            alt_tokens.append(token)
+    return ParsedImageAlt(
+        alt=" ".join(alt_tokens),
+        background=BackgroundImageSpec(
+            direction=direction, split=split, size=size, width=width, height=height
+        ),
+    )
+
+
+def _is_width(kind: str) -> bool:
+    return kind[0].lower() == "w"
+
+
 def consume_image_line(state: SlideState, image: re.Match[str], i: int) -> int:
     index = int(image.group("index"))
     if index < 1:
@@ -134,34 +227,33 @@ def consume_image_line(state: SlideState, image: re.Match[str], i: int) -> int:
             f"'#file:{image.group('index')}' is not valid. N is 1-based, so the "
             "first image is '#file:1'."
         )
-    alt = image.group("alt")
-    if BACKGROUND_ALT_PREFIX_RE.match(alt):
-        _consume_background_image(state, alt, index)
+    parsed = parse_image_alt(image.group("alt"))
+    if parsed.background is not None:
+        _consume_background_image(state, parsed.background, index)
         return i + 1
-    state.blocks.append(ImageBlock(alt=alt, index=index))
+    state.blocks.append(
+        ImageBlock(
+            alt=parsed.alt, index=index, width=parsed.width, height=parsed.height
+        )
+    )
     return i + 1
 
 
-def _consume_background_image(state: SlideState, alt: str, index: int) -> None:
+def _consume_background_image(
+    state: SlideState, spec: BackgroundImageSpec, index: int
+) -> None:
     """A '![bg ...](#file:N)' line is slide chrome for the html/pdf renders,
     never a content picture (python-pptx has no slide-background API): record
-    the 1-based index on the slide. Alt keywords other than the four size
-    keywords reject with the supported list, and at most one background
-    image is allowed per slide."""
-    if not BACKGROUND_ALT_RE.match(alt):
-        keyword = alt[len("bg") :].strip()
-        raise UnsupportedConstructError(
-            f"Unsupported construct on {state.where}: the background image keyword "
-            f"'{keyword}' is not supported. Use '![bg](#file:N)' on a line of its "
-            "own, optionally with one size keyword: '![bg cover](#file:N)' "
-            "(contain, fit and auto likewise)."
-        )
+    the 1-based index and the parsed keywords on the slide. Alt tokens the
+    keyword grammar does not recognize stay human alt text, and at most one
+    background image is allowed per slide."""
     if state.background_image is not None:
         raise UnsupportedConstructError(
             f"Unsupported construct on {state.where}: only one background image is "
             "allowed per slide. Remove the duplicate."
         )
     state.background_image = index
+    state.background_image_spec = spec
 
 
 def consume_list(state: SlideState, lines: list[str], i: int) -> int:

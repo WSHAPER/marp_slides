@@ -76,7 +76,9 @@ SUPPORTED_CONSTRUCTS: tuple[tuple[str, str], ...] = (
         (
             "images provided with the task as '![alt text](#file:N)' on a line of their "
             "own, N is the 1-based position in the task's images input list; each becomes "
-            "a native picture (PNG or JPEG, max 5 MB per image)"
+            "a native picture (PNG or JPEG, max 5 MB per image), optionally with a "
+            "sizing keyword ('![w:200px](#file:N)', h: likewise; html and pdf output "
+            "apply it, the PPTX build keeps the native size)"
         ),
     ),
     (
@@ -122,9 +124,12 @@ SUPPORTED_CONSTRUCTS: tuple[tuple[str, str], ...] = (
             "background images from the task's images, shown in html and pdf output "
             "only (the editable PPTX build ignores them): deck-wide via the optional "
             "frontmatter key \"backgroundImage: '#file:N'\", per-slide via "
-            "'![bg](#file:N)' on a line of its own, optionally with a size keyword "
-            "('![bg cover](#file:N)', also contain, fit, auto); N is the 1-based "
-            "position in the task's images input list, at most one per slide"
+            "'![bg](#file:N)' on a line of its own, optionally with the Marp "
+            "keywords: a size ('![bg cover](#file:N)', also contain, fit, auto, or "
+            "a scale like '150%'), a direction ('![bg left](#file:N)', also right, "
+            "optionally sized '![bg left:33%](#file:N)', or vertical), and w:/h: "
+            "lengths ('![bg left w:50%](#file:N)'); N is the 1-based position in "
+            "the task's images input list, at most one per slide"
         ),
     ),
     (
@@ -133,7 +138,9 @@ SUPPORTED_CONSTRUCTS: tuple[tuple[str, str], ...] = (
             "YAML frontmatter with exactly these keys: marp (must be true), title, theme "
             "(one of the three bundled Marp themes), paginate (optional, true/false), "
             "backgroundColor (optional, '#RRGGBB'), backgroundImage (optional, "
-            "'#file:N')"
+            "'#file:N'), backgroundSize, backgroundPosition and backgroundRepeat "
+            "(optional, quoted CSS value strings such as 'cover', 'center', "
+            "'no-repeat')"
         ),
     ),
 )
@@ -145,6 +152,9 @@ ALLOWED_FRONTMATTER_KEYS = (
     "paginate",
     "backgroundColor",
     "backgroundImage",
+    "backgroundSize",
+    "backgroundPosition",
+    "backgroundRepeat",
 )
 
 #: The ``auto`` theme input: the model picks the best-fitting theme and
@@ -176,6 +186,14 @@ MARP_THEMES: tuple[tuple[str, str], ...] = (
         (
             "a minimal centered theme with large type and generous spacing, for "
             "storytelling, pitches and big statements"
+        ),
+    ),
+    (
+        "nextcloud",
+        (
+            "an instance-branded theme derived from this Nextcloud's admin "
+            "theming (colors, background, slogan), for company or "
+            "organization decks; html and pdf output only"
         ),
     ),
 )

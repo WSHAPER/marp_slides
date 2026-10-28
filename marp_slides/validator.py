@@ -213,6 +213,7 @@ def _validate_frontmatter(
     _reject_unknown_keys(frontmatter)
     _reject_bad_theme(frontmatter.get("theme"))
     _reject_bad_paginate(frontmatter.get("paginate"))
+    _reject_bad_background_style(frontmatter)
     deck_background = _frontmatter_background(frontmatter)
     deck_background_image = _frontmatter_background_image(frontmatter)
     return frontmatter, deck_background, deck_background_image
@@ -254,6 +255,31 @@ def _reject_bad_paginate(paginate: object) -> None:
         raise DeckError(
             f"Invalid deck: paginate must be a boolean (true/false), got {paginate!r}. "
             "Write 'paginate: true' to number every slide."
+        )
+
+
+#: Deck-wide background style directives (Marp local directives), applied to
+#: the deck-wide backgroundImage. The validator only checks the VALUE TYPE:
+#: each must be a text string whose content is a CSS value Marp understands
+#: (cover, center, top left, no-repeat, ...) — Marp owns that grammar.
+BACKGROUND_STYLE_KEYS = ("backgroundSize", "backgroundPosition", "backgroundRepeat")
+
+_BACKGROUND_STYLE_EXAMPLES = {
+    "backgroundSize": "cover",
+    "backgroundPosition": "center",
+    "backgroundRepeat": "no-repeat",
+}
+
+
+def _reject_bad_background_style(frontmatter: dict[str, Any]) -> None:
+    for key in BACKGROUND_STYLE_KEYS:
+        if key not in frontmatter or isinstance(frontmatter[key], str):
+            continue
+        example = _BACKGROUND_STYLE_EXAMPLES[key]
+        raise DeckError(
+            f"Invalid deck: the frontmatter {key} must be a QUOTED text string (a "
+            f"CSS value like {example!r}), got {frontmatter[key]!r} (YAML parsed it "
+            f"as something else). Write it as \"{key}: '{example}'\"."
         )
 
 

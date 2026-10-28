@@ -3,8 +3,8 @@
 	<id>marp_slides</id>
 	<name>Marp Slides</name>
 	<summary>Turn a prompt into a PPTX slide deck</summary>
-	<description><![CDATA[Turn a user prompt into a slide deck. A language model authors Marp Markdown from the prompt; the deck is built as an editable PPTX (default, native shapes, images via provided files), a standalone HTML presentation or a PDF document, with speaker notes (PDF output excludes them) and the Markdown source retained.]]></description>
-	<version>0.1.0</version>
+	<description><![CDATA[Turn a user prompt into a slide deck. A language model authors Marp Markdown from the prompt; the deck is built as an editable PPTX (default, native shapes, images via provided files), a standalone HTML presentation or a PDF document, with speaker notes (PDF output excludes them) and the Markdown source retained. A deterministic re-render task type rebuilds the deck from an edited Markdown source with no language model involved.]]></description>
+	<version>0.1.1</version>
 	<licence>agpl</licence>
 	<namespace>MarpSlides</namespace>
 	<category>office</category>
@@ -15,7 +15,7 @@
 		<docker-install>
 			<registry>docker.io</registry>
 			<image>marp-slides</image>
-			<image-tag>0.1.0</image-tag>
+			<image-tag>0.1.1</image-tag>
 		</docker-install>
 		<environment-variables>
 			<variable>

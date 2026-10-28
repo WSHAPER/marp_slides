@@ -8,12 +8,22 @@ from dataclasses import dataclass
 
 APP_ID = "marp_slides"
 # keep in sync with appinfo/info.xml (pinned by tests/test_versions.py)
-APP_VERSION = "0.1.0"
+APP_VERSION = "0.1.1"
 
 TASK_TYPE_ID = "marp_slides:slide_deck_generation"
 PROVIDER_ID = "marp_slides-deck_renderer"
 PROVIDER_NAME = "Marp Slide Deck Renderer"
 EXPECTED_RUNTIME_S = 120
+
+#: The deterministic re-render task type: the SAME strict validation and
+#: render pipeline as the authoring task, minus the LLM call. Input is a
+#: complete Marp Markdown source (typically the retained
+#: ``slide_deck_source`` after edits), so the expected runtime is the render
+#: cost only, no authoring round.
+RE_RENDER_TASK_TYPE_ID = "marp_slides:re_render"
+RE_RENDER_PROVIDER_ID = "marp-slides:re_renderer"
+RE_RENDER_PROVIDER_NAME = "Marp Slide Deck Re-renderer"
+RE_RENDER_EXPECTED_RUNTIME_S = 10
 
 #: Accepted ``output_format`` values since v0.1.0: ``pptx`` (the default;
 #: native editable build via python-pptx), ``html`` (a single standalone HTML
@@ -47,9 +57,12 @@ DEFAULT_APP_PORT = 9090
 DEFAULT_POLL_INTERVAL_S = 5.0
 DEFAULT_MARP_TIMEOUT_S = 120
 DEFAULT_LLM_TIMEOUT_S = 300
-#: Total cap across BOTH inner-LLM attempts (first + self-correcting
-#: retry): 300 s per round, 480 s total leaves the retry ~180 s.
-DEFAULT_TOTAL_LLM_TIMEOUT_S = 480
+#: Total cap across every inner-LLM round of the two-phase pipeline
+#: (the outline plus each slide, first attempts and retries alike).
+#: Measured on a local qwen3.8-9b: ~70 s for the outline plus 40-70 s
+#: per slide, so an 8-slide deck lands near 500 s and the old 480 s cap
+#: cut off the final slide; 900 s keeps headroom for retries.
+DEFAULT_TOTAL_LLM_TIMEOUT_S = 900
 DEFAULT_MAX_PROMPT_CHARS = 8192
 DEFAULT_MAX_DECK_BYTES = 1024 * 1024
 DEFAULT_MAX_SLIDES = 60

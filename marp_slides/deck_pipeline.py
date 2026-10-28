@@ -29,6 +29,7 @@ from .marp_cli import (
 from .marp_cli import render_deck_html as marp_render_html
 from .marp_cli import render_deck_pdf as marp_render_pdf
 from .settings import OUTPUT_FORMAT_VALUES
+from .theming import ThemingValues
 from .validator import DeckError, ValidatedDeck, count_slides, validate_deck
 
 __all__ = [
@@ -192,6 +193,17 @@ def validate_theme_override(frontmatter: Mapping[str, Any], theme: str) -> None:
 # --- marp renders: compose image materialization ------------------------------
 
 
+def _theming_kwargs(
+    theming_values: ThemingValues | None,
+) -> dict[str, ThemingValues]:
+    """The branded-theme argument for the marp conversion: present only
+    when the deck renders through the generated ``nextcloud`` theme, so
+    every bundled-theme call keeps its exact pre-theming shape."""
+    if theming_values is None:
+        return {}
+    return {"theming_values": theming_values}
+
+
 def render_deck_html(
     markdown: str,
     workdir: str | Path,
@@ -199,6 +211,7 @@ def render_deck_html(
     marp_bin: str = "marp",
     runner: Runner = subprocess.run,
     image_blobs: Mapping[int, bytes] | None = None,
+    theming_values: ThemingValues | None = None,
 ) -> bytes:
     """Render a validated deck to the deliverable standalone HTML file
     (browserless: Node only). When ``image_blobs`` carries the deck's
@@ -208,6 +221,13 @@ def render_deck_html(
     throwaway workdir only; the caller's markdown string keeps ``#file:N``
     (see :func:`marp_slides.marp_cli.render_deck_html` for the render
     contract and the containment argument).
+
+    ``theming_values`` passes straight through to the marp layer: with the
+    instance's theming values available and a ``nextcloud``-themed deck,
+    the branded theme CSS is generated into ``workdir`` and registered via
+    ``--theme-set``, identically to the gate (render/gate parity).
+    ``None`` (every bundled theme) keeps the call identical to the
+    pre-theming pipeline.
     """
     if image_blobs:
         markdown = materialize_image_files(markdown, image_blobs)
@@ -218,6 +238,7 @@ def render_deck_html(
         marp_bin,
         runner,
         allow_local_files=False,  # data URIs carry the bytes; nothing local to read
+        theming_values=theming_values,
     )
 
 
@@ -228,11 +249,16 @@ def render_deck_pdf(
     marp_bin: str = "marp",
     runner: Runner = subprocess.run,
     image_blobs: Mapping[int, bytes] | None = None,
+    theming_values: ThemingValues | None = None,
 ) -> bytes:
     """Render a validated deck to the deliverable PDF document (Chromium
     via puppeteer-core). Images materialize into ``workdir`` exactly as in
     :func:`render_deck_html`; the caller's markdown string keeps
-    ``#file:N``.
+    ``#file:N``. ``theming_values`` passes straight through to the marp
+    layer exactly as in :func:`render_deck_html` (the branded theme CSS
+    plus ``--theme-set`` for a ``nextcloud``-themed deck, identically to
+    the gate).
+
     """
     if image_blobs:
         markdown = materialize_image_files(markdown, image_blobs)
@@ -243,6 +269,7 @@ def render_deck_pdf(
         marp_bin,
         runner,
         allow_local_files=False,  # data URIs carry the bytes; nothing local to read
+        theming_values=theming_values,
     )
 
 

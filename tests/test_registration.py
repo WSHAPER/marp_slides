@@ -17,7 +17,7 @@ from marp_slides.settings import (
 def test_task_type_shape() -> None:
     tt = task_definition.TASK_TYPE
     assert tt.id == TASK_TYPE_ID == "marp_slides:slide_deck_generation"
-    assert [s.name for s in tt.input_shape] == ["prompt"]
+    assert [s.name for s in tt.input_shape] == ["input"]
     assert tt.input_shape[0].shape_type == ShapeType.TEXT
     assert tt.input_shape[0].description == (
         "What the presentation should be about and any requirements for it."

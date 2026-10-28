@@ -3,6 +3,10 @@
 Every marp conversion (the browserless syntax gate, the standalone-HTML
 render, the PDF render) runs under the same strict configuration and the
 same safety flags, so no output format can ever be looser than the gate.
+The instance-branded ``nextcloud`` theme CSS rides all three paths the
+same way: when theming values are available and the deck's frontmatter
+theme is ``nextcloud``, the theme CSS is generated into the workdir and
+registered with ``--theme-set`` (see :func:`_marp_convert`).
 The one deliberate per-invocation difference: render conversions whose
 deck images were materialized into the workdir pass
 ``--allow-local-files`` (see :func:`_marp_convert` for the containment
@@ -15,7 +19,10 @@ import subprocess
 from collections.abc import Callable
 from pathlib import Path
 
-from .validator import DeckError
+import yaml
+
+from .theming import THEME_NAME, ThemingValues, write_theme_css
+from .validator import DeckError, split_frontmatter
 
 Runner = Callable[..., subprocess.CompletedProcess[bytes]]
 
@@ -48,11 +55,17 @@ def marp_html_gate(
     marp_timeout_s: int = 120,
     marp_bin: str = "marp",
     runner: Runner = subprocess.run,
+    theming_values: ThemingValues | None = None,
 ) -> None:
     """Run the marp HTML syntax gate (browserless) on a validated deck.
 
     The PPTX itself is built natively; marp-cli is only a second,
     independent Markdown-syntax check, so the rendered HTML is discarded.
+
+    When ``theming_values`` is provided and the deck's frontmatter theme
+    is ``nextcloud``, the branded theme CSS is generated into ``workdir``
+    and registered via ``--theme-set``: the gate checks the deck under
+    the same theme the deliverable renders will use.
     """
     _marp_convert(
         markdown,
@@ -62,6 +75,7 @@ def marp_html_gate(
         runner,
         stage="validation",
         out_name="deck.html",
+        theming_values=theming_values,
     )
 
 
@@ -72,6 +86,7 @@ def render_deck_html(
     marp_bin: str = "marp",
     runner: Runner = subprocess.run,
     allow_local_files: bool = False,
+    theming_values: ThemingValues | None = None,
 ) -> bytes:
     """Render a validated deck to the deliverable standalone HTML file
     (browserless: Node only, no Chromium is spawned, verified empirically
@@ -82,7 +97,11 @@ def render_deck_html(
     Presenter notes stay in the file as hidden ``bespoke-marp-note`` elements
     (marp's default; visible in the bundled presenter view). The same strict
     flags as the syntax gate apply, so raw HTML authored in the Markdown is
-    rendered as escaped text, never live markup.
+    rendered as escaped text, never live markup. The same holds for the
+    instance-branded theme: when ``theming_values`` is provided and the
+    deck's frontmatter theme is ``nextcloud``, the theme CSS is generated
+    into ``workdir`` and registered via ``--theme-set``, exactly like in
+    the gate (render/gate parity).
 
     ``allow_local_files`` is set by the caller only when the deck's
     ``#file:N`` images were already materialized into ``workdir`` (see
@@ -97,6 +116,7 @@ def render_deck_html(
         stage="HTML rendering",
         out_name="deck.html",
         allow_local_files=allow_local_files,
+        theming_values=theming_values,
     )
 
 
@@ -107,6 +127,7 @@ def render_deck_pdf(
     marp_bin: str = "marp",
     runner: Runner = subprocess.run,
     allow_local_files: bool = False,
+    theming_values: ThemingValues | None = None,
 ) -> bytes:
     """Render a validated deck to the deliverable PDF document.
 
@@ -119,7 +140,10 @@ def render_deck_pdf(
     empirically: zero annotation objects without ``--pdf-notes``); the
     retained ``slide_deck_source`` Markdown carries them. The strict flags
     are identical to the gate/HTML render, and the output format is
-    extension-driven (``-o deck.pdf``).
+    extension-driven (``-o deck.pdf``). The instance-branded theme applies
+    identically too: ``theming_values`` plus a ``nextcloud``-themed deck
+    means the theme CSS in ``workdir`` and ``--theme-set``, exactly like in
+    the gate (render/gate parity).
 
     ``allow_local_files`` is set by the caller only when the deck's
     ``#file:N`` images were already materialized into ``workdir`` (see
@@ -134,10 +158,12 @@ def render_deck_pdf(
         stage="PDF rendering",
         out_name="deck.pdf",
         allow_local_files=allow_local_files,
+        theming_values=theming_values,
     )
 
 
-def _marp_convert(
+def _marp_convert(  # noqa: PLR0913 - the single conversion path: 7 fixed
+    # argv-shape knobs + the 2 optional behavior flags below (keyword-only)
     markdown: str,
     workdir: str | Path,
     marp_timeout_s: int,
@@ -145,7 +171,9 @@ def _marp_convert(
     runner: Runner,
     stage: str,
     out_name: str,
+    *,
     allow_local_files: bool = False,
+    theming_values: ThemingValues | None = None,
 ) -> bytes:
     """Shared strict marp-cli conversion step (Node-only for HTML output;
     ``.pdf`` additionally drives the bundled Chromium via puppeteer-core).
@@ -157,16 +185,26 @@ def _marp_convert(
     The output format is extension-driven: marp-cli infers PDF from the
     ``-o deck.pdf`` target (verified empirically; no ``--pdf`` flag needed).
 
+    ``theming_values`` carries the instance's Nextcloud theming values
+    (fetched by the caller from the capabilities API). When provided AND
+    the deck's frontmatter theme is ``nextcloud``, the branded theme CSS
+    is written into ``workdir`` as ``nextcloud-theme.css`` and registered
+    via ``--theme-set`` so the frontmatter theme name resolves to it. All
+    three call paths (gate, HTML, PDF) apply it identically, keeping the
+    parity contract; a deck under a built-in theme (or absent theming
+    values) converts exactly as before: no theme file, no flag.
+
     ``allow_local_files`` appends ``--allow-local-files`` (the flag governs
     reading local files into the deck, not writing the output; verified
     against ``marp --help``). ONLY the html/pdf render conversions ever set
     it, and only when the deck's ``#file:N`` images were materialized into
     ``workdir`` first. The containment argument: the workdir is a throwaway
     TemporaryDirectory whose only content is files we ourselves wrote (the
-    validated deck Markdown, the strict ``.marprc`` and our own downloaded,
-    type-sniffed, size-capped image blobs), so the path-traversal class the
-    flag guards against has no attack surface here. The browserless syntax
-    gate never sets it and keeps running imageless.
+    validated deck Markdown, the strict ``.marprc``, our own downloaded,
+    type-sniffed, size-capped image blobs, and the generated theme CSS), so
+    the path-traversal class the flag guards against has no attack surface
+    here. The browserless syntax gate never sets it and keeps running
+    imageless.
 
     Returns the output file bytes. Raises :class:`DeckError` with the
     marp-cli output included, so an upstream agent can self-correct from
@@ -188,6 +226,9 @@ def _marp_convert(
         str(marprc_path),
         "--no-html",
     ]
+    if theming_values is not None and _deck_theme(markdown) == THEME_NAME:
+        theme_css_path = write_theme_css(theming_values, workdir)
+        argv += ["--theme-set", str(theme_css_path)]
     if allow_local_files:
         argv.append("--allow-local-files")
     result = _run_marp(runner, argv, marp_timeout_s, stage)
@@ -214,6 +255,24 @@ def _run_marp(
             f"Marp {stage} timed out after {timeout_s} seconds. "
             "The deck may be too complex; try fewer slides."
         ) from exc
+
+
+def _deck_theme(markdown: str) -> str | None:
+    """The deck's frontmatter theme name (None when absent or not a plain
+    string). The markdown reaching a conversion was already validated (the
+    theme key is an allow-listed string there), so this parse is defensive
+    only: any surprise means "no theme", never a render error."""
+    frontmatter_text, _body = split_frontmatter(markdown)
+    if frontmatter_text is None:
+        return None
+    try:
+        frontmatter = yaml.safe_load(frontmatter_text)
+    except yaml.YAMLError:
+        return None
+    if not isinstance(frontmatter, dict):
+        return None
+    theme = frontmatter.get("theme")
+    return theme if isinstance(theme, str) else None
 
 
 def _excerpt(result: subprocess.CompletedProcess[bytes], limit: int = 1500) -> str:

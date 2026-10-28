@@ -137,6 +137,55 @@ def test_validate_deck_does_not_check_bounds() -> None:
     validate_deck("---\nmarp: true\ntitle: t\n---\n\n# T\n\n![a](#file:99)\n")
 
 
+# --- deck completeness (opt-in require_complete) --------------------------------------
+
+
+def test_completeness_error_names_every_never_referenced_image() -> None:
+    # 4 images provided, only #file:1 used (twice): the error names the
+    # other three and stays actionable for the self-correcting retry
+    deck = image_deck("#file:1", "#file:1")
+    with pytest.raises(DeckError) as excinfo:
+        validate_image_references(deck, [501, 502, 503, 504], require_complete=True)
+    message = str(excinfo.value)
+    assert "never referenced" in message
+    assert "#file:2, #file:3, #file:4" in message
+    assert "#file:1" not in message  # the referenced one is not blamed
+    assert "at least one slide" in message
+
+
+def test_completeness_passes_when_every_image_referenced() -> None:
+    deck = image_deck("#file:4", "#file:1", "#file:2", "#file:3")
+    assert validate_image_references(
+        deck, [501, 502, 503, 504], require_complete=True
+    ) == [1, 2, 3, 4]
+
+
+def test_completeness_opt_in_default_keeps_incomplete_deck_valid() -> None:
+    # backwards compatible: without the flag the same incomplete deck
+    # passes (the per-slide sites and the re-render path rely on this)
+    deck = image_deck("#file:1", "#file:1")
+    assert validate_image_references(deck, [501, 502, 503, 504]) == [1]
+    assert validate_image_references(
+        deck, [501, 502, 503, 504], require_complete=False
+    ) == [1]
+
+
+def test_completeness_without_images_passes() -> None:
+    # no images provided, nothing to require: a text-only deck stays valid
+    deck = validate_deck("---\nmarp: true\ntitle: t\n---\n\n# T\n\ntext\n").deck
+    assert validate_image_references(deck, [], require_complete=True) == []
+
+
+def test_completeness_counts_background_images_as_references() -> None:
+    # the deck-wide background reference covers its image: a watermark
+    # background plus one content image satisfies completeness for both
+    deck = validate_deck(
+        "---\nmarp: true\ntitle: t\nbackgroundImage: '#file:2'\n---\n\n"
+        "# T\n\n![pic](#file:1)\n"
+    ).deck
+    assert validate_image_references(deck, [501, 502], require_complete=True) == [1, 2]
+
+
 # --- content sniffing -----------------------------------------------------------------
 
 
@@ -372,3 +421,52 @@ def test_materialize_leaves_background_reference_without_blob_strict() -> None:
     rewritten = materialize_image_files(markdown, {2: png_bytes()})
     assert "backgroundImage: '#file:1'" in rewritten  # no blob: untouched
     assert "![bg](data:image/png;base64," in rewritten
+
+
+# --- extended bg keywords: bounds + render materialization ----------------------
+
+
+def keyword_bg_deck():
+    """A deck using the extended keyword forms: a sized split background and
+    a combined direction+length background."""
+    markdown = (
+        "---\nmarp: true\ntitle: t\n---\n\n"
+        "# T\n\n![bg left:33%](#file:1)\n\n---\n\n"
+        "## Two\n\n![bg left w:50%](#file:2)\n"
+    )
+    return validate_deck(markdown).deck
+
+
+def test_keyword_background_references_collected_for_bounds_checks() -> None:
+    deck = keyword_bg_deck()
+    assert referenced_image_indices(deck) == [1, 2]
+    assert validate_image_references(deck, [501, 502]) == [1, 2]
+    with pytest.raises(DeckError, match=r"#file:2.*1 image\(s\)"):
+        validate_image_references(deck, [501])
+
+
+def test_materialize_preserves_combined_bg_keywords_verbatim() -> None:
+    # the keywords must survive the data-URI rewrite: marp applies them in
+    # the html/pdf renders
+    blob = png_bytes()
+    uri = f"data:image/png;base64,{base64.b64encode(blob).decode()}"
+    markdown = "---\nmarp: true\ntitle: t\n---\n\n# T\n\n![bg left w:50%](#file:1)\n"
+    rewritten = materialize_image_files(markdown, {1: blob})
+    assert f"![bg left w:50%]({uri})" in rewritten
+    assert "#file:1" not in rewritten
+
+
+def test_materialize_preserves_sized_split_keyword() -> None:
+    blob = png_bytes()
+    uri = f"data:image/png;base64,{base64.b64encode(blob).decode()}"
+    markdown = "---\nmarp: true\ntitle: t\n---\n\n# T\n\n![bg right:33%](#file:1)\n"
+    rewritten = materialize_image_files(markdown, {1: blob})
+    assert f"![bg right:33%]({uri})" in rewritten
+
+
+def test_materialize_preserves_inline_sizing_keyword() -> None:
+    blob = png_bytes()
+    uri = f"data:image/png;base64,{base64.b64encode(blob).decode()}"
+    markdown = "---\nmarp: true\ntitle: t\n---\n\n# T\n\n![Diagram w:200px](#file:1)\n"
+    rewritten = materialize_image_files(markdown, {1: blob})
+    assert f"![Diagram w:200px]({uri})" in rewritten

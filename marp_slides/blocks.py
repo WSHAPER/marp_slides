@@ -75,6 +75,24 @@ class TableBlock:
 
 
 @dataclass(frozen=True)
+class BackgroundImageSpec:
+    """The parsed Marp keywords of a per-slide ``![bg ...](#file:N)`` line:
+    how the background image is laid out. Chrome for the html/pdf renders —
+    the keyword text stays in the deck source and marp applies it there;
+    the native PPTX build ignores it together with the background itself."""
+
+    direction: str | None = None  # 'left', 'right' or 'vertical'
+    #: Sized split from 'left:33%' / 'right:33%': the raw percentage.
+    split: str | None = None
+    #: 'cover', 'contain', 'fit', 'auto', or a raw scale like '150%'.
+    size: str | None = None
+    #: Raw w:/width: length value ('50%', '200px').
+    width: str | None = None
+    #: Raw h:/height: length value.
+    height: str | None = None
+
+
+@dataclass(frozen=True)
 class ImageBlock:
     """A file-id image reference on a line of its own, ``![alt](#file:N)``,
     where ``index`` (N) is the 1-based position in the task's ``images``
@@ -84,6 +102,11 @@ class ImageBlock:
 
     alt: str
     index: int  # 1-based position in the task's images input
+    #: Sizing keywords parsed out of the alt text ('![w:200px](#file:N)'),
+    #: raw values. html/pdf output only: marp applies them in its renders,
+    #: the native PPTX build inserts the picture at its native size.
+    width: str | None = None
+    height: str | None = None
 
 
 #: Every block type a slide body can carry. The parser produces them, the
@@ -120,6 +143,10 @@ class ParsedSlide:
     #: has no slide-background API, so the native PPTX build ignores it by
     #: construction (it is chrome here, never a content block).
     background_image: int | None = None
+    #: The parsed keywords of that '![bg ...]' line (direction, split, size,
+    #: w:/h: lengths); None when there is no background image or it carries
+    #: no keywords. Render chrome like ``background_image`` itself.
+    background_image_spec: BackgroundImageSpec | None = None
     #: Two-column layout activation ('<!-- columns: 2 -->' as the slide's
     #: first content); 2 or None.
     columns: int | None = None
