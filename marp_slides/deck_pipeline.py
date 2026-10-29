@@ -19,7 +19,7 @@ from collections.abc import Mapping
 from pathlib import Path
 from typing import Any
 
-from .constructs import MARP_THEMES, SUPPORTED_CONSTRUCTS, THEME_AUTO, THEME_VALUES
+from .constructs import THEME_AUTO, THEME_VALUES
 from .images import materialize_image_files
 from .marp_cli import (
     MARPRC_CONTENT,
@@ -31,6 +31,7 @@ from .marp_cli import (
 )
 from .marp_cli import render_deck_html as marp_render_html
 from .marp_cli import render_deck_pdf as marp_render_pdf
+from .outline import _deck_themes_section, _load_prompt, _supported_constructs_section
 from .settings import OUTPUT_FORMAT_VALUES
 from .theming import ThemingValues
 from .validator import DeckError, ValidatedDeck, count_slides, validate_deck
@@ -38,7 +39,6 @@ from .validator import DeckError, ValidatedDeck, count_slides, validate_deck
 __all__ = [
     "DECK_SKELETON",
     "DECK_SYSTEM_PROMPT",
-    "DECK_THEME_OVERRIDE_PROMPT",
     "MARPRC_CONTENT",
     "DeckError",
     "ValidatedDeck",
@@ -59,21 +59,6 @@ __all__ = [
     "validate_theme",
     "validate_theme_override",
 ]
-
-_PROMPTS_DIR = Path(__file__).parent / "prompts"
-
-
-def _load_prompt(name: str) -> str:
-    return (_PROMPTS_DIR / name).read_text(encoding="utf-8")
-
-
-def _supported_constructs_section() -> str:
-    return "\n".join(f"- {label}" for _id, label in SUPPORTED_CONSTRUCTS)
-
-
-def _deck_themes_section() -> str:
-    return "\n".join(f"- {name}: {description}" for name, description in MARP_THEMES)
-
 
 #: Canonical deck skeleton embedded verbatim in the deck-authoring system
 #: prompt (a fixed example; the generated constructs list stays the single
@@ -132,6 +117,31 @@ def validate_prompt(prompt: object, max_chars: int = 8192) -> str:
     return prompt.strip()
 
 
+def _validated_choice(
+    value: object,
+    default: str,
+    allowed: tuple[str, ...],
+    name: str,
+    unsupported_detail: str,
+) -> str:
+    """Shared shape of the enum task inputs: absent yields ``default``; any
+    other value must normalize into ``allowed``. Both messages name the
+    input and list every accepted value verbatim (pinned by tests)."""
+    if value is None:
+        return default
+    if not isinstance(value, str):
+        raise DeckError(
+            f"Invalid {name} {value!r}: expected one of {list(allowed)} (or omit it)."
+        )
+    normalized = value.strip().lower()
+    if normalized not in allowed:
+        raise DeckError(
+            f"Unsupported {name} {value!r}: expected one of {list(allowed)} "
+            f"(or omit it). {unsupported_detail}"
+        )
+    return normalized
+
+
 def validate_output_format(
     value: object, allowed: tuple[str, ...] = OUTPUT_FORMAT_VALUES
 ) -> str:
@@ -139,21 +149,13 @@ def validate_output_format(
     value (or ``'pptx'`` default when absent). The default derives from
     :data:`marp_slides.settings.OUTPUT_FORMAT_VALUES` so the accepted set
     has exactly one source."""
-    if value is None:
-        return "pptx"
-    if not isinstance(value, str):
-        raise DeckError(
-            f"Invalid output_format {value!r}: expected one of {list(allowed)} "
-            "(or omit it)."
-        )
-    normalized = value.strip().lower()
-    if normalized not in allowed:
-        raise DeckError(
-            f"Unsupported output_format {value!r}: expected one of {list(allowed)} "
-            "(or omit it). ODP cannot be produced because the Marp renderer has "
-            "no ODP output."
-        )
-    return normalized
+    return _validated_choice(
+        value,
+        "pptx",
+        allowed,
+        "output_format",
+        "ODP cannot be produced because the Marp renderer has no ODP output.",
+    )
 
 
 def validate_theme(value: object, allowed: tuple[str, ...] = THEME_VALUES) -> str:
@@ -162,20 +164,14 @@ def validate_theme(value: object, allowed: tuple[str, ...] = THEME_VALUES) -> st
     best-fitting theme). The default derives from
     :data:`marp_slides.constructs.THEME_VALUES` so the accepted set has
     exactly one source."""
-    if value is None:
-        return THEME_AUTO
-    if not isinstance(value, str):
-        raise DeckError(
-            f"Invalid theme {value!r}: expected one of {list(allowed)} (or omit it)."
-        )
-    normalized = value.strip().lower()
-    if normalized not in allowed:
-        raise DeckError(
-            f"Unsupported theme {value!r}: expected one of {list(allowed)} "
-            "(or omit it). Only the three themes bundled with Marp are "
-            "supported; 'auto' (the default) lets the model pick the best fit."
-        )
-    return normalized
+    return _validated_choice(
+        value,
+        THEME_AUTO,
+        allowed,
+        "theme",
+        "Only the three themes bundled with Marp are supported; 'auto' "
+        "(the default) lets the model pick the best fit.",
+    )
 
 
 def validate_theme_override(frontmatter: Mapping[str, Any], theme: str) -> None:
@@ -197,17 +193,6 @@ def validate_theme_override(frontmatter: Mapping[str, Any], theme: str) -> None:
 
 
 # --- marp renders: compose image materialization ------------------------------
-
-
-def _theming_kwargs(
-    theming_values: ThemingValues | None,
-) -> dict[str, ThemingValues]:
-    """The branded-theme argument for the marp conversion: present only
-    when the deck renders through the generated ``nextcloud`` theme, so
-    every bundled-theme call keeps its exact pre-theming shape."""
-    if theming_values is None:
-        return {}
-    return {"theming_values": theming_values}
 
 
 def render_deck_html(
@@ -384,15 +369,10 @@ def build_deck_filename(
 def _deck_title(
     frontmatter: Mapping[str, Any] | None, prompt: str | None
 ) -> str | None:
-    title = None
-    if frontmatter is not None:
-        raw_title = frontmatter.get("title")
-        if isinstance(raw_title, str):
-            title = raw_title
-        elif (
-            isinstance(raw_title, list) and raw_title and isinstance(raw_title[0], str)
-        ):
-            title = raw_title[0]
+    raw_title = frontmatter.get("title") if frontmatter is not None else None
+    if isinstance(raw_title, list) and raw_title and isinstance(raw_title[0], str):
+        raw_title = raw_title[0]
+    title = raw_title if isinstance(raw_title, str) else None
     if not title and prompt:
         return prompt.strip().splitlines()[0]
     return title

@@ -17,7 +17,7 @@ from pptx import Presentation
 from pptx.dml.color import RGBColor
 from pptx.slide import Slide, SlideLayout
 from pptx.text.text import TextFrame, _Paragraph
-from pptx.util import Emu, Inches, Pt
+from pptx.util import Emu, Inches
 
 from .blocks import (
     Block,
@@ -40,6 +40,7 @@ from .elements import (
     add_slide_number_field,
     add_table,
     add_text_block,
+    append_runs,
     apply_list_para,
     apply_quote_para,
     picture_geometry,
@@ -61,7 +62,6 @@ from .geometry import (
     FOOTER_TOP,
     HEADER_TOP,
     LIST_HEIGHT,
-    MONO_FONT,
     PARA_HEIGHT,
     QUOTE_HEIGHT,
     SLIDE_HEIGHT_EMU,
@@ -232,9 +232,17 @@ def _fill_body(
         elif isinstance(block, CodeBlock):
             _fill_body_code(next_para, block, width_pt, avail_in)
         elif isinstance(block, ListBlock):
-            _fill_body_list(next_para, block)
+            paras = []
+            for item in block.items:
+                para = next_para()
+                write_runs(para, item.runs)
+                paras.append(para)
+            _apply_list_paras(paras, block)
         elif isinstance(block, BlockQuote):
-            _fill_body_quote(next_para, block)
+            for quoted in block.paragraphs:
+                para = next_para()
+                write_runs(para, quote_runs(quoted))
+                apply_quote_para(para)
 
 
 def _fill_body_code(
@@ -247,31 +255,16 @@ def _fill_body_code(
     # renders as monospace paragraphs in the column text box, font-fitted
     # to the column width/band (wrap is native)
     font_pt, _height = fit_code(block.text, width_pt, avail_in)
-    for _idx, code_line in enumerate(block.text.splitlines() or [""]):
-        para = next_para()
-        run = para.add_run()
-        run.text = code_line or " "
-        run.font.name = MONO_FONT
-        run.font.size = Pt(font_pt)
+    for line in block.text.splitlines() or [""]:
+        append_runs(next_para(), (Run(line or " ", code=True),), font_pt)
 
 
-def _fill_body_list(next_para: Callable[[], _Paragraph], block: ListBlock) -> None:
-    for idx, item in enumerate(block.items):
-        para = next_para()
-        write_runs(para, item.runs)
+def _apply_list_paras(paras: Iterable[_Paragraph], block: ListBlock) -> None:
+    # startAt only on the first item (apply_list_para documents why)
+    for idx, (para, item) in enumerate(zip(paras, block.items, strict=False)):
         apply_list_para(
-            para,
-            block.ordered,
-            item.level,
-            start=block.start if idx == 0 else None,
+            para, block.ordered, item.level, start=block.start if idx == 0 else None
         )
-
-
-def _fill_body_quote(next_para: Callable[[], _Paragraph], block: BlockQuote) -> None:
-    for quoted in block.paragraphs:
-        para = next_para()
-        write_runs(para, quote_runs(quoted))
-        apply_quote_para(para)
 
 
 def estimate_height(block: Block, images: Mapping[int, bytes]) -> int:
@@ -334,17 +327,7 @@ def _flow_non_code(
     elif isinstance(block, BlockQuote):
         add_text_block(slide, y, height, [quote_runs(p) for p in block.paragraphs])
     elif isinstance(block, ListBlock):
-        _flow_list(slide, y, height, block)
-    return height
-
-
-def _flow_list(slide: Slide, y: int, height: int, block: ListBlock) -> None:
-    paragraphs = [item.runs for item in block.items]
-    box_paragraphs = add_text_block(slide, y, height, paragraphs)
-    for idx, (para, item) in enumerate(zip(box_paragraphs, block.items, strict=False)):
-        apply_list_para(
-            para,
-            block.ordered,
-            item.level,
-            start=block.start if idx == 0 else None,
+        _apply_list_paras(
+            add_text_block(slide, y, height, [item.runs for item in block.items]), block
         )
+    return height

@@ -113,19 +113,15 @@ def collect_link_refs(bodies: list[str]) -> dict[str, str]:
                 # scanned for definitions
                 cursor = _fence_span_end(lines, cursor, fence.group(1)[0])
                 continue
-            _collect_link_def_line(lines[cursor], refs)
+            match = LINK_DEF_RE.match(lines[cursor])
+            if match is not None:
+                key = match.group("id").strip().lower()
+                if key not in refs:  # first definition wins
+                    refs[key] = validate_link_url(
+                        match.group("url"), "a link reference definition"
+                    )
             cursor += 1
     return refs
-
-
-def _collect_link_def_line(line: str, refs: dict[str, str]) -> None:
-    match = LINK_DEF_RE.match(line)
-    if match is None:
-        return
-    key = match.group("id").strip().lower()
-    if key in refs:  # first definition wins
-        return
-    refs[key] = validate_link_url(match.group("url"), "a link reference definition")
 
 
 def parse_deck(
@@ -150,8 +146,22 @@ def parse_deck(
     directives: Directives = {}
     bodies = split_slides(markdown)
     link_refs = collect_link_refs(bodies)
-    deck_background = _absorb_preamble(bodies, directives, link_refs, background)
-    bodies = bodies[1:] if bodies and is_directives_only(bodies[0]) else bodies
+    deck_background = background
+    if bodies and is_directives_only(bodies[0]):
+        # a leading chunk that carries ONLY deck directives (or is empty) is
+        # deck preamble, not a slide: absorb it as chrome so the first titled
+        # slide becomes slide 1
+        absorbed_bg = absorb_directives(bodies[0], directives, link_refs)
+        bodies = bodies[1:]
+        if absorbed_bg is not None:
+            if background is not None:
+                raise UnsupportedConstructError(
+                    "Unsupported construct in the deck preamble: backgroundColor is set twice "
+                    "(frontmatter and a comment directive). Set the deck background once: "
+                    "either backgroundColor: '#RRGGBB' in the frontmatter or a "
+                    "'<!-- backgroundColor: ... -->' comment right after it."
+                )
+            deck_background = absorbed_bg
     slides = [
         parse_slide(number, body, directives if number == 1 else None, link_refs)
         for number, body in enumerate(bodies, start=1)
@@ -169,29 +179,3 @@ def parse_deck(
         background=deck_background,
         background_image=background_image,
     )
-
-
-def _absorb_preamble(
-    bodies: list[str],
-    directives: Directives,
-    link_refs: dict[str, str],
-    frontmatter_background: str | None,
-) -> str | None:
-    """Absorb a leading directives-only chunk (deck preamble) into chrome.
-    Returns the effective deck-wide background color."""
-    if not bodies or not is_directives_only(bodies[0]):
-        return frontmatter_background
-    # a leading chunk that carries ONLY deck directives (or is empty) is deck
-    # preamble, not a slide: absorb it as chrome so the first titled slide
-    # becomes slide 1
-    absorbed_bg = absorb_directives(bodies[0], directives, link_refs)
-    if absorbed_bg is None:
-        return frontmatter_background
-    if frontmatter_background is not None:
-        raise UnsupportedConstructError(
-            "Unsupported construct in the deck preamble: backgroundColor is set twice "
-            "(frontmatter and a comment directive). Set the deck background once: "
-            "either backgroundColor: '#RRGGBB' in the frontmatter or a "
-            "'<!-- backgroundColor: ... -->' comment right after it."
-        )
-    return absorbed_bg

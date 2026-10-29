@@ -48,7 +48,7 @@ from .constructs import (
     validate_hex_color,
 )
 from .directives import DECK_DIRECTIVE_LINE_RE
-from .slide_blocks import FENCE_OPEN_RE
+from .repair import _iter_unfenced_lines
 from .validator import (
     DeckError,
     ValidatedDeck,
@@ -59,7 +59,6 @@ from .validator import (
 
 __all__ = [
     "OUTLINE_SYSTEM_PROMPT",
-    "OUTLINE_THEME_OVERRIDE_PROMPT",
     "SLIDE_SYSTEM_PROMPT",
     "DeckOutline",
     "SlideOutline",
@@ -152,10 +151,7 @@ class DeckOutline:
 def _image_count_clause(image_count: int) -> str:
     if image_count <= 0:
         return 'the task provides no images, so every "has_image" must be false.'
-    return (
-        f"the task provides {image_count} image(s); N is the 1-based position "
-        "among them."
-    )
+    return f"the task provides {image_count} image(s); N is the 1-based position among them."
 
 
 def build_outline_prompt(
@@ -169,15 +165,11 @@ def build_outline_prompt(
     validated theme input: ``'auto'`` (the default) keeps the
     pick-the-best-fit rule; any other value appends the hard
     user-requirement clause from prompts/outline_theme_override.md."""
-    slide_count_clause = (
+    system_prompt = _fill(
+        OUTLINE_SYSTEM_PROMPT, image_count_clause=_image_count_clause(image_count)
+    ) + (
         f"\nTarget deck length: about {max_slides} slides "
         "(fewer is fine, more only if the topic truly needs it).\n"
-    )
-    system_prompt = (
-        _fill(
-            OUTLINE_SYSTEM_PROMPT, image_count_clause=_image_count_clause(image_count)
-        )
-        + slide_count_clause
     )
     if theme != THEME_AUTO:
         system_prompt = (
@@ -249,22 +241,23 @@ def _parse_paginate(data: dict[str, Any]) -> bool:
 
 
 def _parse_background_color(data: dict[str, Any]) -> str | None:
-    if "backgroundColor" not in data or data["backgroundColor"] is None:
+    raw = data.get("backgroundColor")
+    if raw is None:
         return None
     try:
-        return f"#{validate_hex_color(data['backgroundColor'])}"
+        return f"#{validate_hex_color(raw)}"
     except UnsupportedConstructError as exc:
         raise DeckError(f"Invalid outline: {exc}") from exc
 
 
 def _parse_background_image(data: dict[str, Any], image_count: int) -> str | None:
-    if "backgroundImage" not in data or data["backgroundImage"] is None:
+    raw = data.get("backgroundImage")
+    if raw is None:
         return None
-    raw = data["backgroundImage"]
     if isinstance(raw, str) and not raw.strip():
         return None  # empty string means "no background image", not a rejection
     try:
-        index = validate_background_image_reference(data["backgroundImage"])
+        index = validate_background_image_reference(raw)
     except UnsupportedConstructError as exc:
         raise DeckError(f"Invalid outline: {exc}") from exc
     if index > image_count:
@@ -515,19 +508,8 @@ def _reject_deck_directive_lines(markdown: str) -> None:
     clash with the outline's own chrome (or apply from the wrong slide).
     Fence-aware: the same line inside a code block is code, not a
     directive."""
-    in_fence = False
-    fence_char = "`"
-    for line in markdown.splitlines():
-        stripped = line.strip()
-        if in_fence:
-            if stripped and stripped == fence_char * len(stripped):
-                in_fence = False
-            continue
-        if FENCE_OPEN_RE.match(line) is not None:
-            in_fence = True
-            fence_char = stripped[0]
-            continue
-        match = DECK_DIRECTIVE_LINE_RE.match(stripped)
+    for _idx, line in _iter_unfenced_lines(markdown.splitlines(), 0):
+        match = DECK_DIRECTIVE_LINE_RE.match(line.strip())
         if match is not None and match.group("scoped") is None:
             raise DeckError(
                 "The slide response contains a deck-level footer/header "

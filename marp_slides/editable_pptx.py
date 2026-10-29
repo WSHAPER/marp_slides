@@ -93,7 +93,6 @@ __all__ = [
 #: underscore names this module exposed historically).
 _CONTENT_WIDTH_PT = CONTENT_WIDTH_PT
 _COLUMN_WIDTH_PT = COLUMN_WIDTH_PT
-_MAX_CODE_LINES = MAX_CODE_LINES
 _code_wrapped_lines = code_wrapped_lines
 _code_height_in = code_height_in
 _fit_code = fit_code

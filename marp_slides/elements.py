@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import io
 from collections.abc import Iterable
+from dataclasses import replace
 
 from pptx.enum.text import PP_ALIGN
 from pptx.oxml.ns import qn
@@ -45,7 +46,9 @@ from .geometry import (
 )
 
 
-def append_runs(para: _Paragraph, runs: Iterable[Run]) -> None:
+def append_runs(
+    para: _Paragraph, runs: Iterable[Run], font_pt: float | None = None
+) -> None:
     for run in runs:
         r = para.add_run()
         r.text = run.text
@@ -53,6 +56,8 @@ def append_runs(para: _Paragraph, runs: Iterable[Run]) -> None:
         r.font.italic = run.italic or None
         if run.code:
             r.font.name = MONO_FONT
+        if font_pt is not None:
+            r.font.size = Pt(font_pt)  # code-fit ladder size for code runs
         if run.link:
             r.hyperlink.address = run.link  # native text-run hyperlink
 
@@ -100,16 +105,7 @@ def apply_quote_para(para: _Paragraph) -> None:
 
 def quote_runs(paragraph: Paragraph) -> tuple[Run, ...]:
     """A quote's runs carry the same styling as the source, forced italic."""
-    return tuple(
-        Run(
-            r.text,
-            bold=r.bold,
-            italic=True,
-            code=r.code,
-            link=r.link,
-        )
-        for r in paragraph.runs
-    )
+    return tuple(replace(r, italic=True) for r in paragraph.runs)
 
 
 def picture_geometry(blob: bytes) -> tuple[int, int]:
@@ -154,10 +150,7 @@ def add_code_box(
     tf.word_wrap = True
     for idx, line in enumerate(block.text.splitlines() or [""]):
         para = tf.paragraphs[0] if idx == 0 else tf.add_paragraph()
-        r = para.add_run()
-        r.text = line or " "
-        r.font.name = MONO_FONT
-        r.font.size = Pt(font_pt)
+        append_runs(para, (Run(line or " ", code=True),), font_pt)
     box.fill.solid()
     box.fill.fore_color.rgb = CODE_BG
     box.line.color.rgb = CODE_BORDER
@@ -232,12 +225,9 @@ def add_slide_number_field(slide: Slide, number: int) -> None:
     fld = para._p.makeelement(qn("a:fld"), {})
     fld.set("id", SLIDENUM_FIELD_GUID)
     fld.set("type", "slidenum")
-    rpr = fld.makeelement(qn("a:rPr"), {})
-    rpr.set("lang", "en-US")
-    rpr.set("sz", "1000")
+    rpr = fld.makeelement(qn("a:rPr"), {"lang": "en-US", "sz": "1000"})
     fill = rpr.makeelement(qn("a:solidFill"), {})
-    clr = fill.makeelement(qn("a:srgbClr"), {"val": "7F7F7F"})
-    fill.append(clr)
+    fill.append(fill.makeelement(qn("a:srgbClr"), {"val": str(CHROME_COLOR)}))
     rpr.append(fill)
     fld.append(rpr)
     t = fld.makeelement(qn("a:t"), {})

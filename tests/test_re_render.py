@@ -48,7 +48,12 @@ def settings() -> Settings:
 @pytest.fixture(autouse=True)
 def no_llm_no_real_render(monkeypatch):
     """A re-render must never schedule an inner LLM round (the autouse
-    tripwire), and the renders are faked so no marp/docker is needed."""
+    tripwire), and the renders are faked so no marp/docker is needed. The
+    overflow-measurement drivers are faked too (the fit fakes of
+    no_real_build in test_task_plumbing): without them every re-render
+    test would run a REAL marp-cli render per render phase — environment
+    luck, not covered behavior, and ~1.5s each. The measurement drivers
+    keep their dedicated coverage in test_layout.py."""
 
     def forbidden(*args, **kwargs):
         raise AssertionError("re_render must not call the inner LLM")
@@ -68,6 +73,10 @@ def no_llm_no_real_render(monkeypatch):
     monkeypatch.setattr(
         task_worker, "build_pptx", lambda deck, title, images=None: b"PK-editable"
     )
+    monkeypatch.setattr(
+        task_worker, "measure_slide_overflow", lambda md, wd, **kw: None
+    )
+    monkeypatch.setattr(task_worker, "measure_deck_overflow", lambda md, wd, **kw: ())
 
 
 # --- registration: a second provider + task type alongside the existing one

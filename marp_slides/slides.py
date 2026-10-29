@@ -47,13 +47,7 @@ from .geometry import (
     MAX_CODE_LINES,
     code_wrapped_lines,
 )
-from .inline import (
-    _MD,
-    LINK_DEF_PREFIX_RE,
-    LINK_DEF_RE,
-    parse_inline,
-    plain_text,
-)
+from .inline import _MD, LINK_DEF_PREFIX_RE, LINK_DEF_RE, parse_inline
 from .slide_blocks import (
     BULLET_RE,
     FENCE_OPEN_RE,
@@ -70,21 +64,21 @@ from .slide_blocks import (
     consume_table,
 )
 
-#: The top-level block tokens the walk dispatches on: markdown-it's
-#: "commonmark" preset emits exactly these nine for the supported construct
-#: battery. Nested tokens (level >= 1) are covered by their level-0
-#: container token; stream tokens without a source extent are dropped.
+#: The top-level block tokens the walk DISPATCHES on — the closed set
+#: :func:`_consume_token` routes anywhere but the line fallback. Every other
+#: top-level token (paragraphs, thematic breaks, indented code) is
+#: decision-free: its begin line would run the line fallback exactly like a
+#: token-less gap, so it never enters the list. Nested tokens (level >= 1)
+#: are covered by their level-0 container token; stream tokens without a
+#: source extent are dropped.
 _BLOCK_TOKEN_TYPES = frozenset(
     {
         "blockquote_open",
         "bullet_list_open",
-        "code_block",
         "fence",
         "heading_open",
-        "hr",
         "html_block",
         "ordered_list_open",
-        "paragraph_open",
     }
 )
 
@@ -152,12 +146,12 @@ def parse_slide(
 
 def _block_tokens(body: str) -> list[Token]:
     """The body's top-level block tokens that carry a source extent:
-    level-0 openers of the constructs the walk knows (nesting interiors are
-    covered by their level-0 container token), each with a two-entry
-    ``map`` — a ``[begin, end)`` line range over ``body.splitlines()``. The
-    walk consumes only ``begin``: the construct's real extent stays defined
-    by the line consumers, whose boundaries markdown-it does not always
-    share (a short fence closer, for one)."""
+    level-0 openers of the constructs the walk dispatches on (nesting
+    interiors are covered by their level-0 container token), each with a
+    two-entry ``map`` — a ``[begin, end)`` line range over
+    ``body.splitlines()``. The walk consumes only ``begin``: the construct's
+    real extent stays defined by the line consumers, whose boundaries
+    markdown-it does not always share (a short fence closer, for one)."""
     return [
         tok
         for tok in _MD.parse(body)
@@ -180,65 +174,46 @@ def _consume_token(state: SlideState, lines: list[str], tok: Token) -> int:
     the next line index. Each mdit-modeled shape routes to today's handler
     under the guard that keeps markdown-it's laxer block rules (up-to-
     three-space indents, setext underlines, bare '#' lines) on today's
-    semantics; guard misses and tokens the guards do not cover (paragraph,
-    indented code, thematic break) run the line dispatcher instead, which
-    reproduces today's outcome exactly."""
+    semantics; guard misses fall back to the line dispatcher, which
+    reproduces today's outcome exactly (tokens outside _BLOCK_TOKEN_TYPES
+    never dispatch — their lines reach that same fallback as token-less
+    gaps)."""
     begin = _begin(tok)
     line = lines[begin]
     stripped = line.strip()
     if tok.type == "heading_open":
-        return _heading_token(state, lines, tok, begin, line, stripped)
-    if tok.type == "fence":
-        return _fence_token(state, lines, begin, line)
-    if tok.type == "html_block" and stripped.startswith("<!--"):
+        # setext underlines (markup '-'/'=') fall to the line dispatcher,
+        # whose paragraph join and stray-'---' rejection stay authoritative;
+        # atx hashes route to the heading handler only when today's
+        # HEADING_RE agrees — markdown-it also makes heading tokens out of
+        # bare '#'/'##' lines, which today are paragraph text ('## ##' keeps
+        # its empty-title rejection inside the handler).
+        heading = None if tok.markup in ("-", "=") else HEADING_RE.match(stripped)
+        if heading is not None:
+            return _consume_heading(state, heading, begin)
+    elif tok.type == "fence":
+        # the column-0 guard of today's FENCE_OPEN_RE: markdown-it tolerates
+        # up to three leading spaces, and those openers must keep today's
+        # 'no leading spaces' rejection — routing them through the line
+        # dispatcher leaves _skip_or_reject_line the single raise site. The
+        # consumer reads the fence body from the source lines, so short
+        # closers, indented fence lines inside the body and unclosed fences
+        # all keep today's exact boundaries.
+        fence = FENCE_OPEN_RE.match(line)
+        if fence is not None:
+            return _consume_fence(state, lines, begin, fence)
+    elif tok.type == "html_block" and stripped.startswith("<!--"):
         return _consume_comment_block(state, lines, begin)
-    if tok.type == "blockquote_open" and QUOTE_RE.match(stripped):
+    elif tok.type == "blockquote_open" and QUOTE_RE.match(stripped):
         return consume_quote(state, lines, begin)
-    if tok.type in ("bullet_list_open", "ordered_list_open") and (
+    elif tok.type in ("bullet_list_open", "ordered_list_open") and (
         BULLET_RE.match(line) or ORDERED_RE.match(line)
     ):
         return consume_list(state, lines, begin)
     return _consume_line(state, lines, begin, line, stripped)
 
 
-def _heading_token(
-    state: SlideState,
-    lines: list[str],
-    tok: Token,
-    begin: int,
-    line: str,
-    stripped: str,
-) -> int:
-    """A heading token. Setext underlines (markup '-'/'=', a shape today's
-    grammar has no rule for) fall to the line dispatcher, whose paragraph
-    join and stray-'---' rejection stay authoritative; atx hashes route to
-    the heading handler only when today's HEADING_RE agrees — markdown-it
-    also makes heading tokens out of bare '#'/'##' lines, which today are
-    paragraph text ('## ##' keeps its empty-title rejection inside the
-    handler)."""
-    if tok.markup in ("-", "="):
-        return _consume_line(state, lines, begin, line, stripped)
-    heading = HEADING_RE.match(stripped)
-    if heading is not None:
-        return _consume_heading(state, heading, begin)
-    return _consume_line(state, lines, begin, line, stripped)
-
-
-def _fence_token(state: SlideState, lines: list[str], begin: int, line: str) -> int:
-    """A fence token under the column-0 guard of today's FENCE_OPEN_RE:
-    markdown-it tolerates up to three leading spaces, and those openers must
-    keep today's 'no leading spaces' rejection — routing them through the
-    line dispatcher leaves _skip_or_reject_line the single raise site. The
-    consumer then reads the fence body from the source lines, so short
-    closers, indented fence lines inside the body and unclosed fences all
-    keep today's exact boundaries."""
-    fence = FENCE_OPEN_RE.match(line)
-    if fence is not None:
-        return _consume_fence(state, lines, begin, fence)
-    return _consume_line(state, lines, begin, line, line.strip())
-
-
-def _consume_line(
+def _consume_line(  # noqa: PLR0911 - a flat one-return-per-construct dispatch
     state: SlideState, lines: list[str], i: int, line: str, stripped: str
 ) -> int:
     """The bounded line fallback: dispatch one line to its construct
@@ -250,8 +225,10 @@ def _consume_line(
     indented code, bare '#' lines, thematic breaks, non-'1.' ordered
     openers), and on lines no token starts (blank and definition-only
     lines). Each guard in the token dispatch routes back here instead of
-    duplicating a rule, so this function keeps every line-level boundary and
-    rejection message of the line loop that used to drive the parse."""
+    duplicating a rule, so this function — ending in the body-block
+    dispatch into the slide_blocks consumers — keeps every line-level
+    boundary and rejection message of the line loop that used to drive the
+    parse."""
     skipped = _skip_or_reject_line(state, i, line, stripped)
     if skipped is not None:
         return skipped
@@ -263,7 +240,16 @@ def _consume_line(
     fence = FENCE_OPEN_RE.match(line)
     if fence:
         return _consume_fence(state, lines, i, fence)
-    return _consume_block_line(state, lines, i, line, stripped)
+    if QUOTE_RE.match(stripped):
+        return consume_quote(state, lines, i)
+    if TABLE_ROW_RE.match(line):
+        return consume_table(state, lines, i)
+    image = IMAGE_LINE_RE.match(stripped)
+    if image:
+        return consume_image_line(state, image, i)
+    if BULLET_RE.match(stripped) or ORDERED_RE.match(stripped):
+        return consume_list(state, lines, i)
+    return consume_paragraph(state, lines, i, stripped)
 
 
 def _skip_or_reject_line(
@@ -281,7 +267,10 @@ def _skip_or_reject_line(
         return i + 1
     if LINK_DEF_PREFIX_RE.match(line):
         _reject_link_def_prefix(state, stripped)
-    if _is_indented_fence_opener(line, stripped):
+    # a fence opener that only matches when leading whitespace is stripped:
+    # fences must start at column 0, and without this guard the line would
+    # degrade into paragraph text as stray backtick runs
+    if FENCE_OPEN_RE.match(stripped) is not None and not FENCE_OPEN_RE.match(line):
         raise UnsupportedConstructError(
             f"Unsupported construct on {state.where}: a fenced code block must "
             "start at the beginning of its line, with no leading spaces. Remove "
@@ -294,22 +283,6 @@ def _skip_or_reject_line(
             "Separate slides with a '---' line preceded by a blank line."
         )
     return None
-
-
-def _consume_block_line(
-    state: SlideState, lines: list[str], i: int, line: str, stripped: str
-) -> int:
-    """Dispatch a body-block construct to its slide_blocks consumer."""
-    if QUOTE_RE.match(stripped):
-        return consume_quote(state, lines, i)
-    if TABLE_ROW_RE.match(line):
-        return consume_table(state, lines, i)
-    image = IMAGE_LINE_RE.match(stripped)
-    if image:
-        return consume_image_line(state, image, i)
-    if BULLET_RE.match(stripped) or ORDERED_RE.match(stripped):
-        return consume_list(state, lines, i)
-    return consume_paragraph(state, lines, i, stripped)
 
 
 def _finish_slide(state: SlideState) -> ParsedSlide:
@@ -344,18 +317,6 @@ def _finish_slide(state: SlideState) -> ParsedSlide:
     )
 
 
-# --- guards and small predicates -------------------------------------------
-
-
-def _is_indented_fence_opener(line: str, stripped: str) -> bool:
-    """A fence opener that only matches when leading whitespace is stripped:
-    fences must start at column 0, and without this guard the line would
-    degrade into paragraph text as stray backtick runs."""
-    return (
-        FENCE_OPEN_RE.match(stripped) is not None and FENCE_OPEN_RE.match(line) is None
-    )
-
-
 def _reject_link_def_prefix(state: SlideState, stripped: str) -> None:
     """Something that looks like a link definition but does not parse as
     one (footnote definitions included) rejects with the fix, never renders
@@ -380,6 +341,14 @@ def _reject_link_def_prefix(state: SlideState, stripped: str) -> None:
 
 def _consume_comment_block(state: SlideState, lines: list[str], i: int) -> int:
     note, i = consume_comment(lines, i, state.where)
+    return _apply_slide_comment(state, note, i)
+
+
+def _apply_slide_comment(state: SlideState, note: str, i: int) -> int:
+    """Apply one slide-level comment in directive order: footer/header
+    recording (deck-scoped or this slide's override), backgroundColor,
+    columns activation, column-break, and everything else becomes the
+    speaker note."""
     directive = FOOTER_HEADER_NOTE_RE.match(note)
     if directive is not None:
         record_deck_directive(
@@ -390,32 +359,20 @@ def _consume_comment_block(state: SlideState, lines: list[str], i: int) -> int:
             state.slide_directives,
         )
         return i
-    return _apply_slide_comment(state, note, i)
-
-
-def _apply_slide_comment(state: SlideState, note: str, i: int) -> int:
     bg = BG_NOTE_RE.match(note)
-    if bg is None:
-        return _apply_layout_comment(state, note, i)
-    value = validate_hex_color(bg.group("value").strip().strip("'\""))
-    if state.background is not None:
-        raise UnsupportedConstructError(
-            f"Unsupported construct on {state.where}: only one backgroundColor "
-            "directive is allowed per slide. Remove the duplicate."
-        )
-    state.background = value
-    return i
-
-
-def _apply_layout_comment(state: SlideState, note: str, i: int) -> int:
+    if bg is not None:
+        value = validate_hex_color(bg.group("value").strip().strip("'\""))
+        if state.background is not None:
+            raise UnsupportedConstructError(
+                f"Unsupported construct on {state.where}: only one backgroundColor "
+                "directive is allowed per slide. Remove the duplicate."
+            )
+        state.background = value
+        return i
     columns_dir = COLUMNS_NOTE_RE.match(note)
-    if columns_dir is None:
-        return _apply_column_break_or_note(state, note, i)
-    _activate_columns(state, columns_dir.group("count").strip())
-    return i
-
-
-def _apply_column_break_or_note(state: SlideState, note: str, i: int) -> int:
+    if columns_dir is not None:
+        _activate_columns(state, columns_dir.group("count").strip())
+        return i
     if not COLUMN_BREAK_NOTE_RE.match(note):
         state.notes.append(note)
         return i
@@ -484,7 +441,8 @@ def _consume_heading(state: SlideState, heading: re.Match[str], i: int) -> int:
             "to the previous slide."
         )
     state.title_runs = parse_inline(text, state.where, state.link_refs)
-    state.title = plain_text(state.title_runs)
+    # title is the plain-text projection of the runs (filenames, summaries)
+    state.title = "".join(run.text for run in state.title_runs)
     state.title_level = level
     return i + 1
 

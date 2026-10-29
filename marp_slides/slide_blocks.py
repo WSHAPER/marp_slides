@@ -236,24 +236,20 @@ def _parse_background_alt(tokens: list[str]) -> ParsedImageAlt:
     width: str | None = None
     height: str | None = None
     for token in tokens:
-        split_match = _SPLIT_TOKEN_RE.match(token)
-        direction_match = _DIRECTION_TOKEN_RE.match(token)
-        size_match = _SIZE_KEYWORD_TOKEN_RE.match(token)
-        scale_match = _SCALE_TOKEN_RE.match(token)
-        length_match = _LENGTH_TOKEN_RE.match(token)
-        if split_match is not None:
+        if (split_match := _SPLIT_TOKEN_RE.match(token)) is not None:
             direction = split_match.group("direction").lower()
             split = split_match.group("split")
-        elif direction_match is not None:
+        elif (direction_match := _DIRECTION_TOKEN_RE.match(token)) is not None:
             direction = direction_match.group("direction").lower()
-        elif size_match is not None:
+        elif (size_match := _SIZE_KEYWORD_TOKEN_RE.match(token)) is not None:
             size = size_match.group("size").lower()
-        elif scale_match is not None:
+        elif (scale_match := _SCALE_TOKEN_RE.match(token)) is not None:
             size = scale_match.group("scale")
-        elif length_match is not None and _is_width(length_match.group("kind")):
-            width = length_match.group("value")
-        elif length_match is not None:
-            height = length_match.group("value")
+        elif (length_match := _LENGTH_TOKEN_RE.match(token)) is not None:
+            if _is_width(length_match.group("kind")):
+                width = length_match.group("value")
+            else:
+                height = length_match.group("value")
         else:
             alt_tokens.append(token)
     return ParsedImageAlt(
@@ -319,20 +315,16 @@ def consume_list(state: SlideState, lines: list[str], i: int) -> int:
     walk enters on a list token whose opener matches today's regexes; lazy
     continuations stop at the first line the model does not own."""
     items: list[ListItem] = []
-    first = lines[i].rstrip()
-    run_ordered = bool(ORDERED_RE.match(first))
-    run_start = ordered_start(ORDERED_RE.match(first), state.where)
+    first = ORDERED_RE.match(lines[i].rstrip())
+    run_ordered = first is not None
+    run_start = ordered_start(first, state.where)
     while i < len(lines):
         raw = lines[i].rstrip()
         if not raw.strip():
             break
-        b = BULLET_RE.match(raw)
         o = ORDERED_RE.match(raw)
-        if b is not None:
-            m = b
-        elif o is not None:
-            m = o
-        else:
+        m = o or BULLET_RE.match(raw)
+        if m is None:
             break
         if items and bool(o) != run_ordered:
             state.blocks.append(

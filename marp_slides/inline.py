@@ -186,21 +186,6 @@ def _reject_math(context: str, found: str) -> None:
     )
 
 
-def _reject_strikethrough(context: str) -> None:
-    raise UnsupportedConstructError(
-        f"Unsupported construct on {context}: strikethrough (~~...~~) is not supported. "
-        "Use plain or bold text instead."
-    )
-
-
-def _reject_footnote(context: str) -> None:
-    raise UnsupportedConstructError(
-        f"Unsupported construct on {context}: footnotes ('[^...]') are not supported. "
-        "Fold the note into the slide text or into a speaker-note comment "
-        "('<!-- ... -->' on a line of its own)."
-    )
-
-
 def _reject_raw_html(context: str) -> None:
     raise UnsupportedConstructError(
         f"Unsupported construct on {context}: raw HTML tags are not supported. "
@@ -216,7 +201,9 @@ def parse_inline(
     keep their styling), and constructs outside the supported set reject
     wherever they sit. ``context`` names the location in error messages;
     ``refs`` resolves reference-style links (deck-wide definitions, collected
-    by the deck parser before slides are parsed)."""
+    by the deck parser before slides are parsed). ``text`` is one line:
+    every caller passes single-line text (paragraphs join with ``' '``
+    before parsing), so the walk needs no line-break handling."""
     if "$$" in text:
         _reject_math(context, "'$$...$$' display math")
     if "<!--" in text:
@@ -232,10 +219,11 @@ def parse_inline(
             "cannot become slide content. Put '<!-- ... -->' on a line of its own to make "
             "it a speaker note, or remove the comment."
         )
-    tokens: list[Token] = []
-    for inline in _MD.parseInline(text):
-        tokens.extend(inline.children or [])
-    _scan_rejections(tokens, context, refs)
+    tokens = [tok for it in _MD.parseInline(text) for tok in it.children or []]
+    # phase one: the flat rejection scan over the joined substrate,
+    # leftmost-first — code-span contents and autolink URLs stay shielded
+    for match in _REJECT_SCAN_RE.finditer(_build_substrate(tokens)):
+        _reject_match(match, context, refs)
     runs: list[Run] = []
     _runs_from_children(tokens, context, refs, runs)
     return tuple(runs)
@@ -244,57 +232,42 @@ def parse_inline(
 # --- phase one: the flat rejection scan over the token substrate ---------------
 
 
-def _scan_rejections(
-    tokens: list[Token], context: str, refs: dict[str, str] | None
-) -> None:
-    """Reject unsupported constructs wherever they sit. The scan runs over
-    the joined substrate (see :func:`_build_substrate`) with leftmost-first
-    semantics, so constructs inside emphasis and inside link labels reject
-    exactly like top-level ones, while code-span contents and autolink URLs
-    stay shielded."""
-    for match in _REJECT_SCAN_RE.finditer(_build_substrate(tokens)):
-        _reject_match(match, context, refs)
-
-
 def _reject_match(
     match: re.Match[str], context: str, refs: dict[str, str] | None
 ) -> None:
     """Act on one phase-one match: image/link/autolink/ref handlers validate
-    (and claim) the span, math rejects, the literal constructs reject."""
+    (and claim) the span — residual syntax markdown-it refused rejects with
+    the same bytes the token route would — math rejects (it is outside the
+    construct set, so it always raises), and the literal constructs —
+    strikethrough, footnotes, raw HTML — reject with the actionable fix."""
     if match.group("image_url") is not None:
         reject_image(match.group("image_url"), context)
-        return
-    if match.group("autolink") is not None:
-        # residual autolink syntax markdown-it refused (control characters
-        # in the URL): validating here raises the same message the token
-        # route would, byte for byte.
+    elif match.group("autolink") is not None:
+        # control characters in the URL made markdown-it refuse the
+        # autolink; validating here raises the token route's message
         validate_link_url(match.group("autolink"), context)
-        return
-    if match.group("link_url") is not None:
-        # residual bracket-link syntax markdown-it refused (control chars or
-        # spaces in the bare destination): same bytes as the token route.
+    elif match.group("link_url") is not None:
+        # control chars or spaces in the bare destination made markdown-it
+        # refuse the bracket link; same bytes as the token route
         validate_link_url(match.group("link_url"), context)
-        return
-    if match.group("ref_label") is not None:
+    elif match.group("ref_label") is not None:
         # resolve-or-reject NOW: claiming the span keeps '$x$' inside a ref
         # label shielded from the math alternative (leftmost-first order).
         _resolve_ref(match.group("ref_label"), match.group("ref_id"), context, refs)
-        return
-    if match.group("math") is not None:
-        # _reject_math always raises (math is outside the construct set)
+    elif match.group("math") is not None:
         _reject_math(context, f"'${match.group('math')}$'")
-    _reject_literal_construct(match, context)
-
-
-def _reject_literal_construct(match: re.Match[str], context: str) -> None:
-    """Reject the literal-syntax constructs — strikethrough, footnotes, raw
-    HTML — each with the actionable fix. Returns for spans that are none of
-    the three (every other alternative has its own handler above)."""
-    if match.group("strike") is not None:
-        _reject_strikethrough(context)
-    if match.group("footnote") is not None:
-        _reject_footnote(context)
-    if match.group("html") is not None:
+    elif match.group("strike") is not None:
+        raise UnsupportedConstructError(
+            f"Unsupported construct on {context}: strikethrough (~~...~~) is not supported. "
+            "Use plain or bold text instead."
+        )
+    elif match.group("footnote") is not None:
+        raise UnsupportedConstructError(
+            f"Unsupported construct on {context}: footnotes ('[^...]') are not supported. "
+            "Fold the note into the slide text or into a speaker-note comment "
+            "('<!-- ... -->' on a line of its own)."
+        )
+    elif match.group("html") is not None:
         _reject_raw_html(context)
 
 
@@ -334,7 +307,7 @@ def _build_substrate(tokens: list[Token]) -> str:
             parts.append(_raw_image(tok))
         elif tok.type == "link_open" and tok.markup == "autolink":
             close = _find_close(tokens, i + 1, "link_close", "autolink")
-            i = close if close != -1 else i  # URL text stays shielded
+            i = close  # the URL text stays shielded
         # strong_open/em_open/bracket link_open/close tokens add nothing:
         # their interior tokens are siblings and are visited in this loop
         i += 1
@@ -356,7 +329,7 @@ def _raw_text(children: list[Token] | None) -> str:
         elif tok.type == "link_open" and tok.markup == "autolink":
             parts.append(f"<{tok.attrGet('href')}>")  # the URL, not its label token
             close = _find_close(tokens, i + 1, "link_close", "autolink")
-            i = close if close != -1 else i
+            i = close
         elif tok.type in ("text", "text_special", "html_inline"):
             parts.append(tok.content)
         elif tok.type == "code_inline":
@@ -402,7 +375,9 @@ def _runs_from_children(
 ) -> None:
     """Walk an inline token stream into runs, carrying the inherited
     emphasis/link flags — the nesting fix: '**[label](url)**' renders as one
-    bold, hyperlinked run instead of literal markup."""
+    bold, hyperlinked run instead of literal markup. The stream is
+    markdown-it's output for one line, so it holds no line breaks; close
+    tokens always pair with their openers (see :func:`_find_close`)."""
     i = 0
     while i < len(children):
         tok = children[i]
@@ -430,12 +405,6 @@ def _runs_from_children(
             i += 1
         elif tok.type == "html_inline":
             _reject_raw_html(context)
-            i += 1
-        elif tok.type in ("softbreak", "hardbreak"):
-            # unreachable today: every parse_inline caller passes single-line
-            # text (paragraphs join with ' ' before parsing). Defensive, so a
-            # future multi-line caller cannot silently glue words together.
-            runs.append(Run(" ", bold=bold, italic=italic, link=link))
             i += 1
         else:  # link_close / strong_close / em_close carry no content
             i += 1
@@ -485,17 +454,17 @@ def _emphasis_runs(
     here with the span rebuilt raw — inside **bold** too, per the nesting
     contract."""
     tok = children[open_idx]
-    close_idx = _find_close(children, open_idx + 1, _close_type(tok.type), tok.markup)
-    end = len(children) if close_idx == -1 else close_idx
+    close_type = f"{tok.type.removesuffix('_open')}_close"
+    close_idx = _find_close(children, open_idx + 1, close_type, tok.markup)
     if tok.markup in ("_", "__"):
-        span = f"{tok.markup}{_raw_text(children[open_idx + 1 : end])}{tok.markup}"
+        span = (
+            f"{tok.markup}{_raw_text(children[open_idx + 1 : close_idx])}{tok.markup}"
+        )
         raise UnsupportedConstructError(
             f"Unsupported construct on {context}: underscore emphasis "
             f"({span!r}) is not supported. Use *italic* or "
             "**bold** instead."
         )
-    if close_idx == -1:
-        return open_idx + 1  # orphaned opener (crossed delimiters): literal
     _runs_from_children(
         children[open_idx + 1 : close_idx],
         context,
@@ -526,18 +495,17 @@ def _link_runs(
     tok = children[open_idx]
     href = str(tok.attrGet("href") or "")
     close_idx = _find_close(children, open_idx + 1, "link_close", tok.markup)
-    end = len(children) if close_idx == -1 else close_idx
     if tok.markup == "autolink":
         if urlsplit(href).scheme.lower() not in ALLOWED_LINK_SCHEMES:
             _reject_raw_html(context)
         url = validate_link_url(href, context)
         runs.append(Run(url, bold=bold, italic=italic, link=url))  # label = the URL
-        return end + 1
+        return close_idx + 1
     title = tok.attrGet("title")
     raw_url = href if title is None else f'{href} "{title}"'
     url = validate_link_url(raw_url, context)
     _runs_from_children(
-        children[open_idx + 1 : end],
+        children[open_idx + 1 : close_idx],
         context,
         refs,
         runs,
@@ -545,25 +513,19 @@ def _link_runs(
         italic=italic,
         link=url,
     )
-    return end + 1
+    return close_idx + 1
 
 
 def _find_close(children: list[Token], lo: int, close_type: str, markup: str) -> int:
     """Index of the first close token of ``close_type`` carrying the same
-    delimiter ``markup`` at/after ``lo``, or -1. The markup check matters:
-    an outer '_.._' span containing '*..*' holds two em_close tokens, and
-    only the '_' one closes the opener (CommonMark never pairs '_' with '*')."""
+    delimiter ``markup`` at/after ``lo``, or ``len(children)`` when none
+    sits there — markdown-it's inline rules only emit openers that pair, so
+    the miss value is a structural bound that safely ends the caller's
+    walk, not an expected case. The markup check matters: an outer '_.._'
+    span containing '*..*' holds two em_close tokens, and only the '_' one
+    closes the opener (CommonMark never pairs '_' with '*')."""
     for idx in range(lo, len(children)):
         tok = children[idx]
         if tok.type == close_type and tok.markup == markup:
             return idx
-    return -1
-
-
-def _close_type(open_type: str) -> str:
-    """strong_open -> strong_close, em_open -> em_close."""
-    return f"{open_type.removesuffix('_open')}_close"
-
-
-def plain_text(runs: tuple[Run, ...]) -> str:
-    return "".join(run.text for run in runs)
+    return len(children)

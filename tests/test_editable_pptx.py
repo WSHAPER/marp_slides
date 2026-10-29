@@ -111,11 +111,21 @@ print("hi")
 """
 
 
+_DECK_BYTES: dict[str, bytes] = {}
+
+
 def build(markdown: str) -> Presentation:
-    validated = validate_deck(markdown)
-    data = build_pptx(validated.deck, "Test Deck")
-    assert data[:2] == b"PK"  # valid Office Open XML zip container
-    return Presentation(io.BytesIO(data))
+    """Build a deck's PPTX bytes once per DISTINCT markdown (module-level
+    cache of immutable bytes): deck constants built by many tests pay
+    validate+build_pptx once instead of per test, while every test still
+    reopens its OWN Presentation from the shared bytes, so no state can
+    leak between tests."""
+    if markdown not in _DECK_BYTES:
+        validated = validate_deck(markdown)
+        data = build_pptx(validated.deck, "Test Deck")
+        assert data[:2] == b"PK"  # valid Office Open XML zip container
+        _DECK_BYTES[markdown] = data
+    return Presentation(io.BytesIO(_DECK_BYTES[markdown]))
 
 
 def test_supported_construct_constant_shape() -> None:
