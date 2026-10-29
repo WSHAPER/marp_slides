@@ -1,9 +1,17 @@
 """Deck-level parsing: Markdown text to a ParsedDeck.
 
-Splits the document into slide bodies (fence- and setext-aware), collects
-the deck-wide reference-style link definitions, absorbs a directives-only
-preamble into deck chrome, and delegates each slide body to the slide
-parser.
+The deck split and the deck-wide reference-link collection are line-grammar
+by contract: a plain cursor walks the lines and the line rules alone decide.
+markdown-it's block model is falsified as the deck-split contract — its hr
+markup cannot distinguish '---' from '- - -', it emits an hr for every '---'
+directly after a non-blank block (a speaker-note comment, a heading, a
+quote, a list) where the deck grammar must keep the shape in one body (the
+note-comment pins at tests/test_editable_pptx.py:1946/:1954), and its fence
+model misses the splitter's any-length closers while opening fences the
+splitter does not. The machinery win that remains: the old in_fence trackers
+are gone, replaced by the bounded pure span reader :func:`_fence_span_end`.
+A directives-only preamble is absorbed into deck chrome, and each body is
+delegated to the slide parser.
 """
 
 from __future__ import annotations
@@ -20,35 +28,57 @@ def split_slides(markdown: str) -> list[str]:
     """Split into slide bodies (frontmatter removed). A '---' line counts as a
     separator only outside fenced code blocks and only when it follows a blank
     line (markdown-it treats '---' directly after text as a setext heading,
-    which the parser then rejects as an unsupported construct)."""
+    which the parser then rejects as an unsupported construct). The split is
+    line-grammar, not a token walk: an hr token cannot be the separator
+    signal because markdown-it also emits one for every '---' directly after
+    a comment, heading, quote or list, which ``prev_blank`` must keep in one
+    body (the slide walk then rejects the stray '---') — deleting that guard
+    is exactly the note-comment-then-separator regression pinned at
+    tests/test_editable_pptx.py:1946/:1954."""
     lines = markdown.splitlines()
-    start = _skip_frontmatter(lines)
-    slides: list[list[str]] = [[]]
-    in_fence = False
-    fence_char = "`"
+    deck = lines[_skip_frontmatter(lines) :]
+    chunks: list[list[str]] = [[]]
     prev_blank = True
-    for line in lines[start:]:
-        stripped = line.strip()
-        if in_fence:
-            slides[-1].append(line)
-            if stripped and stripped == fence_char * len(stripped):
-                in_fence = False
-                prev_blank = True
-            continue
-        fence = FENCE_OPEN_RE.match(line)
+    cursor = 0
+    while cursor < len(deck):
+        fence = FENCE_OPEN_RE.match(deck[cursor])
         if fence:
-            slides[-1].append(line)
-            in_fence = True
-            fence_char = fence.group(1)[0]
-            prev_blank = False
-            continue
-        if stripped == "---" and prev_blank:
-            slides.append([])
+            # the opener test and the closer rule are the splitter's own:
+            # markdown-it opens fences the splitter does not (a backtick in
+            # the info string, an indented opener) and its closers must be
+            # at least the opener's length, where the splitter accepts any
+            # nonempty run of the fence char
+            stop = _fence_span_end(deck, cursor, fence.group(1)[0])
+            chunks[-1].extend(deck[cursor:stop])
             prev_blank = True
+            cursor = stop
             continue
-        slides[-1].append(line)
-        prev_blank = not stripped
-    return ["\n".join(chunk).strip("\n") for chunk in slides]
+        stripped = deck[cursor].strip()
+        if stripped == "---" and prev_blank:
+            chunks.append([])
+            prev_blank = True
+        else:
+            chunks[-1].append(deck[cursor])
+            prev_blank = not stripped
+        cursor += 1
+    return ["\n".join(chunk).strip("\n") for chunk in chunks]
+
+
+def _fence_span_end(lines: list[str], opener: int, fence_char: str) -> int:
+    """One past the closing fence line per the deck splitter's rule (the same
+    predicate as :func:`marp_slides.slides._collect_fence_body`): the first
+    line after ``opener`` whose stripped text is a nonempty run of
+    ``fence_char`` — any length, any indent. Unclosed fences run to the end of
+    ``lines``. Do not merge with the slide consumer: it must raise on an
+    unclosed fence (a pinned rejection), the deck splitter swallows the
+    tail."""
+    i = opener + 1
+    while i < len(lines):
+        stripped = lines[i].strip()
+        if stripped and stripped == fence_char * len(stripped):
+            return i + 1
+        i += 1
+    return len(lines)
 
 
 def _skip_frontmatter(lines: list[str]) -> int:
@@ -68,23 +98,23 @@ def collect_link_refs(bodies: list[str]) -> dict[str, str]:
     ('[ref]: https://example.com' on their own lines). Ids fold to lowercase;
     the FIRST definition of an id wins (CommonMark semantics); URLs are
     validated with the same http(s) allow-list as inline links. Definition
-    lines are never rendered (the slide parser skips them)."""
+    lines are never rendered (the slide parser skips them). The scan runs the
+    same line grammar as :func:`split_slides`: every line outside a splitter
+    fence runs the collector, because fences markdown-it would open (indented
+    openers, spans past a short closer) must not hide definitions."""
     refs: dict[str, str] = {}
     for body in bodies:
-        in_fence = False
-        fence_char = "`"
-        for line in body.splitlines():
-            stripped = line.strip()
-            if in_fence:
-                if stripped and stripped == fence_char * len(stripped):
-                    in_fence = False
-                continue
-            fence = FENCE_OPEN_RE.match(line)
+        lines = body.splitlines()
+        cursor = 0
+        while cursor < len(lines):
+            fence = FENCE_OPEN_RE.match(lines[cursor])
             if fence:
-                in_fence = True
-                fence_char = fence.group(1)[0]
+                # the opener and every line up to the closer is never
+                # scanned for definitions
+                cursor = _fence_span_end(lines, cursor, fence.group(1)[0])
                 continue
-            _collect_link_def_line(line, refs)
+            _collect_link_def_line(lines[cursor], refs)
+            cursor += 1
     return refs
 
 

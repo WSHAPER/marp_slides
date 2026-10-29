@@ -1,18 +1,26 @@
-"""Slide-body parsing: Markdown lines to blocks on one slide.
+"""Slide-body parsing: a markdown-it block-token walk over the slide lines.
 
-The main loop dispatches each line to a small per-construct handler, so each
-rule reads top to bottom: headings, code fences, quotes,
-tables, images, lists (with the CommonMark marker-kind split), paragraphs,
-and the comment directives (notes, footer/header overrides, backgrounds,
-columns). Every construct outside the allow-list rejects with an actionable
-message at the exact line that broke the contract. The block-level handlers
-for lists, tables, images, quotes and paragraphs live in
-:mod:`marp_slides.slide_blocks`.
+The shared ``MarkdownIt`` instance (owned by :mod:`marp_slides.inline`)
+tokenizes the whole body, and the walk dispatches each top-level block token
+whose first source line is next: headings, code fences, comments, quotes and
+lists are mdit-modeled shapes routed straight to today's construct handlers.
+markdown-it cannot see tables, image lines and link-reference definitions
+(no plugins are allowed), and its block model folds or drops other lines, so
+the per-line dispatcher survives as a bounded fallback: it runs inside
+regions a token folded together and on token-less gaps, which keeps every
+construct boundary and rejection message byte-identical with the line loop
+this replaces. Every construct outside the allow-list rejects with an
+actionable message at the exact line that broke the contract. The handlers
+read the SOURCE lines for extents and message text — token content is never
+trusted. The block-level handlers for lists, tables, images, quotes and
+paragraphs live in :mod:`marp_slides.slide_blocks`.
 """
 
 from __future__ import annotations
 
 import re
+
+from markdown_it.token import Token
 
 from .blocks import (
     BackgroundImageSpec,
@@ -40,6 +48,7 @@ from .geometry import (
     code_wrapped_lines,
 )
 from .inline import (
+    _MD,
     LINK_DEF_PREFIX_RE,
     LINK_DEF_RE,
     parse_inline,
@@ -61,9 +70,28 @@ from .slide_blocks import (
     consume_table,
 )
 
+#: The top-level block tokens the walk dispatches on: markdown-it's
+#: "commonmark" preset emits exactly these nine for the supported construct
+#: battery. Nested tokens (level >= 1) are covered by their level-0
+#: container token; stream tokens without a source extent are dropped.
+_BLOCK_TOKEN_TYPES = frozenset(
+    {
+        "blockquote_open",
+        "bullet_list_open",
+        "code_block",
+        "fence",
+        "heading_open",
+        "hr",
+        "html_block",
+        "ordered_list_open",
+        "paragraph_open",
+    }
+)
+
 
 class SlideState:
-    """Mutable per-slide parsing state, shared by the line handlers."""
+    """Mutable per-slide parsing state, shared by the token handlers and the
+    line fallback."""
 
     def __init__(
         self,
@@ -95,21 +123,135 @@ def parse_slide(
 ) -> ParsedSlide:
     """Parse one slide body (no frontmatter, no separators) into a
     ParsedSlide, raising UnsupportedConstructError for anything outside the
-    allow-list."""
+    allow-list.
+
+    A markdown-it block-token walk drives the iteration: the top-level token
+    whose first source line sits at the cursor dispatches to its construct
+    handler, and every line no token starts — regions markdown-it folded
+    into one token (tables, image lines, lazy continuations, definitions) or
+    dropped — runs the line dispatcher, the bounded fallback. Handlers see
+    the full line list and an absolute start index, so each consumes exactly
+    the lines today's line loop consumed and every rejection message stays
+    byte-identical."""
     state = SlideState(number, deck_directives, link_refs)
     lines = body.splitlines()
-    i = 0
-    while i < len(lines):
-        line = lines[i]
-        stripped = line.strip()
-        i = _consume_line(state, lines, i, line, stripped)
+    tokens = _block_tokens(body)
+    cursor = 0
+    ti = 0
+    while cursor < len(lines):
+        while ti < len(tokens) and _begin(tokens[ti]) < cursor:
+            ti += 1  # the token's start line was consumed by an earlier handler
+        if ti < len(tokens) and _begin(tokens[ti]) == cursor:
+            cursor = _consume_token(state, lines, tokens[ti])
+            ti += 1
+        else:  # a gap: a line markdown-it folded away or dropped
+            line = lines[cursor]
+            cursor = _consume_line(state, lines, cursor, line, line.strip())
     return _finish_slide(state)
+
+
+def _block_tokens(body: str) -> list[Token]:
+    """The body's top-level block tokens that carry a source extent:
+    level-0 openers of the constructs the walk knows (nesting interiors are
+    covered by their level-0 container token), each with a two-entry
+    ``map`` — a ``[begin, end)`` line range over ``body.splitlines()``. The
+    walk consumes only ``begin``: the construct's real extent stays defined
+    by the line consumers, whose boundaries markdown-it does not always
+    share (a short fence closer, for one)."""
+    return [
+        tok
+        for tok in _MD.parse(body)
+        if tok.level == 0
+        and tok.type in _BLOCK_TOKEN_TYPES
+        and tok.map is not None
+        and len(tok.map) == 2  # noqa: PLR2004 - a mapped block extent is [begin, end)
+    ]
+
+
+def _begin(tok: Token) -> int:
+    """The token's first source line. ``Token.map`` is ``list[int] | None``
+    in markdown-it's types; the :func:`_block_tokens` filter keeps it a
+    two-entry list, and the fallback only guards the type narrowing."""
+    return tok.map[0] if tok.map else 0
+
+
+def _consume_token(state: SlideState, lines: list[str], tok: Token) -> int:
+    """Dispatch one top-level block token to its construct handler; returns
+    the next line index. Each mdit-modeled shape routes to today's handler
+    under the guard that keeps markdown-it's laxer block rules (up-to-
+    three-space indents, setext underlines, bare '#' lines) on today's
+    semantics; guard misses and tokens the guards do not cover (paragraph,
+    indented code, thematic break) run the line dispatcher instead, which
+    reproduces today's outcome exactly."""
+    begin = _begin(tok)
+    line = lines[begin]
+    stripped = line.strip()
+    if tok.type == "heading_open":
+        return _heading_token(state, lines, tok, begin, line, stripped)
+    if tok.type == "fence":
+        return _fence_token(state, lines, begin, line)
+    if tok.type == "html_block" and stripped.startswith("<!--"):
+        return _consume_comment_block(state, lines, begin)
+    if tok.type == "blockquote_open" and QUOTE_RE.match(stripped):
+        return consume_quote(state, lines, begin)
+    if tok.type in ("bullet_list_open", "ordered_list_open") and (
+        BULLET_RE.match(line) or ORDERED_RE.match(line)
+    ):
+        return consume_list(state, lines, begin)
+    return _consume_line(state, lines, begin, line, stripped)
+
+
+def _heading_token(
+    state: SlideState,
+    lines: list[str],
+    tok: Token,
+    begin: int,
+    line: str,
+    stripped: str,
+) -> int:
+    """A heading token. Setext underlines (markup '-'/'=', a shape today's
+    grammar has no rule for) fall to the line dispatcher, whose paragraph
+    join and stray-'---' rejection stay authoritative; atx hashes route to
+    the heading handler only when today's HEADING_RE agrees — markdown-it
+    also makes heading tokens out of bare '#'/'##' lines, which today are
+    paragraph text ('## ##' keeps its empty-title rejection inside the
+    handler)."""
+    if tok.markup in ("-", "="):
+        return _consume_line(state, lines, begin, line, stripped)
+    heading = HEADING_RE.match(stripped)
+    if heading is not None:
+        return _consume_heading(state, heading, begin)
+    return _consume_line(state, lines, begin, line, stripped)
+
+
+def _fence_token(state: SlideState, lines: list[str], begin: int, line: str) -> int:
+    """A fence token under the column-0 guard of today's FENCE_OPEN_RE:
+    markdown-it tolerates up to three leading spaces, and those openers must
+    keep today's 'no leading spaces' rejection — routing them through the
+    line dispatcher leaves _skip_or_reject_line the single raise site. The
+    consumer then reads the fence body from the source lines, so short
+    closers, indented fence lines inside the body and unclosed fences all
+    keep today's exact boundaries."""
+    fence = FENCE_OPEN_RE.match(line)
+    if fence is not None:
+        return _consume_fence(state, lines, begin, fence)
+    return _consume_line(state, lines, begin, line, line.strip())
 
 
 def _consume_line(
     state: SlideState, lines: list[str], i: int, line: str, stripped: str
 ) -> int:
-    """Dispatch one line to its construct handler; returns the next index."""
+    """The bounded line fallback: dispatch one line to its construct
+    handler; returns the next index.
+
+    The token walk calls this wherever markdown-it cannot see today's
+    construct (tables, image lines and link definitions live inside
+    paragraph tokens), wherever its block model diverges (setext underlines,
+    indented code, bare '#' lines, thematic breaks, non-'1.' ordered
+    openers), and on lines no token starts (blank and definition-only
+    lines). Each guard in the token dispatch routes back here instead of
+    duplicating a rule, so this function keeps every line-level boundary and
+    rejection message of the line loop that used to drive the parse."""
     skipped = _skip_or_reject_line(state, i, line, stripped)
     if skipped is not None:
         return skipped
