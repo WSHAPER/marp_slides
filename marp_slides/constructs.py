@@ -54,7 +54,9 @@ SUPPORTED_CONSTRUCTS: tuple[tuple[str, str], ...] = (
         (
             "inline links: [label](url), autolinks <https://example.com> and "
             "reference-style [label][ref] with '[ref]: https://example.com' definition "
-            "lines, with full http:// or https:// URLs, rendered as native hyperlinked text"
+            "lines, with full http:// or https:// URLs, rendered as native hyperlinked "
+            "text; links nest inside **bold** and *italic* emphasis (and labels may "
+            "carry emphasis): the text stays clickable with the styling preserved"
         ),
     ),
     (

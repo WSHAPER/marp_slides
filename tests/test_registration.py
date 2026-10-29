@@ -22,16 +22,12 @@ def test_task_type_shape() -> None:
     assert tt.input_shape[0].description == (
         "What the presentation should be about and any requirements for it."
     )
-    # the required outputs are the primary deck file plus the list of every
-    # generated format; slide_deck_source is an OPTIONAL output declared on
-    # the provider (merged into the task type by the server from the
-    # provider registration)
-    assert [s.name for s in tt.output_shape] == ["slide_deck", "slide_decks"]
-    assert tt.output_shape[0].shape_type == ShapeType.FILE
-    assert tt.output_shape[1].shape_type == ShapeType.LIST_OF_FILES
-    assert "PPTX" in tt.output_shape[0].description
-    assert "HTML" in tt.output_shape[0].description
-    assert "PDF" in tt.output_shape[0].description
+    # the required output is the list of every generated format (the ONE
+    # deliverable line the Assistant panel renders); slide_deck_source is
+    # an OPTIONAL output declared on the provider (merged into the task
+    # type by the server from the provider registration)
+    assert [s.name for s in tt.output_shape] == ["slide_decks"]
+    assert tt.output_shape[0].shape_type == ShapeType.LIST_OF_FILES
 
 
 def test_provider_shape() -> None:

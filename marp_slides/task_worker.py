@@ -807,9 +807,8 @@ def _report_deck_result(
     """The delivery tail SHARED by both task types: retain the validated
     Marp Markdown source next to the deliverables and report the result.
     ``deck_files`` is every generated format in generation order
-    ``[(filename, file_id), ...]``; the first entry is the primary deck
-    (``slide_deck``, kept for single-file consumers) and the whole list
-    fills the ``slide_decks`` output slot so EVERY selected format is a
+    ``[(filename, file_id), ...]``; the whole list fills the single
+    required ``slide_decks`` output slot so EVERY selected format is a
     visible, downloadable, saveable output. MUST run after EVERY render
     and upload of the task: a render phase may ping progress, and the
     100% progress ping must PRECEDE report_result with no further pings
@@ -821,7 +820,7 @@ def _report_deck_result(
     SUCCESSFUL; then task 737, status=2/progress=0.92 with all four
     files uploaded, after the 'all formats' loop rendered html/pdf past
     the pptx report)."""
-    primary_filename, primary_file_id = deck_files[0]
+    primary_filename = deck_files[0][0]
     # source retention: the validated Marp Markdown IS the deck source of
     # truth: a later turn can make small edits and feed it to the
     # re-render task instead of a full recompute
@@ -837,7 +836,6 @@ def _report_deck_result(
     nc.providers.task_processing.report_result(
         task_id,
         {
-            "slide_deck": primary_file_id,
             "slide_decks": [file_id for _, file_id in deck_files],
             "slide_deck_source": source_id,
         },

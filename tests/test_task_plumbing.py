@@ -216,7 +216,7 @@ def deck_scheduler(slides: list[str] | None = None, outline_json: str = OUTLINE_
     return make_llm(stream)
 
 
-SUCCESS_OUTPUT = {"slide_deck": 42, "slide_decks": [42], "slide_deck_source": 43}
+SUCCESS_OUTPUT = {"slide_decks": [42], "slide_deck_source": 43}
 
 
 def test_success_reports_slide_deck_and_source(monkeypatch, settings) -> None:
@@ -245,9 +245,9 @@ def test_success_reports_slide_deck_and_source(monkeypatch, settings) -> None:
 
 def test_all_formats_reports_every_deck_file(monkeypatch, settings) -> None:
     """output_format 'all': the three renders upload in generation order,
-    every file id lands in the slide_decks output slot (so each format is
-    a visible, saveable output), the PPTX stays the primary slide_deck,
-    and the result is reported ONCE, after every render."""
+    every file id lands in the single slide_decks output slot (so each
+    format is a visible, saveable output), and the result is reported
+    ONCE, after every render."""
     fake, _calls = deck_scheduler()
     monkeypatch.setattr(task_worker, "schedule_and_wait", fake)
     monkeypatch.setattr(task_worker, "render_deck_html", lambda *a, **k: b"<html>x")
@@ -264,9 +264,9 @@ def test_all_formats_reports_every_deck_file(monkeypatch, settings) -> None:
     )
     (result,) = api.results
     if result["output"] is not None:
-        assert result["output"]["slide_deck"] == 42  # the PPTX is primary
         assert result["output"]["slide_decks"] == [42, 43, 44]  # pptx, html, pdf
         assert result["output"]["slide_deck_source"] == 45
+        assert "slide_deck" not in result["output"]  # the single slot only
     assert [(t, f[0]) for t, f in api.uploads] == [
         (5, "Quarterly-Review.pptx"),
         (5, "Quarterly-Review.html"),
@@ -1135,7 +1135,7 @@ def test_html_task_with_images_passes_blobs_to_render(monkeypatch, settings) -> 
         settings,
     )
     (result,) = api.results
-    assert result["output"]["slide_deck"] == 42
+    assert result["output"]["slide_decks"] == [42]
     assert seen["blobs"] == {1: blob}
     assert seen["markdown"] == IMG_ASSEMBLED
     assert files.downloaded == [101]
@@ -1172,7 +1172,7 @@ def test_pdf_task_gates_imageless_then_renders_with_blobs(
         settings,
     )
     (result,) = api.results
-    assert result["output"]["slide_deck"] == 42
+    assert result["output"]["slide_decks"] == [42]
     assert calls == ["gate:True", "render:True:True"]  # gate first, blobs, source md
     _, (src_name, src_bytes, _mime) = api.uploads[1]
     assert src_name == "Img-Deck.md"
@@ -1536,7 +1536,7 @@ def test_progress_reports_fetch_images_between_slides_and_done(
         settings,
     )
     (result,) = api.results
-    assert result["output"]["slide_deck"] == 42
+    assert result["output"]["slide_decks"] == [42]
     assert api.progress[0] == pytest.approx(5.0)
     assert api.progress[-1] == pytest.approx(100.0)
 
@@ -1559,7 +1559,7 @@ def test_image_reference_out_of_bounds_is_retried_then_corrects(
     assert len(calls) == 4  # outline + slide 1 + slide 2 twice
     assert "#file:2" in calls[3]["input"]  # corrective feedback names the ref
     (result,) = api.results
-    assert result["output"]["slide_deck"] == 42  # corrected slide shipped
+    assert result["output"]["slide_decks"] == [42]  # corrected slide shipped
 
 
 def test_image_reference_without_images_input_fails_actionably(

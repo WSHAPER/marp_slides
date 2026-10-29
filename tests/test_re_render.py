@@ -79,9 +79,8 @@ def test_re_render_task_type_shape() -> None:
     assert [s.name for s in tt.input_shape] == ["markdown"]
     assert tt.input_shape[0].shape_type == ShapeType.TEXT
     assert "frontmatter" in tt.input_shape[0].description
-    assert [s.name for s in tt.output_shape] == ["slide_deck", "slide_decks"]
-    assert tt.output_shape[0].shape_type == ShapeType.FILE
-    assert tt.output_shape[1].shape_type == ShapeType.LIST_OF_FILES
+    assert [s.name for s in tt.output_shape] == ["slide_decks"]
+    assert tt.output_shape[0].shape_type == ShapeType.LIST_OF_FILES
 
 
 def test_re_render_provider_shape() -> None:
@@ -220,7 +219,6 @@ def test_theme_input_is_not_enforced_on_re_render(settings) -> None:
     )
     (result,) = api.results
     assert result["output"] == {
-        "slide_deck": 42,
         "slide_decks": [42],
         "slide_deck_source": 43,
     }
@@ -235,7 +233,7 @@ def test_pptx_re_render_builds_deck_and_echoes_source(settings) -> None:
     assert api.results == [
         {
             "task_id": 7,
-            "output": {"slide_deck": 42, "slide_decks": [42], "slide_deck_source": 43},
+            "output": {"slide_decks": [42], "slide_deck_source": 43},
             "error_message": None,
             "user_facing_error_message": None,
         }
@@ -262,7 +260,7 @@ def test_echoed_source_is_the_stripped_input_verbatim(settings) -> None:
         settings,
     )
     (result,) = api.results
-    assert result["output"]["slide_deck"] == 42
+    assert result["output"]["slide_decks"] == [42]
     assert api.uploads[1][1][1] == VALID_DECK.strip().encode("utf-8")
 
 
@@ -307,7 +305,6 @@ def test_html_re_render_renders_via_marp_only(monkeypatch, settings) -> None:
     )
     (result,) = api.results
     assert result["output"] == {
-        "slide_deck": 42,
         "slide_decks": [42],
         "slide_deck_source": 43,
     }
@@ -342,7 +339,6 @@ def test_pdf_re_render_gates_then_renders(monkeypatch, settings) -> None:
     )
     (result,) = api.results
     assert result["output"] == {
-        "slide_deck": 42,
         "slide_decks": [42],
         "slide_deck_source": 43,
     }
@@ -392,7 +388,7 @@ def test_file_references_resolve_references_to_file_ids(monkeypatch, settings) -
         settings,
     )
     (result,) = api.results
-    assert result["output"]["slide_deck"] == 42
+    assert result["output"]["slide_decks"] == [42]
     assert built["images"] == {1: blob}
     assert files.downloaded == [101]  # only the referenced file was fetched
     _, (src_name, src_bytes, _src_mime) = api.uploads[1]
@@ -415,7 +411,7 @@ def test_images_slot_alias_works_the_same(monkeypatch, settings) -> None:
         settings,
     )
     (result,) = api.results
-    assert result["output"]["slide_deck"] == 42
+    assert result["output"]["slide_decks"] == [42]
     assert files.downloaded == [101]
 
 
@@ -440,7 +436,7 @@ def test_file_references_take_precedence_over_images(monkeypatch, settings) -> N
         settings,
     )
     (result,) = api.results
-    assert result["output"]["slide_deck"] == 42
+    assert result["output"]["slide_decks"] == [42]
     assert files.downloaded == [202]
 
 

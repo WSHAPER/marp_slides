@@ -10,7 +10,7 @@ Rules:
 - Start the slide with exactly one title heading ('#' or '##') followed by its content.
 - Cover exactly what this slide's summary asks for; the other slides cover the rest of the plan, so do not repeat their content.
 - Inside the slide you may use '###' and deeper headings as subheadings to structure its content (never before the slide's title heading).
-- Inline links become clickable hyperlinks; use full http:// or https:// URLs only. Three forms work: [label](https://example.com), the autolink <https://example.com>, and reference-style [label][ref] whose '[ref]: https://example.com' definition lines sit on their own lines inside this slide.
+- Inline links become clickable hyperlinks; use full http:// or https:// URLs only. Three forms work: [label](https://example.com), the autolink <https://example.com>, and reference-style [label][ref] whose '[ref]: https://example.com' definition lines sit on their own lines inside this slide. Links may sit inside **bold** or *italic* emphasis (for example **[label](https://example.com)**) and link labels may be emphasized: write them nested, never as literal brackets.
 - Images provided with the task are placed as SLIDE BACKGROUNDS by default, not as inline images. Inline images drift below the text and break the slide layout; a background stays behind or beside the content. The preferred forms, in order:
   1. Split background (image beside content): '![bg right:33%](#file:N)' or '![bg left:33%](#file:N)' — the image takes that fraction of the slide, the text fills the rest. This is the best form for most slides with an image.
   2. Full background (image behind content): '![bg cover](#file:N)' or '![bg contain](#file:N)' — the image fills the whole slide; keep the text sparse so both remain readable.
@@ -22,6 +22,7 @@ Rules:
 - Background images appear in html and pdf output only; the editable PPTX build cannot show them, so keep them decorative. Per slide: '![bg](#file:N)' on a line of its own, optionally with a size keyword, e.g. '![bg cover](#file:N)' (contain, fit and auto also work, plus a scale like '150%'), a direction keyword — '![bg left](#file:N)' or '![bg right](#file:N)' for a half-slide split, sized as '![bg left:33%](#file:N)', or 'bg vertical' — or a w:/h: length, combined as in '![bg left w:50%](#file:N)'. N is the 1-based position in the task's images list, at most one background image per slide.
 - Two-column slide: put '<!-- columns: 2 -->' on the first line of the slide's content (right after its title) and '<!-- column-break -->' on its own line where the right column should start. Tables are not allowed on column slides; use them on a full-width slide instead.
 - Keep code blocks within the slide: at most about 30 lines, lines at most about 110 characters (longer code is rejected with an error; shorten it).
+- Keep the whole slide within its box: roughly 6 to 9 bullets, or a dozen short lines, plus the title. Content that measurably overflows the theme's slide box is rejected with an error naming how much to cut; when in doubt, put less on the slide and split the rest onto the next one.
 - Write the slide in the same language as the deck plan below.
 
 Shape of a valid slide (follow this shape exactly: the title heading first, then the content; no frontmatter, no separators):
