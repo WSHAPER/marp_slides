@@ -156,6 +156,7 @@ layers = [
     "marp_slides.constructs",
     "marp_slides.geometry",
     "marp_slides.layout",
+    "marp_slides.draft_store",
     "marp_slides.settings",
 ]
 
