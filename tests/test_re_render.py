@@ -79,8 +79,9 @@ def test_re_render_task_type_shape() -> None:
     assert [s.name for s in tt.input_shape] == ["markdown"]
     assert tt.input_shape[0].shape_type == ShapeType.TEXT
     assert "frontmatter" in tt.input_shape[0].description
-    assert [s.name for s in tt.output_shape] == ["slide_deck"]
+    assert [s.name for s in tt.output_shape] == ["slide_deck", "slide_decks"]
     assert tt.output_shape[0].shape_type == ShapeType.FILE
+    assert tt.output_shape[1].shape_type == ShapeType.LIST_OF_FILES
 
 
 def test_re_render_provider_shape() -> None:
@@ -101,6 +102,7 @@ def test_re_render_provider_shape() -> None:
         "pptx",
         "html",
         "pdf",
+        "all",
     ]
     assert provider.optional_input_shape_defaults == {"output_format": "pptx"}
     assert [s.name for s in provider.optional_output_shape] == ["slide_deck_source"]
@@ -217,7 +219,11 @@ def test_theme_input_is_not_enforced_on_re_render(settings) -> None:
         settings,
     )
     (result,) = api.results
-    assert result["output"] == {"slide_deck": 42, "slide_deck_source": 43}
+    assert result["output"] == {
+        "slide_deck": 42,
+        "slide_decks": [42],
+        "slide_deck_source": 43,
+    }
 
 
 # --- rendering for each format, no LLM --------------------------------------
@@ -229,7 +235,7 @@ def test_pptx_re_render_builds_deck_and_echoes_source(settings) -> None:
     assert api.results == [
         {
             "task_id": 7,
-            "output": {"slide_deck": 42, "slide_deck_source": 43},
+            "output": {"slide_deck": 42, "slide_decks": [42], "slide_deck_source": 43},
             "error_message": None,
             "user_facing_error_message": None,
         }
@@ -300,7 +306,11 @@ def test_html_re_render_renders_via_marp_only(monkeypatch, settings) -> None:
         settings,
     )
     (result,) = api.results
-    assert result["output"] == {"slide_deck": 42, "slide_deck_source": 43}
+    assert result["output"] == {
+        "slide_deck": 42,
+        "slide_decks": [42],
+        "slide_deck_source": 43,
+    }
     assert calls == ["render"]
     _task_id, (filename, payload, mime) = api.uploads[0]
     assert filename == "Quarterly-Review.html"
@@ -331,7 +341,11 @@ def test_pdf_re_render_gates_then_renders(monkeypatch, settings) -> None:
         settings,
     )
     (result,) = api.results
-    assert result["output"] == {"slide_deck": 42, "slide_deck_source": 43}
+    assert result["output"] == {
+        "slide_deck": 42,
+        "slide_decks": [42],
+        "slide_deck_source": 43,
+    }
     assert calls == ["gate", "render_pdf"]  # gate first, browser render second
     _task_id, (filename, payload, mime) = api.uploads[0]
     assert filename == "Quarterly-Review.pdf"

@@ -151,8 +151,10 @@ def parse_inline(
         # the inline regex's HTML branch needs '<[a-zA-Z/]', so a comment
         # inside paragraph text would otherwise land VERBATIM on the slide.
         # Comments are speaker notes and live on lines of their own (raw
-        # HTML inside inline code is rejected by the deck pre-scan the same
-        # way, so code spans get no exemption here either).
+        # HTML tags inside inline code are exempt in the deck pre-scan —
+        # code spans are literal text — but HTML comments still get no
+        # exemption here: a comment span mid-paragraph is never intended
+        # content).
         raise UnsupportedConstructError(
             f"Unsupported construct on {context}: an HTML comment inside paragraph text "
             "cannot become slide content. Put '<!-- ... -->' on a line of its own to make "

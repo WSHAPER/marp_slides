@@ -362,10 +362,26 @@ def parse_outline(
             f"Invalid outline: {len(slides_data)} slides were planned (maximum "
             f"is {max_slides}). Plan fewer slides."
         )
+    slides = tuple(_parse_slide(entry, image_count) for entry in slides_data)
+    if image_count > 0:
+        # Image completeness is enforced at deck assembly; catching the
+        # shortfall HERE means the outline retry fixes the plan before
+        # every slide is generated. The slide builder assigns #file:N to
+        # image slides in order, so the plan must mark at least as many
+        # slides "has_image" as there are provided images.
+        marked = sum(1 for slide in slides if slide.has_image)
+        if marked < image_count:
+            raise DeckError(
+                f"Invalid outline: the task provides {image_count} image(s) but "
+                f'only {marked} slide(s) are marked "has_image": true. Every '
+                "provided image must appear in the deck, so mark at least one "
+                'slide "has_image": true per provided image (a dedicated slide '
+                "per image is fine)."
+            )
     return DeckOutline(
         title=_required_text(data, "title"),
         theme=_parse_theme(data),
-        slides=tuple(_parse_slide(entry, image_count) for entry in slides_data),
+        slides=slides,
         paginate=_parse_paginate(data),
         background_color=_parse_background_color(data),
         background_image=_parse_background_image(data, image_count),
@@ -413,10 +429,41 @@ def build_slide_prompt(outline: DeckOutline, number: int, image_count: int = 0) 
     if slide.summary:
         prompt += f"\nSummary of what this slide must cover: {slide.summary}"
     if slide.has_image and image_count > 0:
-        prompt += (
-            f"\nThis slide should show one of the task's {image_count} provided "
-            "image(s): place it with '![alt text](#file:N)' on a line of its own."
+        # Deterministic assignment: the k-th image slide of the plan
+        # carries #file:k, so every provided image lands in the deck
+        # regardless of which file the model would otherwise guess.
+        position = sum(
+            1 for planned in outline.slides[: number - 1] if planned.has_image
         )
+        assigned = position + 1
+        if assigned > image_count:
+            # more image slides than images: reuse in round-robin order
+            assigned = ((assigned - 1) % image_count) + 1
+        summary = slide.summary.lower()
+        if "full background" in summary:
+            directive = f"![bg cover](#file:{assigned})"
+            hint = (
+                f"This slide MUST show provided image #file:{assigned} as its "
+                f"FULL background: write '{directive}' on a line of its own, "
+                "keep the text sparse so image and text both stay readable."
+            )
+        elif "inline" in summary:
+            directive = f"![image](#file:{assigned})"
+            hint = (
+                f"This slide MUST show provided image #file:{assigned} as a "
+                f"small inline illustration: write '{directive}' on a line of "
+                "its own within the content flow."
+            )
+        else:
+            # default placement: split background
+            directive = f"![bg right:33%](#file:{assigned})"
+            hint = (
+                f"This slide MUST show provided image #file:{assigned} as a "
+                f"SPLIT background beside the text: write '{directive}' on a "
+                "line of its own. The image takes a third of the slide and "
+                "the text fills the rest."
+            )
+        prompt += f"\n{hint}"
     return f"{prompt}\n"
 
 

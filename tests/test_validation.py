@@ -310,6 +310,38 @@ def test_any_other_raw_html_rejected_strict_native_only() -> None:
         validate_deck(deck)
 
 
+def test_angle_brackets_in_inline_code_not_raw_html() -> None:
+    """Code spans are literal text: '<project>_default' in backticks is
+    content, not markup (a live Docker Compose deck was rejected here)."""
+    deck = (
+        "---\nmarp: true\n---\n\n# Networks\n\n"
+        "- Compose creates a `<project>_default` network.\n"
+    )
+    validated = validate_deck(deck)
+    (list_block,) = validated.deck.slides[0].blocks
+    runs = list_block.items[0].runs  # type: ignore[attr-defined]
+    assert any(r.code and "<project>" in r.text for r in runs)
+
+
+def test_angle_brackets_in_code_fence_not_raw_html() -> None:
+    deck = (
+        "---\nmarp: true\n---\n\n# Config\n\n"
+        "```yaml\nnetworks:\n  default:\n    name: <project>_default\n```\n"
+    )
+    validate_deck(deck)  # must not raise
+
+
+def test_real_html_tag_still_rejected_next_to_code_span() -> None:
+    """The exemption covers code constructs only: a bare tag in prose still
+    rejects, and the scan survives code spans elsewhere on the line."""
+    deck = (
+        "---\nmarp: true\n---\n\n# Hello\n\n"
+        "Use `<b>` in code, but <b>bold</b> in prose is raw HTML.\n"
+    )
+    with pytest.raises(DeckError, match="raw HTML"):
+        validate_deck(deck)
+
+
 def test_html_comment_notes_are_allowed(valid_deck: str) -> None:
     validated = validate_deck(valid_deck)  # contains a speaker note comment
     assert validated.deck.slides[0].notes

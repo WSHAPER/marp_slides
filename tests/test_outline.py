@@ -69,6 +69,10 @@ def test_parse_outline_full_metadata() -> None:
             backgroundImage="#file:2",
             footer=" Acme   Inc ",
             header="Q3 2026",
+            slides=[
+                {"title": "Opening", "summary": "Welcome.", "has_image": True},
+                {"title": "Results", "summary": "Revenue.", "has_image": True},
+            ],
         ),
         image_count=2,
     )
@@ -141,7 +145,16 @@ def test_parse_outline_rejects_bad_background_color() -> None:
 
 def test_parse_outline_background_image_out_of_bounds() -> None:
     with pytest.raises(DeckError, match="only 2 image"):
-        parse_outline(outline_json(backgroundImage="#file:3"), image_count=2)
+        parse_outline(
+            outline_json(
+                backgroundImage="#file:3",
+                slides=[
+                    {"title": "Opening", "summary": "Welcome.", "has_image": True},
+                    {"title": "Results", "summary": "Revenue.", "has_image": True},
+                ],
+            ),
+            image_count=2,
+        )
 
 
 def test_parse_outline_background_image_without_images() -> None:
@@ -297,9 +310,40 @@ def test_build_slide_prompt_image_instruction_only_when_planned() -> None:
         slides=(SlideOutline("A", "a", True), SlideOutline("B", "b", False)),
     )
     with_image = build_slide_prompt(planned, 1, image_count=2)
-    assert "should show one of the task's 2 provided image(s)" in with_image
+    # the k-th image slide gets a DETERMINISTIC #file:N assignment
+    assert "MUST show provided image #file:1" in with_image
+    assert "![bg right:33%](#file:1)" in with_image
     without = build_slide_prompt(planned, 2, image_count=2)
-    assert "should show one" not in without
+    assert "MUST show provided image" not in without
+
+
+def test_build_slide_prompt_image_assignment_follows_plan_order() -> None:
+    """The 2nd image slide of the plan carries #file:2: no guessing, so
+    every provided image lands in the deck even when the model would
+    otherwise repeat a file."""
+    planned = DeckOutline(
+        title="T",
+        theme="default",
+        slides=(
+            SlideOutline("A", "a", True),
+            SlideOutline("B", "b", True),
+            SlideOutline("C", "c", False),
+            SlideOutline("D", "d full background", True),
+        ),
+    )
+    second = build_slide_prompt(planned, 2, image_count=3)
+    assert "MUST show provided image #file:2" in second
+    fourth = build_slide_prompt(planned, 4, image_count=3)
+    # placement hint in the summary selects the cover form
+    assert "![bg cover](#file:3)" in fourth
+    # round-robin: a 4th image slide beyond the image count wraps to #file:1
+    wrap = DeckOutline(
+        title="T",
+        theme="default",
+        slides=tuple(SlideOutline(f"S{n}", "s", True) for n in range(4)),
+    )
+    fourth_wrap = build_slide_prompt(wrap, 4, image_count=3)
+    assert "MUST show provided image #file:1" in fourth_wrap
 
 
 def test_build_slide_prompt_number_out_of_range() -> None:

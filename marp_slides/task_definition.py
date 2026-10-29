@@ -93,9 +93,18 @@ TASK_TYPE = TaskType(
             description=(
                 "The generated presentation file: a PPTX (default), a "
                 "standalone HTML file or a PDF document, following "
-                "output_format."
+                "output_format. With output_format 'all' this is the PPTX."
             ),
             shape_type=ShapeType.FILE,
+        ),
+        ShapeDescriptor(
+            name="slide_decks",
+            description=(
+                "Every generated presentation file, one per selected "
+                "output format (pptx, html, pdf), in generation order. "
+                "Each has download and save-to-files actions."
+            ),
+            shape_type=ShapeType.LIST_OF_FILES,
         ),
     ],
 )
@@ -189,9 +198,18 @@ RE_RENDER_TASK_TYPE = TaskType(
             description=(
                 "The re-rendered presentation file: a PPTX (default), a "
                 "standalone HTML file or a PDF document, following "
-                "output_format."
+                "output_format. With output_format 'all' this is the PPTX."
             ),
             shape_type=ShapeType.FILE,
+        ),
+        ShapeDescriptor(
+            name="slide_decks",
+            description=(
+                "Every re-rendered presentation file, one per selected "
+                "output format (pptx, html, pdf), in generation order. "
+                "Each has download and save-to-files actions."
+            ),
+            shape_type=ShapeType.LIST_OF_FILES,
         ),
     ],
 )

@@ -28,6 +28,7 @@ from .constructs import (
 )
 from .directives import normalize_preamble_separators
 from .parser import parse_deck, split_slides
+from .slide_blocks import FENCE_OPEN_RE
 
 _FRONTMATTER_DELIM = "---"
 
@@ -108,13 +109,48 @@ _JS_URL_RE = re.compile(r"javascript\s*:", re.IGNORECASE)
 _MATH_BLOCK_SPAN_RE = re.compile(r"\$\$.+?\$\$", re.DOTALL)
 _MATH_INLINE_SPAN_RE = re.compile(r"\$[^$\n]+\$")
 
+#: Inline code spans are literal text, so they leave the raw-HTML scan
+#: too (observed live: a Docker Compose deck legitimately writes
+#: '`<project>_default`' in a code span and was rejected as raw HTML).
+_INLINE_CODE_SPAN_RE = re.compile(r"`+[^`\n]+`+")
+
+
+def _scan_text(markdown: str) -> str:
+    """The text the raw-HTML scan runs over: fenced code blocks blanked
+    line by line (mirroring the parser's fence walk: fence markers,
+    closer of the same character run, blanked content), then math spans
+    and inline code spans removed. Code constructs are literal text, so
+    angle brackets inside them are content, not markup; math spans keep
+    relation characters from false-positiveing."""
+    lines: list[str] = []
+    in_fence = False
+    fence_char = "`"
+    for line in markdown.split("\n"):
+        stripped = line.strip()
+        if in_fence:
+            lines.append("")
+            if stripped and stripped == fence_char * len(stripped):
+                in_fence = False
+            continue
+        fence = FENCE_OPEN_RE.match(line)
+        if fence:
+            lines.append("")
+            in_fence = True
+            fence_char = fence.group(1)[0]
+            continue
+        lines.append(line)
+    text = "\n".join(lines)
+    text = _MATH_BLOCK_SPAN_RE.sub(" ", text)
+    text = _MATH_INLINE_SPAN_RE.sub(" ", text)
+    return _INLINE_CODE_SPAN_RE.sub(" ", text)
+
 
 def _reject_html(markdown: str) -> None:
-    """Strict native-only: ANY raw HTML tag is rejected (speaker-note
-    comments never match the tag regex; the parser handles those as notes).
+    """Strict native-only: ANY raw HTML tag in prose is rejected (speaker-note
+    comments never match the tag regex; the parser handles those as notes;
+    code fences and code spans are literal text and exempt via _scan_text).
     The on*/javascript: checks only pick more specific messages."""
-    text = _MATH_BLOCK_SPAN_RE.sub(" ", markdown)
-    text = _MATH_INLINE_SPAN_RE.sub(" ", text)
+    text = _scan_text(markdown)
     if _SCRIPT_TAG_RE.search(text):
         raise DeckError(
             "Invalid deck: <script> tags are not allowed. Remove all script tags; "

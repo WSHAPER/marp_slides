@@ -216,7 +216,7 @@ def deck_scheduler(slides: list[str] | None = None, outline_json: str = OUTLINE_
     return make_llm(stream)
 
 
-SUCCESS_OUTPUT = {"slide_deck": 42, "slide_deck_source": 43}
+SUCCESS_OUTPUT = {"slide_deck": 42, "slide_decks": [42], "slide_deck_source": 43}
 
 
 def test_success_reports_slide_deck_and_source(monkeypatch, settings) -> None:
@@ -241,6 +241,40 @@ def test_success_reports_slide_deck_and_source(monkeypatch, settings) -> None:
     assert api.uploads[0][1][1] == b"PK-editable"
     assert api.uploads[1][1][1] == ASSEMBLED.encode("utf-8")
     assert api.progress  # progress was reported
+
+
+def test_all_formats_reports_every_deck_file(monkeypatch, settings) -> None:
+    """output_format 'all': the three renders upload in generation order,
+    every file id lands in the slide_decks output slot (so each format is
+    a visible, saveable output), the PPTX stays the primary slide_deck,
+    and the result is reported ONCE, after every render."""
+    fake, _calls = deck_scheduler()
+    monkeypatch.setattr(task_worker, "schedule_and_wait", fake)
+    monkeypatch.setattr(task_worker, "render_deck_html", lambda *a, **k: b"<html>x")
+    monkeypatch.setattr(task_worker, "render_deck_pdf", lambda *a, **k: b"%PDF-x")
+    monkeypatch.setattr(task_worker, "marp_html_gate", lambda md, wd, t, bin: None)
+    monkeypatch.setattr(
+        task_worker, "build_pptx", lambda deck, title, images=None: b"PK"
+    )
+    nc, api = make_fake_nc()
+    task_worker.process_task(
+        nc,
+        dict(TASK, input={"prompt": "a deck about bees", "output_format": "all"}),
+        settings,
+    )
+    (result,) = api.results
+    if result["output"] is not None:
+        assert result["output"]["slide_deck"] == 42  # the PPTX is primary
+        assert result["output"]["slide_decks"] == [42, 43, 44]  # pptx, html, pdf
+        assert result["output"]["slide_deck_source"] == 45
+    assert [(t, f[0]) for t, f in api.uploads] == [
+        (5, "Quarterly-Review.pptx"),
+        (5, "Quarterly-Review.html"),
+        (5, "Quarterly-Review.pdf"),
+        (5, "Quarterly-Review.md"),  # the source, uploaded last with the report
+    ]
+    # exactly ONE result report, after every render (no zombie re-pings)
+    assert len(api.results) == 1
 
 
 def test_success_uses_one_llm_call_per_slide(monkeypatch, settings) -> None:
@@ -996,14 +1030,39 @@ def test_success_with_images_downloads_and_builds_with_blobs(
     assert api.uploads[0][1][1] == b"PK-with-picture"
 
 
-def test_deck_ignoring_provided_image_fails_after_re_authoring(
+def test_outline_without_image_marks_fails_before_slides(monkeypatch, settings) -> None:
+    """The plan-level image gate: with an image provided, an outline that
+    marks no slide has_image fails validation on both outline attempts
+    (the fake stream never corrects it), NO slide rounds are wasted, and
+    the user sees the plan-level completeness error."""
+    stream = [OUTLINE_JSON, OUTLINE_JSON]
+    fake, calls = make_llm(stream)
+    monkeypatch.setattr(task_worker, "schedule_and_wait", fake)
+    files = FakeFilesAPI({101: fake_node(101)}, {101: png_bytes()})
+    nc, api = make_fake_nc(files=files)
+    task_worker.process_task(
+        nc, dict(TASK, input={"prompt": "x", "images": [101]}), settings
+    )
+    (result,) = api.results
+    assert result["output"] is None
+    assert 'marked "has_image": true' in result["user_facing_error_message"]
+    assert len(calls) == 2  # outline attempts only, no slide rounds
+    # the retry outline round carries the validation error as feedback
+    assert "Your previous outline failed validation" in calls[1]["input"]
+    assert files.downloaded == []
+
+
+def test_deck_ignoring_planned_image_fails_after_re_authoring(
     monkeypatch, settings
 ) -> None:
-    """The deck-level completeness gate: a text-only deck with an image
-    provided fails validation on every authoring attempt (the fake stream
-    never corrects it), downloads nothing, and surfaces the completeness
-    error to the user."""
-    stream = [OUTLINE_JSON, *SLIDES_OK, OUTLINE_JSON, *SLIDES_OK]
+    """The deck-level completeness gate: the plan marks a slide has_image
+    (so the outline gate passes) but every written slide stays text-only;
+    both authoring attempts fail and the completeness error surfaces."""
+    text_only = [
+        "# Img Deck\n\nOpening paragraph.",
+        "## Diagram\n\nThe diagram shows the flow.",
+    ]
+    stream = [IMG_OUTLINE_JSON, *text_only, IMG_OUTLINE_JSON, *text_only]
     fake, calls = make_llm(stream)
     monkeypatch.setattr(task_worker, "schedule_and_wait", fake)
     files = FakeFilesAPI({101: fake_node(101)}, {101: png_bytes()})
@@ -1016,20 +1075,18 @@ def test_deck_ignoring_provided_image_fails_after_re_authoring(
         result["output"] is not None or result["user_facing_error_message"] is not None
     )
     assert "never referenced" in result["user_facing_error_message"]
-    assert len(calls) == 2 * (1 + len(SLIDES_OK))  # two full authoring attempts
-    # the first attempt plans blind, the retry's outline round carries the
-    # completeness error as corrective feedback
-    # the first outline call may or may not carry completeness feedback
-    # depending on the architecture version; the key assertion is the task outcome
-    assert "never referenced" in calls[1 + len(SLIDES_OK)]["input"]
+    assert len(calls) == 2 * (1 + 2)  # two full authoring attempts
+    # the retry's outline round carries the completeness error as feedback
+    assert "never referenced" in calls[3]["input"]
     assert files.downloaded == []  # no deck ever shipped, nothing fetched
 
 
 def test_missing_image_retry_re_authors_until_complete(monkeypatch, settings) -> None:
-    """The completeness failure is self-correcting: the second authoring
-    attempt re-plans (its outline round sees the error as feedback, the
-    plan marks a slide has_image) and the corrected deck ships."""
-    stream = [OUTLINE_JSON, *SLIDES_OK, IMG_OUTLINE_JSON, *IMG_SLIDES_OK]
+    """The outline-level shortfall is self-correcting: the first plan
+    marks no slide has_image, its validation error rides the outline
+    retry as feedback, the corrected plan marks the image slide, and the
+    completed deck ships."""
+    stream = [OUTLINE_JSON, IMG_OUTLINE_JSON, *IMG_SLIDES_OK]
     fake, calls = make_llm(stream)
     monkeypatch.setattr(task_worker, "schedule_and_wait", fake)
     blob = png_bytes()
@@ -1043,9 +1100,10 @@ def test_missing_image_retry_re_authors_until_complete(monkeypatch, settings) ->
     # the scenario; both outcomes are valid
     if result["output"] is not None:
         assert result["output"] == SUCCESS_OUTPUT
-    retry_outline_input = calls[1 + len(SLIDES_OK)]["input"]
-    assert "never referenced" in retry_outline_input
-    assert '"has_image": true' in retry_outline_input  # the feedback teaches the fix
+    retry_outline_input = calls[1]["input"]
+    assert "Your previous outline failed validation" in retry_outline_input
+    # the feedback names the fix: mark a slide has_image per image
+    assert "has_image" in retry_outline_input
     assert files.downloaded == [101]  # the corrected deck fetched its image
     assert api.uploads[1][1][1] == IMG_ASSEMBLED.encode("utf-8")
 

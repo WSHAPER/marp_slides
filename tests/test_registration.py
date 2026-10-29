@@ -22,11 +22,13 @@ def test_task_type_shape() -> None:
     assert tt.input_shape[0].description == (
         "What the presentation should be about and any requirements for it."
     )
-    # the required output stays exactly the PPTX; slide_deck_source is an
-    # OPTIONAL output declared on the provider (merged into the task type by
-    # the server from the provider registration)
-    assert [s.name for s in tt.output_shape] == ["slide_deck"]
+    # the required outputs are the primary deck file plus the list of every
+    # generated format; slide_deck_source is an OPTIONAL output declared on
+    # the provider (merged into the task type by the server from the
+    # provider registration)
+    assert [s.name for s in tt.output_shape] == ["slide_deck", "slide_decks"]
     assert tt.output_shape[0].shape_type == ShapeType.FILE
+    assert tt.output_shape[1].shape_type == ShapeType.LIST_OF_FILES
     assert "PPTX" in tt.output_shape[0].description
     assert "HTML" in tt.output_shape[0].description
     assert "PDF" in tt.output_shape[0].description
@@ -51,7 +53,7 @@ def test_provider_shape() -> None:
     # entry to a ShapeEnumValue and the Assistant UI renders the list as a
     # dropdown (EnumField.vue NcSelect options): multiple values are
     # supported end to end.
-    assert [v.value for v in enum_values] == ["pptx", "html", "pdf"]
+    assert [v.value for v in enum_values] == ["pptx", "html", "pdf", "all"]
     assert [v.name for v in enum_values] == [
         OUTPUT_FORMAT_LABELS[value] for value in OUTPUT_FORMAT_VALUES
     ]
@@ -136,5 +138,5 @@ def test_descriptions_do_not_pack_pipe_separated_examples() -> None:
 
 
 def test_format_constants_are_consistent() -> None:
-    assert OUTPUT_FORMAT_VALUES == ("pptx", "html", "pdf")
+    assert OUTPUT_FORMAT_VALUES == ("pptx", "html", "pdf", "all")
     assert set(OUTPUT_FORMAT_LABELS) == set(OUTPUT_FORMAT_VALUES)

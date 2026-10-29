@@ -31,20 +31,22 @@ RE_RENDER_EXPECTED_RUNTIME_S = 10
 #: (a PDF document rendered by marp-cli through the bundled Chromium: the
 #: one output format that uses the browser shipped in the base image).
 #: marp-cli cannot emit ODP, so it is not offered.
-OUTPUT_FORMAT_VALUES = ("pptx", "html", "pdf")
+OUTPUT_FORMAT_VALUES = ("pptx", "html", "pdf", "all")
 
 #: Display names for the ENUM slot values (one per OUTPUT_FORMAT_VALUES entry).
 OUTPUT_FORMAT_LABELS = {
     "pptx": "PowerPoint presentation (pptx)",
     "html": "Standalone HTML presentation (html)",
     "pdf": "PDF document (pdf)",
+    "all": "All formats (pptx + html + pdf)",
 }
 
 #: Description for the ``output_format`` input slot (states the allowed values).
 OUTPUT_FORMAT_DESCRIPTION = (
     "Output file format for the deck: 'pptx' (editable PowerPoint, the default), "
-    "'html' (a single standalone HTML file) or 'pdf' (a PDF document). ODP cannot "
-    "be produced because the Marp renderer has no ODP output."
+    "'html' (a single standalone HTML file), 'pdf' (a PDF document), or 'all' "
+    "(generates all three formats as separate files). ODP cannot be produced "
+    "because the Marp renderer has no ODP output."
 )
 
 #: Input key of the nested ``core:text2text`` task (verified in

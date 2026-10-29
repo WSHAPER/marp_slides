@@ -112,6 +112,7 @@ from .settings import (
     APP_ID,
     HTML_MIME_TYPE,
     MARKDOWN_MIME_TYPE,
+    OUTPUT_FORMAT_VALUES,
     PDF_MIME_TYPE,
     PPTX_MIME_TYPE,
     PROVIDER_ID,
@@ -607,13 +608,23 @@ def _re_render_deck(
     # markdown may legitimately use only a subset of the provided files.
     validate_image_references(validated.deck, image_file_ids)
 
-    file_bytes, mime_type = _render_deck_file(
-        nc, task_id, validated, markdown, output_format, image_file_ids, settings
+    # "all" expands like the authoring pipeline; every render and upload
+    # precedes the single result report (render phases ping progress, and
+    # a ping after report_result resurrects the task as a RUNNING zombie).
+    formats = (
+        list(OUTPUT_FORMAT_VALUES[:3]) if output_format == "all" else [output_format]
     )
-    # No prompt to derive the name from: the deck's own frontmatter title
-    # is the source of truth (it named the original deliverable).
-    filename = build_deck_filename(validated.frontmatter, None, output_format)
-    _upload_and_report(nc, task_id, filename, file_bytes, mime_type, markdown)
+    deck_files: list[tuple[str, int]] = []
+    for fmt in formats:
+        file_bytes, mime_type = _render_deck_file(
+            nc, task_id, validated, markdown, fmt, image_file_ids, settings
+        )
+        # No prompt to derive the name from: the deck's own frontmatter
+        # title is the source of truth (it named the original deliverable).
+        filename = build_deck_filename(validated.frontmatter, None, fmt)
+        file_id = _upload_deck_file(nc, task_id, filename, file_bytes, mime_type)
+        deck_files.append((filename, file_id))
+    _report_deck_result(nc, task_id, deck_files, markdown)
     return markdown
 
 
@@ -770,46 +781,72 @@ def _render_deck_file(
     return file_bytes, mime_type
 
 
-def _upload_and_report(
+def _upload_deck_file(
     nc: NextcloudApp,
     task_id: int,
     filename: str,
     file_bytes: bytes,
     mime_type: str,
-    markdown: str,
-) -> None:
-    """The delivery tail SHARED by both task types: upload the
-    deliverable, retain the validated Marp Markdown source next to it, and
-    report the result (both output slots filled)."""
-    file_id = nc.providers.task_processing.upload_result_file(
+) -> int:
+    """Upload ONE deliverable file for the task; returns its file id.
+    Multi-format generation calls this per format (every file appears in
+    the assistant result view); the result report itself happens exactly
+    once, at the very end, via _report_deck_result."""
+    file_id: int = nc.providers.task_processing.upload_result_file(
         task_id, (filename, file_bytes, mime_type)
     )
+    return file_id
+
+
+def _report_deck_result(
+    nc: NextcloudApp,
+    task_id: int,
+    deck_files: list[tuple[str, int]],
+    markdown: str,
+) -> None:
+    """The delivery tail SHARED by both task types: retain the validated
+    Marp Markdown source next to the deliverables and report the result.
+    ``deck_files`` is every generated format in generation order
+    ``[(filename, file_id), ...]``; the first entry is the primary deck
+    (``slide_deck``, kept for single-file consumers) and the whole list
+    fills the ``slide_decks`` output slot so EVERY selected format is a
+    visible, downloadable, saveable output. MUST run after EVERY render
+    and upload of the task: a render phase may ping progress, and the
+    100% progress ping must PRECEDE report_result with no further pings
+    after it. Nextcloud's setTaskProgress unconditionally flips the task
+    back to STATUS_RUNNING (no terminal-state guard), so any progress
+    report after the result would resurrect the finished task as a
+    permanent RUNNING zombie with its output already stored (observed
+    live: task 544, status=2/progress=1.0/output present, never
+    SUCCESSFUL; then task 737, status=2/progress=0.92 with all four
+    files uploaded, after the 'all formats' loop rendered html/pdf past
+    the pptx report)."""
+    primary_filename, primary_file_id = deck_files[0]
     # source retention: the validated Marp Markdown IS the deck source of
     # truth: a later turn can make small edits and feed it to the
     # re-render task instead of a full recompute
     source_id = nc.providers.task_processing.upload_result_file(
         task_id,
         (
-            source_markdown_filename(filename),
+            source_markdown_filename(primary_filename),
             markdown.encode("utf-8"),
             MARKDOWN_MIME_TYPE,
         ),
     )
-    # The 100% progress ping must PRECEDE report_result: Nextcloud's
-    # setTaskProgress unconditionally flips the task back to
-    # STATUS_RUNNING (no terminal-state guard), so a progress report
-    # after the result would resurrect the finished task as a permanent
-    # RUNNING zombie with its output already stored (observed live:
-    # task 544, status=2/progress=1.0/output present, never SUCCESSFUL).
     _report_progress(nc, task_id, 100.0, "done")
     nc.providers.task_processing.report_result(
-        task_id, {"slide_deck": file_id, "slide_deck_source": source_id}
+        task_id,
+        {
+            "slide_deck": primary_file_id,
+            "slide_decks": [file_id for _, file_id in deck_files],
+            "slide_deck_source": source_id,
+        },
     )
     LOGGER.info(
-        "Task %s completed: %s (deck file id %s, source markdown file id %s)",
+        "Task %s completed: %s (deck file ids %s, source markdown file id %s)",
         task_id,
-        filename,
-        file_id,
+        primary_filename,
+        [file_id for _, file_id in deck_files],
         source_id,
     )
 
@@ -903,11 +940,22 @@ def _generate_deck(
     validated, markdown = _author_validated_deck(
         nc, prompt, theme, settings, task_id, image_file_ids
     )
-    file_bytes, mime_type = _render_deck_file(
-        nc, task_id, validated, markdown, output_format, image_file_ids, settings
+    # "all" expands to every format; each gets its own file and upload.
+    # EVERY render and upload happens BEFORE the single result report:
+    # render phases ping progress, and a progress ping after
+    # report_result resurrects the task as a RUNNING zombie (task 737).
+    formats = (
+        list(OUTPUT_FORMAT_VALUES[:3]) if output_format == "all" else [output_format]
     )
-    filename = build_deck_filename(validated.frontmatter, prompt, output_format)
-    _upload_and_report(nc, task_id, filename, file_bytes, mime_type, markdown)
+    deck_files: list[tuple[str, int]] = []
+    for fmt in formats:
+        file_bytes, mime_type = _render_deck_file(
+            nc, task_id, validated, markdown, fmt, image_file_ids, settings
+        )
+        filename = build_deck_filename(validated.frontmatter, prompt, fmt)
+        file_id = _upload_deck_file(nc, task_id, filename, file_bytes, mime_type)
+        deck_files.append((filename, file_id))
+    _report_deck_result(nc, task_id, deck_files, markdown)
     return markdown
 
 

@@ -57,6 +57,6 @@ def test_allowed_default_is_the_settings_constant() -> None:
 
     from marp_slides.settings import OUTPUT_FORMAT_VALUES
 
-    assert OUTPUT_FORMAT_VALUES == ("pptx", "html", "pdf")
+    assert OUTPUT_FORMAT_VALUES == ("pptx", "html", "pdf", "all")
     default = inspect.signature(validate_output_format).parameters["allowed"].default
     assert default is OUTPUT_FORMAT_VALUES
