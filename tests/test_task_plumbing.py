@@ -15,10 +15,12 @@ import pytest
 from PIL import Image
 
 from marp_slides import task_worker
-from marp_slides.deck_pipeline import DeckError
+from marp_slides.deck_pipeline import DeckError, _OverflowMeasurementError
+from marp_slides.layout import SlideOverflow
 from marp_slides.ocs_tasks import NestedTaskError
 from marp_slides.outline import assemble_deck, parse_outline
 from marp_slides.settings import (
+    DEFAULT_OVERFLOW_CHECK,
     HTML_MIME_TYPE,
     MARKDOWN_MIME_TYPE,
     PDF_MIME_TYPE,
@@ -175,8 +177,10 @@ def settings() -> Settings:
 
 @pytest.fixture(autouse=True)
 def no_real_build(monkeypatch):
-    """Default: the marp gate/renders and the PPTX builder are faked so tests
-    never need marp/docker."""
+    """Default: the marp gate/renders, the PPTX builder and the overflow
+    measurement drivers are faked so tests never need marp, Chromium or
+    docker. The fit fakes report a fit (None per slide, no overflowing
+    slide); overflow behavior is tested by overriding them per test."""
     monkeypatch.setattr(task_worker, "marp_html_gate", lambda md, wd, t, bin: None)
     monkeypatch.setattr(
         task_worker,
@@ -191,6 +195,10 @@ def no_real_build(monkeypatch):
     monkeypatch.setattr(
         task_worker, "build_pptx", lambda deck, title, images=None: b"PK-editable"
     )
+    monkeypatch.setattr(
+        task_worker, "measure_slide_overflow", lambda md, wd, **kw: None
+    )
+    monkeypatch.setattr(task_worker, "measure_deck_overflow", lambda md, wd, **kw: ())
 
 
 # --- the two-phase inner-LLM fake -------------------------------------------------
@@ -1795,3 +1803,265 @@ def test_model_side_nested_failure_is_not_rescheduled(monkeypatch) -> None:
     )
     assert "returned no text" in result["user_facing_error_message"]
     assert len(calls) == 1
+
+
+# --- overflow gates: per-slide retry + render-time backstop ----------------------
+
+
+#: A construct-valid slide whose CONTENT overflows: the fit fake keys on
+#: its distinctive last bullet (the retry outputs must not contain it).
+OVERFLOWING_SLIDE = "## Results\n\n" + "\n".join(
+    f"- bullet {i} with plenty of words" for i in range(1, 31)
+)
+
+
+def overflow_report(slide: int = 2) -> SlideOverflow:
+    """A realistic measured overflow report (default-theme metrics: 29 px
+    body font, content 790 px against a 563 px safe area)."""
+    return SlideOverflow(
+        slide=slide,
+        theme="default",
+        box_px=(1280, 720),
+        safe_px=(1280, 563),
+        content_h_px=790,
+        overflow_y_px=227,
+        fill_ratio=1.4,
+        font_px=29,
+        line_px=33,
+        first_offender=("li", "bullet 27 with far too much text to fit"),
+    )
+
+
+def test_overflowing_slide_retried_with_fit_feedback(monkeypatch, settings) -> None:
+    """A slide whose content overflows its theme box (constructs all
+    valid) fails the per-slide fit gate and retries ITSELF with the
+    measured overflow message as corrective feedback; the corrected
+    slide ships. The measured markdown carries the deck's theme so the
+    metrics match the deck the slide ships in."""
+    report = overflow_report(slide=1)  # a lone section measures as 1
+    measured: list[str] = []
+
+    def fake_measure(md, wd):
+        measured.append(md)
+        return report if "bullet 30" in md else None
+
+    monkeypatch.setattr(task_worker, "measure_slide_overflow", fake_measure)
+    slides = [SLIDES_OK[0], OVERFLOWING_SLIDE, SLIDES_OK[1], SLIDES_OK[2]]
+    fake, calls = deck_scheduler(slides)
+    monkeypatch.setattr(task_worker, "schedule_and_wait", fake)
+    nc, api = make_fake_nc()
+    task_worker.process_task(nc, TASK, settings)
+    assert len(calls) == 5  # outline + slide 1 + slide 2 twice + slide 3
+    retry_input = calls[3]["input"]  # slide 2's second attempt
+    assert "Your previous attempt for this slide failed validation:" in retry_input
+    assert "too much for the slide" in retry_input  # the message rides verbatim
+    assert "slide 2" in retry_input  # renumbered from the measured section
+    assert "bullet 27" in retry_input  # the first offender rides along too
+    assert retry_input.endswith("Return ONLY the corrected slide.")
+    (result,) = api.results
+    assert result["output"] == SUCCESS_OUTPUT  # the corrected slide shipped
+    overflowing_md = next(md for md in measured if "bullet 30" in md)
+    assert overflowing_md.startswith("---\nmarp: true\ntheme: default\n---")
+
+
+def test_overflowing_slide_failing_twice_reports_overflow(
+    monkeypatch, settings
+) -> None:
+    """Both attempts overflow: the task fails with the measured overflow
+    message surfaced, renumbered to the deck position, exactly like any
+    other per-slide output-quality failure."""
+    report = overflow_report()
+
+    def fake_measure(md, wd):
+        return report if "bullet 30" in md else None
+
+    monkeypatch.setattr(task_worker, "measure_slide_overflow", fake_measure)
+    slides = [SLIDES_OK[0], OVERFLOWING_SLIDE, OVERFLOWING_SLIDE]
+    fake, calls = deck_scheduler(slides)
+    monkeypatch.setattr(task_worker, "schedule_and_wait", fake)
+    nc, api = make_fake_nc()
+    task_worker.process_task(nc, TASK, settings)
+    assert len(calls) == 4  # outline + slide 1 + slide 2's two attempts
+    (result,) = api.results
+    assert result["output"] is None
+    assert "too much for the slide" in result["user_facing_error_message"]
+    assert "slide 2" in result["user_facing_error_message"]
+    assert api.uploads == []  # nothing was ever uploaded
+
+
+def test_deck_overflow_backstop_fails_render_before_any_output(
+    monkeypatch, settings
+) -> None:
+    """A deck the authoring phase let through (every slide fit) but the
+    batch render-time measurement rejects: non-retryable like the other
+    render gates, BEFORE the marp gate runs or any file uploads."""
+
+    def overflowing_deck(md, wd):
+        return (overflow_report(),)
+
+    def forbidden_gate(md, wd, t, bin):
+        raise AssertionError("the fit backstop must reject before the marp gate")
+
+    monkeypatch.setattr(task_worker, "measure_deck_overflow", overflowing_deck)
+    monkeypatch.setattr(task_worker, "marp_html_gate", forbidden_gate)
+    fake, calls = deck_scheduler()
+    monkeypatch.setattr(task_worker, "schedule_and_wait", fake)
+    nc, api = make_fake_nc()
+    task_worker.process_task(nc, TASK, settings)
+    assert len(calls) == 4  # authoring only: the backstop never retries
+    (result,) = api.results
+    assert result["output"] is None
+    assert "does not fit its slide boxes" in result["user_facing_error_message"]
+    assert "slide 2" in result["user_facing_error_message"]
+    assert api.uploads == []  # no deliverable and no source upload
+
+
+def test_fitting_deck_pipeline_output_unchanged(monkeypatch, settings) -> None:
+    """Measurements that report a fit (None per slide, empty batch) leave
+    the pipeline byte-identical: same result output, same uploads, with
+    every authored slide measured once and the deck measured once."""
+    slide_measures: list[str] = []
+    deck_measures: list[str] = []
+
+    def fitting_slide(md, wd):
+        slide_measures.append(md)  # falls through: a fit is reported as None
+
+    def fitting_deck(md, wd):
+        deck_measures.append(md)
+        return ()
+
+    monkeypatch.setattr(task_worker, "measure_slide_overflow", fitting_slide)
+    monkeypatch.setattr(task_worker, "measure_deck_overflow", fitting_deck)
+    fake, _calls = deck_scheduler()
+    monkeypatch.setattr(task_worker, "schedule_and_wait", fake)
+    nc, api = make_fake_nc()
+    task_worker.process_task(nc, TASK, settings)
+    assert api.results == [
+        {
+            "task_id": 5,
+            "output": SUCCESS_OUTPUT,
+            "error_message": None,
+            "user_facing_error_message": None,
+        }
+    ]
+    assert [(t, f[0], f[2]) for t, f in api.uploads] == [
+        (5, "Quarterly-Review.pptx", PPTX_MIME_TYPE),
+        (5, "Quarterly-Review.md", MARKDOWN_MIME_TYPE),
+    ]
+    assert len(slide_measures) == 3  # every authored slide was measured
+    assert deck_measures == [ASSEMBLED]  # ONE batch measure of the deck
+
+
+def test_overflow_check_off_skips_both_gates(monkeypatch, settings) -> None:
+    """MARP_SLIDES_OVERFLOW_CHECK=false: both gates no-op, the drivers are
+    never invoked (the toggle skips the checks; it does not fake a fit)."""
+    calls: list[str] = []
+
+    def forbidden_slide(md, wd):
+        calls.append("slide")
+
+    def forbidden_deck(md, wd):
+        calls.append("deck")
+
+    monkeypatch.setattr(task_worker, "measure_slide_overflow", forbidden_slide)
+    monkeypatch.setattr(task_worker, "measure_deck_overflow", forbidden_deck)
+    fake, _calls = deck_scheduler()
+    monkeypatch.setattr(task_worker, "schedule_and_wait", fake)
+    nc, api = make_fake_nc()
+    task_worker.process_task(nc, TASK, replace(settings, overflow_check=False))
+    assert calls == []
+    assert api.results[0]["output"] == SUCCESS_OUTPUT
+
+
+def test_measurement_outage_never_blocks_delivery(
+    monkeypatch, settings, caplog
+) -> None:
+    """Fail-open: the drivers' infrastructure error class (marp/Chromium
+    missing, render crash, timeout - consistently
+    _OverflowMeasurementError) logs a warning and the pipeline continues
+    - per-slide authoring AND the render both reach success, because a
+    measurement outage must never block deck delivery."""
+
+    def broken(md, wd, **kw):
+        raise _OverflowMeasurementError("chromium binary not found")
+
+    monkeypatch.setattr(task_worker, "measure_slide_overflow", broken)
+    monkeypatch.setattr(task_worker, "measure_deck_overflow", broken)
+    fake, _calls = deck_scheduler()
+    monkeypatch.setattr(task_worker, "schedule_and_wait", fake)
+    nc, api = make_fake_nc()
+    with caplog.at_level("WARNING", logger="marp_slides.task_worker"):
+        task_worker.process_task(nc, TASK, settings)
+    assert api.results[0]["output"] == SUCCESS_OUTPUT  # the deck delivered
+    warnings = [r.getMessage() for r in caplog.records if r.levelname == "WARNING"]
+    assert any("overflow measurement unavailable" in w for w in warnings)
+
+
+def test_nextcloud_theme_measurement_gets_theming_values(monkeypatch, settings) -> None:
+    """theme=nextcloud: the generated theme exists only as CSS written
+    from the instance theming, so BOTH gates must hand the measurement
+    the resolved ThemingValues (per slide and at the deck backstop);
+    bundled themes measure without any theming kwarg at all."""
+    slide_kwargs: list[dict] = []
+    slide_markdowns: list[str] = []
+    deck_kwargs: list[dict] = []
+
+    def nc_slide(md, wd, **kw):
+        slide_markdowns.append(md)
+        slide_kwargs.append(kw)
+
+    def nc_deck(md, wd, **kw):
+        deck_kwargs.append(kw)
+        return ()
+
+    monkeypatch.setattr(task_worker, "measure_slide_overflow", nc_slide)
+    monkeypatch.setattr(task_worker, "measure_deck_overflow", nc_deck)
+    fake, _calls = nc_deck_scheduler()
+    monkeypatch.setattr(task_worker, "schedule_and_wait", fake)
+    monkeypatch.setattr(
+        task_worker, "marp_html_gate", lambda md, wd, t, bin, **kw: None
+    )
+    nc, api = make_fake_nc(capabilities={"theming": NC_THEMING_CAPS})
+    task_worker.process_task(
+        nc, dict(TASK, input={"prompt": "x", "theme": "nextcloud"}), settings
+    )
+    (result,) = api.results
+    assert result["output"] == SUCCESS_OUTPUT
+    # every authored slide measured with the branded values
+    assert len(slide_kwargs) == 3
+    for kwargs in slide_kwargs:
+        values = kwargs["theming_values"]
+        assert isinstance(values, ThemingValues)
+        assert values.color == "#0082c9"
+    assert all("theme: nextcloud" in md for md in slide_markdowns)
+    # the deck backstop measured with branded values too
+    (deck_values,) = [kwargs["theming_values"] for kwargs in deck_kwargs]
+    assert isinstance(deck_values, ThemingValues) and deck_values.color == "#0082c9"
+
+    # bundled theme: no theming kwarg rides either measurement
+    slide_kwargs.clear()
+    deck_kwargs.clear()
+    fake, _calls = deck_scheduler()
+    monkeypatch.setattr(task_worker, "schedule_and_wait", fake)
+    nc, api = make_fake_nc(capabilities={"theming": NC_THEMING_CAPS})
+    task_worker.process_task(nc, TASK, settings)
+    assert api.results[0]["output"] == SUCCESS_OUTPUT
+    assert slide_kwargs == [{} for _ in range(3)]
+    assert deck_kwargs == [{}]
+
+
+def test_overflow_check_env_round_trip() -> None:
+    """MARP_SLIDES_OVERFLOW_CHECK: default on; 'false'/'0' disable, 'true'
+    and empty re-enable (the same parsing as the other boolean knobs)."""
+    assert Settings.from_env({}).overflow_check is DEFAULT_OVERFLOW_CHECK is True
+    assert (
+        Settings.from_env({"MARP_SLIDES_OVERFLOW_CHECK": "false"}).overflow_check
+        is False
+    )
+    assert (
+        Settings.from_env({"MARP_SLIDES_OVERFLOW_CHECK": "0"}).overflow_check is False
+    )
+    assert (
+        Settings.from_env({"MARP_SLIDES_OVERFLOW_CHECK": "true"}).overflow_check is True
+    )
+    assert Settings.from_env({"MARP_SLIDES_OVERFLOW_CHECK": ""}).overflow_check is True

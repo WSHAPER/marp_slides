@@ -81,6 +81,15 @@ DEFAULT_RETRY_LLM = True
 #: (security audit F6).
 DEFAULT_LOG_EXCERPT = True
 
+#: Early slide-fit gates: every authored slide is measured against its
+#: theme box (an overflowing slide fails the per-slide retry with the
+#: measured overflow message as feedback), and one batch measurement
+#: backs the render phase as a non-retryable deck-level gate. Measurement
+#: is best-effort: an infrastructure outage (Chromium missing, render
+#: crash) logs and skips the check, never blocks deck delivery. Disable
+#: both gates with ``MARP_SLIDES_OVERFLOW_CHECK=false``.
+DEFAULT_OVERFLOW_CHECK = True
+
 PPTX_MIME_TYPE = (
     "application/vnd.openxmlformats-officedocument.presentationml.presentation"
 )
@@ -143,6 +152,7 @@ class Settings:
     marp_bin: str = DEFAULT_MARP_BIN
     retry_llm: bool = DEFAULT_RETRY_LLM
     log_excerpt: bool = DEFAULT_LOG_EXCERPT
+    overflow_check: bool = DEFAULT_OVERFLOW_CHECK
 
     @classmethod
     def from_env(cls, env: Mapping[str, str] | None = None) -> Settings:
@@ -172,4 +182,7 @@ class Settings:
             or DEFAULT_MARP_BIN,
             retry_llm=_env_bool(env, "MARP_SLIDES_RETRY_LLM", DEFAULT_RETRY_LLM),
             log_excerpt=_env_bool(env, "MARP_SLIDES_LOG_EXCERPT", DEFAULT_LOG_EXCERPT),
+            overflow_check=_env_bool(
+                env, "MARP_SLIDES_OVERFLOW_CHECK", DEFAULT_OVERFLOW_CHECK
+            ),
         )

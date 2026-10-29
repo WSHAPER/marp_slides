@@ -23,8 +23,17 @@ browser. All LLM calls share one total-time budget
 remaining budget. When a slide fails validation, a deterministic heuristic
 repair round first attempts known trivial fixes (:mod:`marp_slides.repair`)
 and re-validates; only when repair cannot rescue the slide is a per-slide
-self-correcting retry scheduled. Gate/image-fetch/build/prompt failures are
-never retried. Deck images arrive as
+self-correcting retry scheduled. A slide that passes validation is also
+measured against its theme box (best-effort render measurement,
+``MARP_SLIDES_OVERFLOW_CHECK``; a ``nextcloud``-themed deck measures with
+the instance-branded theme values): an overflowing slide fails right
+there with the quantified overflow message, so the same
+repair-then-retry machinery gets a chance to slim it before assembly; a
+deck-level batch measurement backs the render phase as a non-retryable
+last gate. A
+measurement outage (Chromium missing, render crash) never blocks deck
+delivery: it logs and skips the check. Gate/image-fetch/build/prompt
+failures are never retried. Deck images arrive as
 task file inputs (``![alt](#file:N)``): the PPTX build inserts them as
 native pictures, while the html/pdf renders materialize them into the
 throwaway marp workdir and hand marp a render-local markdown copy (the
@@ -67,6 +76,8 @@ import tempfile
 import threading
 from collections.abc import Mapping
 from contextlib import suppress
+from dataclasses import replace
+from pathlib import Path
 from threading import Event
 from time import monotonic, sleep
 from typing import Any
@@ -79,8 +90,11 @@ from niquests import Timeout as RequestsTimeout
 from .deck_pipeline import (
     DeckError,
     ValidatedDeck,
+    _OverflowMeasurementError,
     build_deck_filename,
     marp_html_gate,
+    measure_deck_overflow,
+    measure_slide_overflow,
     render_deck_html,
     render_deck_pdf,
     source_markdown_filename,
@@ -96,6 +110,7 @@ from .images import (
     validate_image_references,
     validate_images_slot,
 )
+from .layout import deck_overflow_message, overflow_message
 from .ocs_tasks import NestedTaskError, schedule_and_wait
 from .outline import (
     DeckOutline,
@@ -334,6 +349,105 @@ def _strip_repair_wrapper(markdown: str) -> str:
     return markdown
 
 
+def _reject_slide_overflow(
+    nc: NextcloudApp,
+    slide_markdown: str,
+    theme: str,
+    number: int,
+    task_id: int,
+    settings: Settings,
+) -> None:
+    """Early slide-fit gate for ONE authored slide: measure the candidate
+    (wrapped in a minimal frontmatter carrying the deck's theme, so the
+    metrics match the deck the slide will ship in) inside a fresh
+    throwaway workdir and raise the measured overflow message as a normal
+    DeckError, so the EXISTING repair-then-retry machinery carries it
+    with zero loop of its own. For the generated ``nextcloud`` theme the
+    resolved instance theming values ride the call: the theme exists only
+    as CSS written from them, so without the values the driver cannot
+    render the slide at all (it then fails closed to its measurement
+    error and the fail-open handling below skips the check, the correct
+    degraded behavior). Best-effort by contract: a measurement
+    infrastructure failure logs a warning and lets the slide through;
+    only a MEASURED overflow fails the slide, because a measurement
+    outage must never block deck delivery. This is not an LLM round: it
+    never touches the shared LLM time budget. No-op when
+    ``settings.overflow_check`` is False."""
+    if not settings.overflow_check:
+        return
+    markdown = f"---\nmarp: true\ntheme: {theme}\n---\n\n{slide_markdown}"
+    measure_kwargs: dict[str, ThemingValues] = {}
+    if theme == THEME_NAME:
+        # _resolve_theming_values is designed never to raise (it falls
+        # back to the stock branding), but if a future resolution failure
+        # ever escapes, measure WITHOUT the values and let the driver's
+        # fail-closed error hit the fail-open handler below
+        try:
+            measure_kwargs = {"theming_values": _resolve_theming_values(nc, task_id)}
+        except Exception as exc:  # noqa: BLE001 - defensive only, see above
+            LOGGER.warning(
+                "Task %s: slide %d theming resolution failed (%s); measuring "
+                "without the branded theme values",
+                task_id,
+                number,
+                exc,
+            )
+    try:
+        with tempfile.TemporaryDirectory(prefix="marp_slides-fit-") as workdir:
+            report = measure_slide_overflow(markdown, Path(workdir), **measure_kwargs)
+    except _OverflowMeasurementError as exc:
+        LOGGER.warning(
+            "Task %s: slide %d overflow measurement unavailable (%s); "
+            "continuing without the per-slide fit check",
+            task_id,
+            number,
+            exc,
+        )
+        return
+    if report is not None:
+        # renumber the measured section to its deck position so the
+        # message names the slide the retry is actually for
+        raise DeckError(overflow_message(replace(report, slide=number)))
+
+
+def _reject_deck_overflow(
+    markdown: str,
+    theming_values: ThemingValues | None,
+    task_id: int,
+    settings: Settings,
+) -> None:
+    """The render-time deck backstop: ONE batch measurement of the
+    assembled deck; any overflowing slide fails the render phase with the
+    deck-level overflow message, non-retryable like the other render
+    gates (the authoring phase already had its retryable per-slide
+    chances). ``theming_values`` is the instance theming the caller
+    resolved for a ``nextcloud``-themed deck (None for bundled themes,
+    which need none). Best-effort like the per-slide gate: a measurement
+    infrastructure failure logs a warning and the render proceeds without
+    the check. No-op when ``settings.overflow_check`` is False."""
+    if not settings.overflow_check:
+        return
+    # the branded-theme kwarg rides only when the caller resolved values
+    # (a nextcloud deck), so every bundled-theme measurement call keeps
+    # its exact pre-theming shape - the same discipline as render_kwargs
+    measure_kwargs: dict[str, ThemingValues] = (
+        {"theming_values": theming_values} if theming_values is not None else {}
+    )
+    try:
+        with tempfile.TemporaryDirectory(prefix="marp_slides-fit-") as workdir:
+            reports = measure_deck_overflow(markdown, Path(workdir), **measure_kwargs)
+    except _OverflowMeasurementError as exc:
+        LOGGER.warning(
+            "Task %s: deck overflow measurement unavailable (%s); "
+            "continuing without the render-time fit check",
+            task_id,
+            exc,
+        )
+        return
+    if reports:
+        raise DeckError(deck_overflow_message(reports))
+
+
 def _generate_slide(
     nc: NextcloudApp,
     outline: DeckOutline,
@@ -383,6 +497,17 @@ def _generate_slide(
             # the task's images (completeness is a deck-level gate,
             # enforced in _author_validated_deck after assembly)
             validate_image_references(validated.deck, image_file_ids)
+            # slide-fit gate: a measured overflow is a retryable
+            # output-quality failure exactly like a construct error.
+            # Known limitation: measurement runs BEFORE the deck's images
+            # are fetched, so '#file:N' references render as broken-image
+            # placeholders and under-measure those slides; the deck
+            # backstop in _render_deck_file measures AFTER fetch
+            # materializes the images and is the authoritative
+            # image-inclusive check.
+            _reject_slide_overflow(
+                nc, slide_markdown, outline.theme, number, task_id, settings
+            )
             return slide_markdown.strip()
         except DeckError as exc:
             # heuristic repair first: trivially fixable issues cost nothing.
@@ -409,6 +534,13 @@ def _generate_slide(
                         )
                         # bounds only here too, never require_complete (see above)
                         validate_image_references(validated.deck, image_file_ids)
+                        # same fit gate on the repair rescue: a repaired
+                        # slide that still overflows falls through to the
+                        # retry instead of shipping to the backstop
+                        # (same image-placeholder limitation as above)
+                        _reject_slide_overflow(
+                            nc, repaired_md, outline.theme, number, task_id, settings
+                        )
                         return repaired_md.strip()
                     except DeckError:
                         pass  # repair insufficient, fall through to retry
@@ -673,7 +805,12 @@ def _render_deck_file(
 ) -> tuple[bytes, str]:
     """The render phase SHARED by both task types: turn a validated deck
     into the deliverable file bytes for the requested format (pptx/html/
-    pdf) and return them with their MIME type. html renders via marp
+    pdf) and return them with their MIME type. Before any format branch,
+    one best-effort batch fit measurement backs the authoring phase's
+    per-slide gate: an overflowing deck fails here, non-retryably, before
+    any render work starts. For a ``nextcloud``-themed deck the instance
+    theming resolves first, because the measurement needs the same
+    branded theme CSS the renders use. html renders via marp
     directly (the render IS the gate); pdf runs the browserless HTML
     syntax gate FIRST (malformed Markdown never reaches Chromium); pptx
     runs the same gate, then builds the native editable deck in-process.
@@ -688,6 +825,10 @@ def _render_deck_file(
     theming_values: ThemingValues | None = None
     if deck_theme == THEME_NAME:
         theming_values = _resolve_theming_values(nc, task_id)
+    # the render-time fit backstop measures the deck AFTER its images
+    # materialize (image-inclusive, unlike the per-slide gate) and with
+    # the branded theme values a nextcloud deck needs
+    _reject_deck_overflow(markdown, theming_values, task_id, settings)
     # The branded-theme payload rides as a keyword argument only when a
     # branded theme is in play, so every bundled-theme render call keeps
     # its exact pre-theming shape. (Unpacked into the marp call sites:

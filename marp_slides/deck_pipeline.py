@@ -24,7 +24,10 @@ from .images import materialize_image_files
 from .marp_cli import (
     MARPRC_CONTENT,
     Runner,
+    _OverflowMeasurementError,
     marp_html_gate,
+    measure_deck_overflow,
+    measure_slide_overflow,
 )
 from .marp_cli import render_deck_html as marp_render_html
 from .marp_cli import render_deck_pdf as marp_render_pdf
@@ -39,11 +42,14 @@ __all__ = [
     "MARPRC_CONTENT",
     "DeckError",
     "ValidatedDeck",
+    "_OverflowMeasurementError",
     "build_deck_filename",
     "build_llm_prompt",
     "count_slides",
     "extract_markdown",
     "marp_html_gate",
+    "measure_deck_overflow",
+    "measure_slide_overflow",
     "render_deck_html",
     "render_deck_pdf",
     "source_markdown_filename",
