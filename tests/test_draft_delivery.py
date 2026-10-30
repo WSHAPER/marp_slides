@@ -11,7 +11,7 @@ from __future__ import annotations
 
 from types import SimpleNamespace
 
-from nc_py_api import NextcloudExceptionNotFound
+from nc_py_api import NextcloudException, NextcloudExceptionNotFound
 
 from marp_slides.deck_pipeline import build_deck_filename
 from marp_slides.draft_delivery import (
@@ -478,3 +478,40 @@ def test_delivery_filename_sanitization_is_identity_for_deck_names():
     assert _sanitize_filename("deck") == "deck"  # no extension: no mangling
     assert _sanitize_filename("...") == ""
     assert _sanitize_filename("") == ""
+
+
+def test_ai_tag_conflict_on_retag_is_idempotent_success(caplog):
+    """Re-delivering over an already-tagged file answers 409 Conflict
+    (the tag relation exists): that is success, not a warning - the
+    observed re-run sprayed a traceback per file (task 923)."""
+    from marp_slides.draft_delivery import (
+        _TAG_ALREADY_ASSIGNED_STATUS,
+        _tag_ai_generated,
+    )
+
+    class Tag:
+        tag_id = 1
+
+    class Files:
+        def tag_by_name(self, name):
+            return Tag()
+
+        def assign_tag(self, file_id, tag_id):
+            raise NextcloudException(
+                status_code=_TAG_ALREADY_ASSIGNED_STATUS,
+                reason="Conflict",
+            )
+
+    class NC:
+        files = Files()
+
+    import logging as _logging
+
+    with caplog.at_level(_logging.DEBUG, logger="marp_slides.draft_delivery"):
+        _tag_ai_generated(NC(), "re-run deck.md", 1478)  # type: ignore[arg-type]
+    assert not any("AI tag not applied" in r.message for r in caplog.records), (
+        "409 on re-tag must not warn"
+    )
+    assert any("already present" in r.message for r in caplog.records), (
+        "409 on re-tag logs the idempotent debug line"
+    )

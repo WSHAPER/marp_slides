@@ -59,11 +59,15 @@ import logging
 import re
 from dataclasses import replace
 
-from nc_py_api import NextcloudApp, NextcloudExceptionNotFound
+from nc_py_api import NextcloudApp, NextcloudException, NextcloudExceptionNotFound
 
 from .draft_store import SLIDE_DONE, DeckDraft
 from .outline import assemble_deck, parse_outline
 from .settings import MARKDOWN_MIME_TYPE
+
+#: DAV systemtag answer when the tag relation already exists (assigning
+#: an already-assigned tag): the idempotent re-tag success case.
+_TAG_ALREADY_ASSIGNED_STATUS = 409
 
 LOGGER = logging.getLogger("marp_slides.draft_delivery")
 
@@ -358,16 +362,27 @@ def _tag_ai_generated(nc: NextcloudApp, subject: str, file_id: int) -> None:
     """Apply the AI system tag to a delivered file, best-effort: the
     tag is looked up and created when missing exactly like the
     assistant's SystemTagService does, then assigned over the same
-    app-context DAV session as the upload. Any problem (API missing,
-    forbidden, transient) is logged and skipped; tagging never fails the
-    delivery."""
+    app-context DAV session as the upload. Re-delivering over an
+    already-tagged file answers 409 Conflict (the relation exists), so
+    that is idempotent SUCCESS, not a problem. Any other problem (API
+    missing, forbidden, transient) is logged and skipped; tagging never
+    fails the delivery."""
     try:
         try:
             tag = nc.files.tag_by_name(AI_TAG_NAME)
         except NextcloudExceptionNotFound:
             nc.files.create_tag(AI_TAG_NAME)
             tag = nc.files.tag_by_name(AI_TAG_NAME)
-        nc.files.assign_tag(file_id, tag.tag_id)
+        try:
+            nc.files.assign_tag(file_id, tag.tag_id)
+        except NextcloudException as exc:
+            if getattr(exc, "status_code", None) != _TAG_ALREADY_ASSIGNED_STATUS:
+                raise
+            LOGGER.debug(
+                "AI tag already present on %s (file id %s); nothing to do",
+                subject,
+                file_id,
+            )
     except Exception:
         LOGGER.warning(
             "AI tag not applied to the delivered file %s; tagging is "
