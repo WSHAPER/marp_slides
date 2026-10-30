@@ -62,9 +62,13 @@ DEFAULT_LLM_TIMEOUT_S = 300
 #: Total cap across every inner-LLM round of the two-phase pipeline
 #: (the outline plus each slide, first attempts and retries alike).
 #: Measured on a local qwen3.8-9b: ~70 s for the outline plus 40-70 s
-#: per slide, so an 8-slide deck lands near 500 s and the old 480 s cap
-#: cut off the final slide; 900 s keeps headroom for retries.
-DEFAULT_TOTAL_LLM_TIMEOUT_S = 900
+#: per slide. A hosted research/shared-quota provider (OpenRouter-class)
+#: runs 2-6x slower per round with occasional multi-minute stalls, and
+#: the 900 s cap calibrated on the local model killed benign 6-8 slide
+#: decks mid-authoring (measured live: 6 of 8 benign decks); 1800 s
+#: keeps the local case comfortable and lets hosted providers finish
+#: with retry headroom.
+DEFAULT_TOTAL_LLM_TIMEOUT_S = 1800
 DEFAULT_MAX_PROMPT_CHARS = 8192
 DEFAULT_MAX_DECK_BYTES = 1024 * 1024
 DEFAULT_MAX_SLIDES = 60

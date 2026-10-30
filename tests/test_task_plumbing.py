@@ -1631,16 +1631,17 @@ def test_invalid_images_slot_fails_before_any_llm_round(monkeypatch, settings) -
 
 
 def test_total_llm_cap_across_all_calls(monkeypatch, settings, caplog) -> None:
-    """The 900 s cap spans EVERY LLM call (outline + slides): with the
-    budget already burnt by the outline round, the first slide round is
-    refused with the actionable timeout error naming the knob."""
+    """The total cap (1800 s by default) spans EVERY LLM call (outline +
+    slides): with the budget already burnt by the outline round, the
+    first slide round is refused with the actionable timeout error
+    naming the knob."""
     clock = {"now": 0.0}
 
     def fake_monotonic() -> float:
         return clock["now"]
 
     def slow_outline(nc_, task_type, task_input, **kwargs):
-        clock["now"] += 901.0  # the outline round consumed the whole cap
+        clock["now"] += 1801.0  # the outline round consumed the whole cap
         return {"output": OUTLINE_JSON}
 
     monkeypatch.setattr(task_worker, "monotonic", fake_monotonic)
@@ -1652,7 +1653,7 @@ def test_total_llm_cap_across_all_calls(monkeypatch, settings, caplog) -> None:
     assert (
         result["output"] is not None or result["user_facing_error_message"] is not None
     )
-    assert "total time cap of 900 seconds" in result["user_facing_error_message"]
+    assert "total time cap of 1800 seconds" in result["user_facing_error_message"]
     assert "MARP_SLIDES_TOTAL_LLM_TIMEOUT" in result["user_facing_error_message"]
 
 
@@ -1781,7 +1782,75 @@ def test_stalled_nested_round_is_rescheduled_once(monkeypatch) -> None:
     nc, api = make_fake_nc()
     task_worker.process_task(nc, TASK, Settings())
     assert api.results[0]["output"] == SUCCESS_OUTPUT
-    assert len(calls) == 4  # the stall round + outline + 3 slide rounds
+    assert len(calls) == 4  # the successful rounds: outline + 3 slides
+    # (the stalled round raised before reaching the recording fake)
+
+
+def test_double_stalled_nested_round_survives(monkeypatch) -> None:
+    """Two consecutive stalls of the same inner round (observed live on a
+    hosted OpenRouter-class provider: 3 of 8 benign decks died exactly
+    here, after the single reschedule also stalled) still get fresh task
+    ids; the failure surfaces only after the third consecutive stall."""
+    stream, calls = deck_scheduler()
+    stalls = {"left": 2}
+
+    def fake(nc, task_type, task_input, **kwargs):
+        if stalls["left"] > 0:
+            stalls["left"] -= 1
+            raise NestedTaskError(
+                "The internal core:text2text task did not finish within 300 seconds."
+            )
+        return stream(nc, task_type, task_input, **kwargs)
+
+    monkeypatch.setattr(task_worker, "schedule_and_wait", fake)
+    nc, api = make_fake_nc()
+    task_worker.process_task(nc, TASK, Settings())
+    assert api.results[0]["output"] == SUCCESS_OUTPUT
+    assert len(calls) == 4  # the successful rounds: outline + 3 slides
+    # (the two stalled rounds raised before reaching the recording fake)
+
+
+def test_triple_stall_surfaces_the_nested_failure(monkeypatch) -> None:
+    """Three consecutive stalls exhaust the reschedule budget: the nested
+    failure surfaces with its actionable message instead of looping."""
+    calls: list[dict] = []
+
+    def fake(nc, task_type, task_input, **kwargs):
+        calls.append(task_input)
+        raise NestedTaskError(
+            "The internal core:text2text task did not finish within 300 seconds."
+        )
+
+    monkeypatch.setattr(task_worker, "schedule_and_wait", fake)
+    nc, api = make_fake_nc()
+    task_worker.process_task(nc, TASK, Settings())
+    (result,) = api.results
+    assert result["output"] is None
+    assert "did not finish within 300 seconds" in result["user_facing_error_message"]
+    assert len(calls) == 3  # the round + both reschedules, then surface
+
+
+def test_max_slides_input_binds_the_outline_plan(monkeypatch) -> None:
+    """The optional max_slides task input must actually bind: the outline
+    prompt asks for 'about N slides' (before, the validated value was
+    discarded and every deck planned up to the 8-slide default - decks
+    25 percent longer than requested, on a slow provider long enough to
+    hit the total time cap)."""
+    prompts: list[str] = []
+    stream, _calls = deck_scheduler()
+
+    def fake(nc, task_type, task_input, **kwargs):
+        prompts.append(task_input["input"])
+        return stream(nc, task_type, task_input, **kwargs)
+
+    monkeypatch.setattr(task_worker, "schedule_and_wait", fake)
+    nc, api = make_fake_nc()
+    task_worker.process_task(
+        nc, dict(TASK, input={"prompt": "x", "max_slides": 6}), Settings()
+    )
+    assert api.results[0]["output"] == SUCCESS_OUTPUT
+    outline_prompt = prompts[0]
+    assert "Target deck length: about 6 slides" in outline_prompt
 
 
 def test_model_side_nested_failure_is_not_rescheduled(monkeypatch) -> None:

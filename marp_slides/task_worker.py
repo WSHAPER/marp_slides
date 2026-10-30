@@ -205,6 +205,15 @@ def _log_deck_failure(
     )
 
 
+#: How many times a stalled inner round (claimed by the executor but
+#: never progressing until the round timeout) is rescheduled on a fresh
+#: task id before the failure surfaces. Measured on a hosted
+#: OpenRouter-class provider: single stalls are frequent transient
+#: executor state, and surfacing the failure after the SECOND consecutive
+#: stall killed 3 of 8 benign decks whose other rounds were healthy.
+_STALL_RESCHEDULE_LIMIT = 2
+
+
 def _schedule_llm_round(
     nc: NextcloudApp, llm_input: str, deadline: float, settings: Settings
 ) -> str:
@@ -212,19 +221,27 @@ def _schedule_llm_round(
 
     A round whose nested task stalls - claimed by the executor but never
     progressing (observed live: a forever-RUNNING inner task at progress
-    0 until the round timeout) - is rescheduled ONCE on a fresh task id:
-    the stall is transient executor state, not a property of the prompt,
-    and failing the whole deck for it wastes every slide already paid
-    for. Each attempt gets only the remaining shared-budget time."""
-    try:
-        return _schedule_llm_round_once(nc, llm_input, deadline, settings)
-    except NestedTaskError as exc:
-        if "did not finish within" not in str(exc):
-            raise
-        LOGGER.warning(
-            "nested LLM round stalled (%s); rescheduling once on a fresh task", exc
-        )
-    return _schedule_llm_round_once(nc, llm_input, deadline, settings)
+    0 until the round timeout) - is rescheduled on a fresh task id, up to
+    ``_STALL_RESCHEDULE_LIMIT`` times: the stall is transient executor
+    state, not a property of the prompt, and failing the whole deck for
+    it wastes every slide already paid for. Each attempt gets only the
+    remaining shared-budget time."""
+    reschedules_left = _STALL_RESCHEDULE_LIMIT
+    while True:
+        try:
+            return _schedule_llm_round_once(nc, llm_input, deadline, settings)
+        except NestedTaskError as exc:
+            if "did not finish within" not in str(exc):
+                raise
+            if reschedules_left <= 0:
+                raise
+            reschedules_left -= 1
+            LOGGER.warning(
+                "nested LLM round stalled (%s); rescheduling on a fresh task "
+                "(%d reschedule(s) left)",
+                exc,
+                reschedules_left,
+            )
 
 
 def _schedule_llm_round_once(
@@ -1074,10 +1091,10 @@ def _generate_deck(
         task_input.get("input", task_input.get("prompt")), settings.max_prompt_chars
     )
     image_file_ids = validate_images_slot(task_input.get("images"))
-    _validate_max_slides(task_input.get("max_slides"), settings)
+    max_slides = _validate_max_slides(task_input.get("max_slides"), settings)
 
     validated, markdown = _author_validated_deck(
-        nc, prompt, theme, settings, task_id, image_file_ids
+        nc, prompt, theme, settings, task_id, image_file_ids, max_slides=max_slides
     )
     # "all" expands to every format; each gets its own file and upload.
     # EVERY render and upload happens BEFORE the single result report:
