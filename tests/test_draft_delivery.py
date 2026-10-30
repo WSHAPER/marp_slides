@@ -13,13 +13,22 @@ from types import SimpleNamespace
 
 from nc_py_api import NextcloudExceptionNotFound
 
+from marp_slides.deck_pipeline import build_deck_filename
 from marp_slides.draft_delivery import (
     AI_TAG_NAME,
     _folder_components,
+    _sanitize_filename,
     _sanitize_stem,
+    deliver_deck_files,
     deliver_draft,
 )
 from marp_slides.draft_store import SLIDE_DONE, SLIDE_FAILED, DeckDraft, SlideDraft
+from marp_slides.settings import (
+    HTML_MIME_TYPE,
+    MARKDOWN_MIME_TYPE,
+    PDF_MIME_TYPE,
+    PPTX_MIME_TYPE,
+)
 
 DRAFT_ID = "abc123def456"
 FOLDER = "Marp Slides drafts"
@@ -99,9 +108,12 @@ def make_draft(*, slides: dict[int, SlideDraft] | None = None) -> DeckDraft:
 
 
 class FakeFilesAPI:
-    """The files-API surface deliver_draft touches: makedirs, upload and
-    the systemtags endpoints. upload() models DAV PUT semantics: the
-    newest write of a path wins in place, nothing is deleted first."""
+    """The files-API surface the delivery functions touch: makedirs,
+    upload and the systemtags endpoints. upload() models DAV PUT
+    semantics: the newest write of a path wins in place, nothing is
+    deleted first. Per-call upload failures are injectable through
+    ``fail_uploads_at`` (1-based call numbers) for partial-failure
+    tests; ``fail_upload`` fails every call."""
 
     def __init__(self) -> None:
         self.makedirs_calls: list[tuple[str, bool]] = []
@@ -113,6 +125,8 @@ class FakeFilesAPI:
         self.assigned_tags: list[tuple[int, int]] = []
         self.fail_makedirs: Exception | None = None
         self.fail_upload: Exception | None = None
+        self.fail_uploads_at: set[int] = set()
+        self.upload_calls = 0
         self.fail_assign_tag: Exception | None = None
 
     def makedirs(self, path, exist_ok=False):
@@ -121,8 +135,11 @@ class FakeFilesAPI:
             raise self.fail_makedirs
 
     def upload(self, path, content):
+        self.upload_calls += 1
         if self.fail_upload is not None:
             raise self.fail_upload
+        if self.upload_calls in self.fail_uploads_at:
+            raise RuntimeError(f"injected upload failure at call {self.upload_calls}")
         self.files[path] = content
         file_id = 1000 + len(self.files)
         self.file_ids[path] = file_id
@@ -312,3 +329,152 @@ def test_ai_tag_failure_is_skipped_delivery_stands(caplog):
     assert files.assigned_tags == []
     assert set(files.file_ids) == {f"{FOLDER}/Quarterly-Review.draft.md"}
     assert "AI tag not applied" in caplog.text
+
+
+# --- deliver_deck_files: the generalized Files delivery ----------------------
+
+
+#: The success-path payload shape: every rendered format of a deck plus
+#: the source markdown, exactly as the task worker collects them (the
+#: appdata names themselves, per-format bytes, per-format MIME types).
+DECK_FILES = [
+    ("Quarterly-Review.pptx", b"PK\x03\x04editable", PPTX_MIME_TYPE),
+    ("Quarterly-Review.html", b"<html>standalone</html>", HTML_MIME_TYPE),
+    ("Quarterly-Review.pdf", b"%PDF-1.7 standalone", PDF_MIME_TYPE),
+    (
+        "Quarterly-Review.md",
+        b"---\nmarp: true\n---\n\n# Quarterly Review\n",
+        MARKDOWN_MIME_TYPE,
+    ),
+]
+
+
+def test_deliver_deck_files_writes_every_file_and_opens_folder_once(caplog):
+    caplog.set_level("INFO", logger="marp_slides.draft_delivery")
+    nc, files = make_nc()
+    written = deliver_deck_files(nc, "alice", FOLDER, DECK_FILES)
+    assert written == [name for name, _b, _m in DECK_FILES]
+    assert nc.impersonated == ["alice"]  # one impersonation, not one per file
+    assert files.makedirs_calls == [(FOLDER, True)]  # the folder opens ONCE
+    for name, content, _mime in DECK_FILES:
+        assert files.files[f"{FOLDER}/{name}"] == content
+    # every written file is AI-tagged (the tag object itself is created once)
+    assert files.created_tags == [AI_TAG_NAME]
+    assert files.assigned_tags == [
+        (files.file_ids[f"{FOLDER}/{name}"], files.tags[AI_TAG_NAME])
+        for name, _b, _m in DECK_FILES
+    ]
+    assert files.deleted == []
+    assert "delivered" in caplog.text
+
+
+def test_deliver_deck_files_partial_failure_returns_partial_names(caplog):
+    caplog.set_level("WARNING", logger="marp_slides.draft_delivery")
+    nc, files = make_nc()
+    files.fail_uploads_at = {2}  # the html write fails; the rest still run
+    written = deliver_deck_files(nc, "alice", FOLDER, DECK_FILES)
+    assert written == [
+        "Quarterly-Review.pptx",
+        "Quarterly-Review.pdf",
+        "Quarterly-Review.md",
+    ]
+    assert set(files.files) == {
+        f"{FOLDER}/Quarterly-Review.pptx",
+        f"{FOLDER}/Quarterly-Review.pdf",
+        f"{FOLDER}/Quarterly-Review.md",
+    }
+    assert len(files.assigned_tags) == 3  # only the written ones
+    assert files.makedirs_calls == [(FOLDER, True)]  # still opened just once
+    assert "could not be delivered" in caplog.text
+
+
+def test_deliver_deck_files_full_failure_returns_empty_and_logs(caplog):
+    caplog.set_level("WARNING", logger="marp_slides.draft_delivery")
+    nc, files = make_nc()
+    files.fail_upload = RuntimeError("507 Quota Exceeded")
+    assert deliver_deck_files(nc, "alice", FOLDER, DECK_FILES) == []
+    assert files.files == {}
+    assert files.assigned_tags == []
+    # the folder opened (that part worked); every write failed after it
+    assert files.makedirs_calls == [(FOLDER, True)]
+    assert "could not be delivered" in caplog.text
+
+
+def test_deliver_deck_files_fail_soft_when_folder_open_fails(caplog):
+    caplog.set_level("WARNING", logger="marp_slides.draft_delivery")
+    nc, files = make_nc()
+    files.fail_makedirs = RuntimeError("403 Forbidden")
+    assert deliver_deck_files(nc, "alice", FOLDER, DECK_FILES) == []
+    assert nc.impersonated == ["alice"]  # impersonation happened first
+    assert files.files == {}
+    assert "could not be delivered" in caplog.text
+
+
+def test_deliver_deck_files_rejections_matrix(caplog):
+    caplog.set_level("WARNING", logger="marp_slides.draft_delivery")
+    # unsafe folder (a '..' component): nothing is opened or written
+    nc, files = make_nc()
+    assert deliver_deck_files(nc, "alice", "../../etc", DECK_FILES) == []
+    assert nc.impersonated == []
+    assert files.makedirs_calls == []
+    assert "unsafe" in caplog.text
+    # empty folder
+    assert deliver_deck_files(make_nc()[0], "alice", " / ", DECK_FILES) == []
+    assert "no deliveries folder" in caplog.text
+    # no user at all
+    nc2, files2 = make_nc()
+    assert deliver_deck_files(nc2, "  ", FOLDER, DECK_FILES) == []
+    assert nc2.impersonated == []
+    assert files2.makedirs_calls == []
+    assert "no user" in caplog.text
+
+
+def test_deliver_deck_files_skips_unsanitizable_names(caplog):
+    caplog.set_level("WARNING", logger="marp_slides.draft_delivery")
+    nc, files = make_nc()
+    written = deliver_deck_files(
+        nc, "alice", FOLDER, [("..", b"x", "text/plain"), *DECK_FILES[:1]]
+    )
+    assert written == ["Quarterly-Review.pptx"]
+    assert set(files.files) == {f"{FOLDER}/Quarterly-Review.pptx"}
+    assert "sanitizes to nothing" in caplog.text
+
+
+def test_deliver_deck_files_overwrites_in_place_without_suffixing():
+    nc, files = make_nc()
+    first = deliver_deck_files(nc, "alice", FOLDER, DECK_FILES)
+    assert first == [name for name, _b, _m in DECK_FILES]
+    # a same-stem re-run writes the SAME target names: newest bytes win,
+    # nothing is deleted, no suffix is ever appended (server versioning
+    # keeps the history)
+    rerendered = [("Quarterly-Review.pptx", b"PK\x03\x04edited", PPTX_MIME_TYPE)]
+    assert deliver_deck_files(nc, "alice", FOLDER, rerendered) == [
+        "Quarterly-Review.pptx"
+    ]
+    assert len(files.files) == len(DECK_FILES)
+    assert files.files[f"{FOLDER}/Quarterly-Review.pptx"] == b"PK\x03\x04edited"
+    assert files.deleted == []
+
+
+def test_deliver_deck_files_tag_failure_keeps_every_write(caplog):
+    caplog.set_level("WARNING", logger="marp_slides.draft_delivery")
+    nc, files = make_nc()
+    files.tags[AI_TAG_NAME] = 7  # the tag pre-exists: no create attempt
+    files.fail_assign_tag = RuntimeError("405")
+    written = deliver_deck_files(nc, "alice", FOLDER, DECK_FILES)
+    assert written == [name for name, _b, _m in DECK_FILES]  # writes stand
+    assert len(files.files) == len(DECK_FILES)
+    assert files.created_tags == []
+    assert files.assigned_tags == []
+    assert "AI tag not applied" in caplog.text
+
+
+def test_delivery_filename_sanitization_is_identity_for_deck_names():
+    for fmt in ("pptx", "html", "pdf"):
+        built = build_deck_filename({"title": "Quarterly Review"}, None, fmt)
+        assert _sanitize_filename(built) == built == f"Quarterly-Review.{fmt}"
+    assert _sanitize_filename("My Deck v2.pptx") == "My-Deck-v2.pptx"
+    assert _sanitize_filename("a/b.pptx") == "a-b.pptx"  # traversal folded
+    assert _sanitize_filename("deck") == "deck"  # no extension: no mangling
+    assert _sanitize_filename("...") == ""
+    assert _sanitize_filename("") == ""

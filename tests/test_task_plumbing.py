@@ -44,6 +44,7 @@ from marp_slides.settings import (
     Settings,
 )
 from marp_slides.theming import THEME_NAME, THEMING_DEFAULTS, ThemingValues
+from tests.conftest import VALID_DECK
 
 TASK = {
     "id": 5,
@@ -354,6 +355,164 @@ def test_all_formats_reports_every_deck_file(monkeypatch, settings) -> None:
     ]
     # exactly ONE result report, after every render (no zombie re-pings)
     assert len(api.results) == 1
+
+
+# --- Files delivery of the deliverables (success path) -----------------------
+
+
+def record_delivery(recordings: list[dict], api: FakeTaskProcessingAPI):
+    """A fake deliver_deck_files seam that snapshots its call together
+    with the task-processing state at call time (upload/result counts),
+    so tests can pin the delivery's ordering against the report."""
+
+    def fake_deliver(_nc, user_id, folder, files):
+        recordings.append(
+            {
+                "user_id": user_id,
+                "folder": folder,
+                "files": list(files),
+                "uploads_so_far": len(api.uploads),
+                "results_so_far": len(api.results),
+            }
+        )
+        return [name for name, _b, _m in files]
+
+    return fake_deliver
+
+
+def test_files_delivery_sends_rendered_files_and_source_before_report(
+    monkeypatch, settings
+) -> None:
+    """The success path delivers every generated format PLUS the source
+    markdown into the owner's Files under the deployment's default
+    folder, with exactly the names and bytes the appdata uploads use;
+    the delivery sits after the last deck upload and BEFORE the source's
+    own appdata upload and the result report, with no progress ping
+    after it."""
+    fake, _calls = deck_scheduler()
+    monkeypatch.setattr(task_worker, "schedule_and_wait", fake)
+    recordings: list[dict] = []
+    nc, api = make_fake_nc()
+    monkeypatch.setattr(
+        task_worker, "deliver_deck_files", record_delivery(recordings, api)
+    )
+    task_worker.process_task(
+        nc,
+        dict(TASK, input={"prompt": "a deck about bees", "output_format": "all"}),
+        settings,
+    )
+    (record,) = recordings
+    assert record["user_id"] == "alice"  # threaded from process_task
+    assert record["folder"] == "Marp Slides"  # the deployment default, on
+    assert record["files"] == [
+        ("Quarterly-Review.pptx", b"PK-editable", PPTX_MIME_TYPE),
+        ("Quarterly-Review.html", b"<html>standalone</html>", HTML_MIME_TYPE),
+        ("Quarterly-Review.pdf", b"%PDF-1.7 standalone", PDF_MIME_TYPE),
+        ("Quarterly-Review.md", ASSEMBLED.encode("utf-8"), MARKDOWN_MIME_TYPE),
+    ]
+    # ordering: after every deck appdata upload, BEFORE the source appdata
+    # upload (which happens inside _report_deck_result) and the report
+    assert record["uploads_so_far"] == 3
+    assert record["results_so_far"] == 0
+    # the task completed normally: one report, terminal progress 100
+    (result,) = api.results
+    assert result["output"] == {"slide_decks": [42, 43, 44], "slide_deck_source": 45}
+    assert api.progress[-1] == 100.0
+    assert len(api.results) == 1
+
+
+def test_files_delivery_skipped_when_deliveries_folder_unset(
+    monkeypatch, settings
+) -> None:
+    """An empty deliveries_folder disables the Files delivery; the task
+    itself is unaffected."""
+    fake, _calls = deck_scheduler()
+    monkeypatch.setattr(task_worker, "schedule_and_wait", fake)
+    calls: list[tuple] = []
+    monkeypatch.setattr(
+        task_worker,
+        "deliver_deck_files",
+        lambda *args, **kwargs: calls.append(args) or [],
+    )
+    nc, api = make_fake_nc()
+    task_worker.process_task(nc, TASK, replace(settings, deliveries_folder=""))
+    assert calls == []
+    (result,) = api.results
+    assert result["output"] == SUCCESS_OUTPUT
+
+
+def test_files_delivery_skipped_without_task_owner(monkeypatch, settings) -> None:
+    """A task with no userId has no impersonation target: the delivery is
+    skipped and the task still succeeds."""
+    fake, _calls = deck_scheduler()
+    monkeypatch.setattr(task_worker, "schedule_and_wait", fake)
+    calls: list[tuple] = []
+    monkeypatch.setattr(
+        task_worker,
+        "deliver_deck_files",
+        lambda *args, **kwargs: calls.append(args) or [],
+    )
+    nc, api = make_fake_nc()
+    task = {key: value for key, value in TASK.items() if key != "userId"}
+    task_worker.process_task(nc, task, settings)
+    assert calls == []
+    (result,) = api.results
+    assert result["output"] == SUCCESS_OUTPUT
+
+
+def test_files_delivery_failure_never_fails_the_task(monkeypatch, settings) -> None:
+    """The delivery is fail-soft even when it explodes outright: the task
+    still reports its SUCCESSFUL appdata outputs, exactly once, with the
+    terminal 100% progress intact."""
+    fake, _calls = deck_scheduler()
+    monkeypatch.setattr(task_worker, "schedule_and_wait", fake)
+
+    def boom(*_args, **_kwargs):
+        raise RuntimeError("DAV down")
+
+    monkeypatch.setattr(task_worker, "deliver_deck_files", boom)
+    nc, api = make_fake_nc()
+    task_worker.process_task(nc, TASK, settings)
+    (result,) = api.results
+    assert result["output"] == SUCCESS_OUTPUT
+    assert result["error_message"] is None
+    assert api.progress[-1] == 100.0
+    assert len(api.results) == 1
+
+
+def test_re_render_path_delivers_files_too(monkeypatch, settings) -> None:
+    """The re-render task type collects its rendered bytes the same way
+    and delivers them plus the submitted (stripped) source markdown
+    before its own result report; user_id threads on this path too."""
+    recordings: list[dict] = []
+    nc, api = make_fake_nc()
+    monkeypatch.setattr(
+        task_worker, "deliver_deck_files", record_delivery(recordings, api)
+    )
+    task_worker.process_task(
+        nc,
+        {
+            "id": 6,
+            "type": "marp_slides:re_render",
+            "status": "STATUS_RUNNING",
+            "userId": "alice",
+            "appId": "marp_slides",
+            "input": {"markdown": VALID_DECK, "output_format": "pptx"},
+        },
+        settings,
+    )
+    (record,) = recordings
+    assert record["user_id"] == "alice"
+    assert record["folder"] == "Marp Slides"
+    assert record["files"] == [
+        ("Quarterly-Review.pptx", b"PK-editable", PPTX_MIME_TYPE),
+        ("Quarterly-Review.md", VALID_DECK.strip().encode("utf-8"), MARKDOWN_MIME_TYPE),
+    ]
+    # after the deck upload, before the source upload and the report
+    assert record["uploads_so_far"] == 1
+    assert record["results_so_far"] == 0
+    (result,) = api.results
+    assert result["output"] == SUCCESS_OUTPUT
 
 
 def test_success_uses_one_llm_call_per_slide(monkeypatch, settings) -> None:

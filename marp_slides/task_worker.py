@@ -50,7 +50,12 @@ that task, falling back to the stock Nextcloud defaults when the
 capabilities are unavailable — a theming issue never fails a task.
 The final validated Marp Markdown is
 retained as ``slide_deck_source`` so a later turn can make small edits without
-a full recompute. Every failure path ends in ``report_result`` with an actionable
+a full recompute. On success every generated deck file plus that source
+markdown is also delivered into the task owner's Files under
+``MARP_SLIDES_DELIVERIES_FOLDER`` (default "Marp Slides", empty disables):
+fail-soft, before the result is reported and with no progress ping around
+it (the zombie constraint applies to the delivery too), while the appdata
+task outputs stay unchanged. Every failure path ends in ``report_result`` with an actionable
 ``user_facing_error_message``; deck failures additionally log a
 240-character excerpt of the offending slide or deck markdown (WARNING,
 single line) so they are diagnosable from docker logs, unless
@@ -117,6 +122,7 @@ from .deck_pipeline import (
     validate_prompt,
     validate_theme,
 )
+from .draft_delivery import deliver_deck_files
 from .draft_store import (
     SLIDE_DONE,
     SLIDE_FAILED,
@@ -1066,6 +1072,7 @@ def _re_render_deck(
     task_input: Mapping[str, Any],
     settings: Settings,
     task_id: int,
+    user_id: str | None = None,
 ) -> str:
     """Deterministic re-render of an edited deck source: the SAME strict
     validation (same rules, same error messages) and the SAME render phase
@@ -1076,7 +1083,9 @@ def _re_render_deck(
     authoring, no retry loop, no outline generation: a deck that fails
     validation fails the task with the validator's actionable message for
     the caller (human or chat LLM) to fix in the source. Returns the
-    submitted markdown (the caller's failure-logging excerpt source)."""
+    submitted markdown (the caller's failure-logging excerpt source).
+    ``user_id`` (the task owner, threaded from process_task) gates the
+    fail-soft Files delivery of the rendered files."""
     output_format = validate_output_format(task_input.get("output_format"))
     image_file_ids = _re_render_file_ids(task_input)
     markdown = _input_deck_markdown(task_input.get("markdown"))
@@ -1097,6 +1106,7 @@ def _re_render_deck(
         list(OUTPUT_FORMAT_VALUES[:3]) if output_format == "all" else [output_format]
     )
     deck_files: list[tuple[str, int]] = []
+    rendered: list[tuple[str, bytes, str]] = []
     for fmt in formats:
         file_bytes, mime_type = _render_deck_file(
             nc, task_id, validated, markdown, fmt, image_file_ids, settings
@@ -1106,6 +1116,12 @@ def _re_render_deck(
         filename = build_deck_filename(validated.frontmatter, None, fmt)
         file_id = _upload_deck_file(nc, task_id, filename, file_bytes, mime_type)
         deck_files.append((filename, file_id))
+        # the per-format bytes ride along for the owner's Files delivery
+        # (they die with this loop otherwise)
+        rendered.append((filename, file_bytes, mime_type))
+    # fail-soft Files delivery, never pinged around, always before the
+    # result report (the zombie constraint applies to it too)
+    _deliver_deck_files(nc, user_id, settings, task_id, rendered, markdown)
     _report_deck_result(nc, task_id, deck_files, markdown)
     return markdown
 
@@ -1287,6 +1303,73 @@ def _upload_deck_file(
         task_id, (filename, file_bytes, mime_type)
     )
     return file_id
+
+
+def _deliver_deck_files(
+    nc: NextcloudApp,
+    user_id: str | None,
+    settings: Settings,
+    task_id: int,
+    rendered: list[tuple[str, bytes, str]],
+    markdown: str,
+) -> None:
+    """Fail-soft delivery of the generated deck files plus the deck's
+    Markdown source into the task owner's Files (the deployment's
+    ``deliveries_folder``, on by default: the owner keeps editable
+    artifacts next to the appdata task outputs, which stay unchanged).
+    ``rendered`` is every generated format's ``(filename, bytes, mime)``
+    in generation order, collected as the renders happen (the bytes are
+    loop-local otherwise); the source entry is precomputed here exactly
+    the way ``_report_deck_result`` names its own source upload
+    (``<stem>.md`` off the first rendered file, same bytes). MUST run
+    BEFORE :func:`_report_deck_result` and NEVER ping progress around
+    itself: a progress ping after the result report would resurrect the
+    finished task as a RUNNING zombie. Delivery problems only log; they
+    never affect the task's outcome or its reported outputs."""
+    if not settings.deliveries_folder:
+        return
+    if not user_id:
+        LOGGER.debug(
+            "Task %s: no task owner; skipping the Files delivery of the deck",
+            task_id,
+        )
+        return
+    files = [
+        *rendered,
+        (
+            source_markdown_filename(rendered[0][0]),
+            markdown.encode("utf-8"),
+            MARKDOWN_MIME_TYPE,
+        ),
+    ]
+    try:
+        written = deliver_deck_files(nc, user_id, settings.deliveries_folder, files)
+    except Exception as exc:  # noqa: BLE001 - fail-soft by contract: delivery must never affect the task
+        LOGGER.warning(
+            "Task %s: delivery of the deck files to the Files folder %r of "
+            "user %s failed (%s); the task result is unaffected",
+            task_id,
+            settings.deliveries_folder,
+            user_id,
+            exc,
+        )
+        return
+    if written:
+        LOGGER.info(
+            "Task %s: delivered %s to the Files folder %r of user %s",
+            task_id,
+            written,
+            settings.deliveries_folder,
+            user_id,
+        )
+    else:
+        LOGGER.warning(
+            "Task %s: no deck files could be delivered to the Files folder "
+            "%r of user %s; the task result is unaffected",
+            task_id,
+            settings.deliveries_folder,
+            user_id,
+        )
 
 
 def _report_deck_result(
@@ -1490,9 +1573,11 @@ def process_task(nc: NextcloudApp, task: Mapping[str, Any], settings: Settings) 
         nc.set_user(user_id)
     try:
         if re_render:
-            markdown = _re_render_deck(nc, task_input, settings, task_id)
+            markdown = _re_render_deck(nc, task_input, settings, task_id, user_id)
         else:
-            markdown = _generate_deck(nc, task_input, settings, task_id, drafts)
+            markdown = _generate_deck(
+                nc, task_input, settings, task_id, drafts, user_id
+            )
     except DeckError as exc:
         _log_deck_failure(
             task_id,
@@ -1543,6 +1628,7 @@ def _generate_deck(
     settings: Settings,
     task_id: int,
     drafts: _DraftSession | None = None,
+    user_id: str | None = None,
 ) -> str:
     """The authoring pipeline (the ``marp_slides:slide_deck_generation``
     task): validate the inputs, author the deck via the inner LLM, then
@@ -1552,7 +1638,9 @@ def _generate_deck(
     rebuilt and reused (no outline LLM round), the checkpoint's image ids
     ride along ONLY when the task provides none (provided images win and
     bounds-check as usual), and the per-slide loop reuses done slides
-    verbatim while regenerating missing or failed ones."""
+    verbatim while regenerating missing or failed ones. ``user_id`` (the
+    task owner, threaded from process_task) gates the fail-soft Files
+    delivery of the generated files."""
     output_format = validate_output_format(task_input.get("output_format"))
     theme = validate_theme(task_input.get("theme"))
     # The required input slot is 'input'; 'prompt' is read as a legacy
@@ -1600,10 +1688,13 @@ def _generate_deck(
     # EVERY render and upload happens BEFORE the single result report:
     # render phases ping progress, and a progress ping after
     # report_result resurrects the task as a RUNNING zombie (task 737).
+    # The fail-soft Files delivery (no pings of its own) sits between the
+    # uploads and the report for the same reason.
     formats = (
         list(OUTPUT_FORMAT_VALUES[:3]) if output_format == "all" else [output_format]
     )
     deck_files: list[tuple[str, int]] = []
+    rendered: list[tuple[str, bytes, str]] = []
     for fmt in formats:
         file_bytes, mime_type = _render_deck_file(
             nc, task_id, validated, markdown, fmt, image_file_ids, settings
@@ -1611,6 +1702,10 @@ def _generate_deck(
         filename = build_deck_filename(validated.frontmatter, prompt, fmt)
         file_id = _upload_deck_file(nc, task_id, filename, file_bytes, mime_type)
         deck_files.append((filename, file_id))
+        # the per-format bytes ride along for the owner's Files delivery
+        # (they die with this loop otherwise)
+        rendered.append((filename, file_bytes, mime_type))
+    _deliver_deck_files(nc, user_id, settings, task_id, rendered, markdown)
     _report_deck_result(nc, task_id, deck_files, markdown)
     return markdown
 

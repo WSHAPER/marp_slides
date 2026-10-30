@@ -1,39 +1,55 @@
-"""Deliver a deck draft checkpoint into the scheduling user's Files.
+"""Deliver deck artifacts into the scheduling user's Files.
 
-When a deck task fails (or resumes from an earlier failure), the draft
-store keeps the checkpoint on the ExApp volume, a place the task owner
-cannot browse. With ``drafts_folder`` configured, this module copies the
-checkpoint's current state into that folder of the USER'S Files as
-``<deck_stem>.draft.md``: a leading HTML comment naming the draft id and
-its resume usage, then the deck document reassembled through
-:func:`marp_slides.outline.assemble_deck` (frontmatter and footer/header
-chrome rebuilt from the checkpointed outline) with the DONE slides in
-slide order, joined with the deck separator convention. Only DONE slides
-ship: a slide whose attempts were exhausted never passed validation.
+Two delivery surfaces share one write path (app-context DAV
+impersonation, the folder created when missing, DAV PUT overwrite in
+place with Nextcloud's file versioning keeping the history, the AI
+system tag applied best-effort, fail-soft on every problem):
+
+- :func:`deliver_draft`: when a deck task fails (or resumes from an
+  earlier failure), the draft store keeps the checkpoint on the ExApp
+  volume, a place the task owner cannot browse. With ``drafts_folder``
+  configured, the checkpoint's current state is copied into that folder
+  of the USER'S Files as ``<deck_stem>.draft.md``: a leading HTML
+  comment naming the draft id and its resume usage, then the deck
+  document reassembled through :func:`marp_slides.outline.assemble_deck`
+  (frontmatter and footer/header chrome rebuilt from the checkpointed
+  outline) with the DONE slides in slide order, joined with the deck
+  separator convention. Only DONE slides ship: a slide whose attempts
+  were exhausted never passed validation.
+- :func:`deliver_deck_files`: when a deck task succeeds, every generated
+  deck file plus the deck's Markdown source is written into the
+  deployment's ``deliveries_folder`` (default ``Marp Slides``), so the
+  task owner OWNS editable artifacts next to the appdata-locked task
+  outputs (which stay unchanged). The names are the appdata file names
+  themselves (``<stem>.pptx``/``<stem>.html``/``<stem>.pdf`` and
+  ``<stem>.md``), overwritten in place on every re-run of the same deck.
 
 The write rides the app-context DAV impersonation the image downloads
 already use (``nc.set_user`` stamps every request with the
 AUTHORIZATION-APP-API header; app_api's DavPlugin resolves it to the
 impersonated user, whose quota and permissions apply). The folder is
 created when missing (``nc.files.makedirs(exist_ok=True)``) and the
-upload overwrites an existing target, so the newest draft of a stem wins
+upload overwrites an existing target, so the newest file of a stem wins
 while Nextcloud's file versioning keeps the history. The ``.md``
 extension is what makes the server store the upload as ``text/markdown``
 (the DAV upload carries no explicit content type).
 
-Fail-soft by contract: delivery runs on a task's failure path, so every
-delivery problem (unsafe stem or folder, corrupt outline, DAV error,
-quota) is logged and returns ``False``; it NEVER surfaces as a task
-failure. The AI system tag (the assistant's visible and user-assignable
-"Generated using AI" tag, created when missing) is applied best-effort
-after a successful write; when the tagging API is not reachable from
-app context the tag is skipped with a log line and the delivery stands.
+Fail-soft by contract: delivery runs beside a task's own outcome, so
+every delivery problem (unsafe stem or folder, corrupt outline, DAV
+error, quota) is logged and returned as a failed or partial delivery; it
+NEVER raises and NEVER surfaces as a task failure. The AI system tag
+(the assistant's visible and user-assignable "Generated using AI" tag,
+created when missing) is applied best-effort after a successful write;
+when the tagging API is not reachable from app context the tag is
+skipped with a log line and the delivery stands.
 
-Note for manual re-renders: the draft-id comment leads the file, so the
-``marp_slides:re_render`` task (which requires the frontmatter to start
-the document) does not accept the file as-is; strip the comment line
-first. Resume flows do not read this file: they load the checkpoint from
-the draft store via ``draft_id``.
+Note for manual re-renders: the draft-id comment leads the draft file,
+so the ``marp_slides:re_render`` task (which requires the frontmatter to
+start the document) does not accept the draft file as-is; strip the
+comment line first. Resume flows do not read the draft file: they load
+the checkpoint from the draft store via ``draft_id``. The delivered
+``<stem>.md`` source file carries no comment; it feeds the re-render
+task as-is.
 """
 
 from __future__ import annotations
@@ -117,27 +133,138 @@ def deliver_draft(
         )
         return False
     folder_path = "/".join(components)
-    target = f"{folder_path}/{stem}{DRAFT_SUFFIX}"
+    subject = f"Draft {draft.draft_id}"
     try:
-        content = _draft_document(draft)
-        nc.set_user(user_id)
-        nc.files.makedirs(folder_path, exist_ok=True)
-        node = nc.files.upload(target, content.encode("utf-8"))
+        content = _draft_document(draft).encode("utf-8")
     except Exception:
         LOGGER.exception(
-            "Draft %s could not be delivered to '%s' for user %s.",
-            draft.draft_id,
+            "%s could not be delivered: the draft document could not be assembled.",
+            subject,
+        )
+        return False
+    if not _open_delivery_folder(nc, user_id, folder_path, subject):
+        return False
+    return _write_delivered_file(
+        nc,
+        user_id,
+        folder_path,
+        f"{stem}{DRAFT_SUFFIX}",
+        content,
+        MARKDOWN_MIME_TYPE,
+        subject,
+    )
+
+
+def deliver_deck_files(
+    nc: NextcloudApp,
+    user_id: str,
+    folder: str,
+    files: list[tuple[str, bytes, str]],
+) -> list[str]:
+    """Write every ``(name, bytes, mime)`` entry of ``files`` into the
+    user's ``folder`` (relative to their Files root, created when
+    missing) and tag each written file with the AI system tag
+    best-effort. Returns the names actually written: a partial list when
+    some writes fail, an empty list when none succeed or the delivery is
+    rejected up front. Never raises.
+
+    Each name is sanitized as a delivery filename: the final extension
+    rides verbatim while the stem is reduced to the deck-filename
+    alphabet (the same sanitization ``build_deck_filename`` applies, so
+    the appdata deck names pass through byte-unchanged); an entry whose
+    stem sanitizes to nothing is skipped with a log line. ``folder``
+    sanitization and user validation mirror :func:`deliver_draft` (any
+    ``..`` component, an empty folder or no user rejects the whole
+    delivery with an empty return). Writes are independent: one failing
+    entry logs and the remaining entries are still attempted, which is
+    what makes the partial return list possible. Overwrite semantics
+    are DAV PUT in place (Nextcloud's file versioning keeps the
+    history); no suffixing.
+    """
+    written: list[str] = []
+    components = _folder_components(folder)
+    if components is None:
+        LOGGER.warning(
+            "Deck files not delivered: the configured deliveries folder %r "
+            "is unsafe (it contains a '..' component).",
+            folder,
+        )
+        return written
+    if not components:
+        LOGGER.warning("Deck files not delivered: no deliveries folder is configured.")
+        return written
+    if not user_id.strip():
+        LOGGER.warning("Deck files not delivered: no user to deliver for.")
+        return written
+    folder_path = "/".join(components)
+    if not _open_delivery_folder(nc, user_id, folder_path, "The deck files"):
+        return written
+    for name, content, mime_type in files:
+        subject = f"Deck file {name!r}"
+        filename = _sanitize_filename(name)
+        if not filename:
+            LOGGER.warning("%s not delivered: the name sanitizes to nothing.", subject)
+            continue
+        if _write_delivered_file(
+            nc, user_id, folder_path, filename, content, mime_type, subject
+        ):
+            written.append(filename)
+    return written
+
+
+def _open_delivery_folder(
+    nc: NextcloudApp, user_id: str, folder_path: str, subject: str
+) -> bool:
+    """The shared first step of both delivery surfaces: impersonate the
+    user and make sure their delivery folder exists (created once per
+    delivery, whatever the number of files). Any failure logs and
+    returns False; never raises."""
+    try:
+        nc.set_user(user_id)
+        nc.files.makedirs(folder_path, exist_ok=True)
+    except Exception:
+        LOGGER.exception(
+            "%s could not be delivered: opening the folder '%s' as user %s failed.",
+            subject,
+            folder_path,
+            user_id,
+        )
+        return False
+    return True
+
+
+def _write_delivered_file(
+    nc: NextcloudApp,
+    user_id: str,
+    folder_path: str,
+    filename: str,
+    content: bytes,
+    mime_type: str,
+    subject: str,
+) -> bool:
+    """The shared write step: upload ONE file into the already-opened
+    delivery folder (DAV PUT overwrite-in-place semantics, no explicit
+    content type: the extension is what the server detects) and tag it
+    best-effort. Any upload failure logs and returns False; never
+    raises."""
+    target = f"{folder_path}/{filename}"
+    try:
+        node = nc.files.upload(target, content)
+    except Exception:
+        LOGGER.exception(
+            "%s could not be delivered to '%s' for user %s.",
+            subject,
             target,
             user_id,
         )
         return False
-    _tag_ai_generated(nc, draft.draft_id, node.file_id)
+    _tag_ai_generated(nc, subject, node.file_id)
     LOGGER.info(
-        "Draft %s delivered to '%s' in the Files of user %s (%s).",
-        draft.draft_id,
+        "%s delivered to '%s' in the Files of user %s (%s).",
+        subject,
         target,
         user_id,
-        MARKDOWN_MIME_TYPE,
+        mime_type,
     )
     return True
 
@@ -153,6 +280,23 @@ def _sanitize_stem(deck_stem: str) -> str:
         .strip("-._")[:_MAX_STEM_CHARS]
         .rstrip("-._")
     )
+
+
+def _sanitize_filename(filename: str) -> str:
+    """A delivery filename in the deck-filename alphabet: the final
+    extension rides verbatim while the stem is sanitized exactly like a
+    deck stem (:func:`_sanitize_stem`, which also neutralizes traversal
+    inside the stem). Byte-identical to its input for every name
+    ``build_deck_filename`` produces (those stems already passed the
+    same alphabet and cap); a stem that sanitizes to nothing yields
+    ``''`` (the entry is skipped by the caller)."""
+    stem, dot, extension = filename.rpartition(".")
+    if not dot:
+        stem, extension = filename, ""
+    stem = _sanitize_stem(stem)
+    if not stem:
+        return ""
+    return f"{stem}.{extension}" if extension else stem
 
 
 def _folder_components(folder: str) -> list[str] | None:
@@ -210,8 +354,8 @@ def _draft_document(draft: DeckDraft) -> str:
     return f"{comment}\n\n{deck_markdown}"
 
 
-def _tag_ai_generated(nc: NextcloudApp, draft_id: str, file_id: int) -> None:
-    """Apply the AI system tag to the delivered draft, best-effort: the
+def _tag_ai_generated(nc: NextcloudApp, subject: str, file_id: int) -> None:
+    """Apply the AI system tag to a delivered file, best-effort: the
     tag is looked up and created when missing exactly like the
     assistant's SystemTagService does, then assigned over the same
     app-context DAV session as the upload. Any problem (API missing,
@@ -226,8 +370,8 @@ def _tag_ai_generated(nc: NextcloudApp, draft_id: str, file_id: int) -> None:
         nc.files.assign_tag(file_id, tag.tag_id)
     except Exception:
         LOGGER.warning(
-            "AI tag not applied to the delivered draft %s; tagging is "
+            "AI tag not applied to the delivered file %s; tagging is "
             "best-effort and the delivery stands.",
-            draft_id,
+            subject,
             exc_info=True,
         )
