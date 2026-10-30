@@ -8,8 +8,9 @@ system tag applied best-effort, fail-soft on every problem):
 - :func:`deliver_draft`: when a deck task fails (or resumes from an
   earlier failure), the draft store keeps the checkpoint on the ExApp
   volume, a place the task owner cannot browse. With ``drafts_folder``
-  configured, the checkpoint's current state is copied into that folder
-  of the USER'S Files as ``<deck_stem>.draft.md``: a leading HTML
+  configured, the checkpoint's current state is copied into a per-deck
+  subdirectory of that folder of the USER'S Files as
+  ``<deck_stem>/<deck_stem>.draft.md``: a leading HTML
   comment naming the draft id and its resume usage, then the deck
   document reassembled through :func:`marp_slides.outline.assemble_deck`
   (frontmatter and footer/header chrome rebuilt from the checkpointed
@@ -17,12 +18,15 @@ system tag applied best-effort, fail-soft on every problem):
   separator convention. Only DONE slides ship: a slide whose attempts
   were exhausted never passed validation.
 - :func:`deliver_deck_files`: when a deck task succeeds, every generated
-  deck file plus the deck's Markdown source is written into the
-  deployment's ``deliveries_folder`` (default ``Marp Slides``), so the
-  task owner OWNS editable artifacts next to the appdata-locked task
-  outputs (which stay unchanged). The names are the appdata file names
-  themselves (``<stem>.pptx``/``<stem>.html``/``<stem>.pdf`` and
-  ``<stem>.md``), overwritten in place on every re-run of the same deck.
+  deck file plus the deck's Markdown source is written into a per-deck
+  subdirectory of the deployment's ``deliveries_folder`` (default
+  ``Marp Slides``, so one deck's bundle lands in
+  ``Marp Slides/<deck_stem>/``), where the task owner OWNS editable
+  artifacts next to the appdata-locked task outputs (which stay
+  unchanged) and multiple decks never pool into one flat folder. The
+  names are the appdata file names themselves
+  (``<stem>.pptx``/``<stem>.html``/``<stem>.pdf`` and ``<stem>.md``),
+  overwritten in place on every re-run of the same deck.
 
 The write rides the app-context DAV impersonation the image downloads
 already use (``nc.set_user`` stamps every request with the
@@ -95,16 +99,19 @@ def deliver_draft(
     deck_stem: str,
     folder: str,
 ) -> bool:
-    """Write ``draft`` into the user's ``folder`` (relative to their Files
-    root, created when missing) as ``<deck_stem>.draft.md`` and tag it
-    with the AI system tag. Returns True on a successful write, False on
-    any failure (logged with the reason); never raises.
+    """Write ``draft`` into the per-deck subdirectory ``<deck_stem>`` of
+    the user's ``folder`` (relative to their Files root, both created
+    when missing) as ``<deck_stem>.draft.md`` and tag it with the AI
+    system tag. Returns True on a successful write, False on any failure
+    (logged with the reason); never raises.
 
     Sanitization is pinned: ``deck_stem`` is reduced to the deck-filename
     alphabet (unsafe runs become ``-``, leading/trailing ``-``/``.``/``
     ``_`` are stripped, 80 chars max), which also neutralizes traversal
-    (``../x`` sanitizes to ``x``); a stem that sanitizes to nothing
-    rejects the delivery. ``folder`` is sanitized structurally:
+    (``../x`` sanitizes to ``x``); the sanitized stem doubles as the
+    per-deck subdirectory, so one deck's draft always lands beside its
+    own name and never pools with other decks; a stem that sanitizes to
+    nothing rejects the delivery. ``folder`` is sanitized structurally:
     components are whitespace-stripped, empty and ``.`` components are
     dropped (leading/trailing ``/`` therefore just normalize), while any
     ``..`` component or an empty folder rejects the delivery.
@@ -137,7 +144,7 @@ def deliver_draft(
             "Draft %s not delivered: no user to deliver for.", draft.draft_id
         )
         return False
-    folder_path = "/".join(components)
+    folder_path = "/".join([*components, stem])
     subject = f"Draft {draft.draft_id}"
     try:
         content = _draft_document(draft).encode("utf-8")
@@ -164,27 +171,34 @@ def deliver_deck_files(
     nc: NextcloudApp,
     user_id: str,
     folder: str,
+    deck_stem: str,
     files: list[tuple[str, bytes, str]],
 ) -> list[str]:
     """Write every ``(name, bytes, mime)`` entry of ``files`` into the
-    user's ``folder`` (relative to their Files root, created when
-    missing) and tag each written file with the AI system tag
-    best-effort. Returns the names actually written: a partial list when
-    some writes fail, an empty list when none succeed or the delivery is
-    rejected up front. Never raises.
+    per-deck subdirectory ``<deck_stem>`` of the user's ``folder``
+    (relative to their Files root, both created when missing) and tag
+    each written file with the AI system tag best-effort. Returns the
+    names actually written: a partial list when some writes fail, an
+    empty list when none succeed or the delivery is rejected up front.
+    Never raises.
 
-    Each name is sanitized as a delivery filename: the final extension
-    rides verbatim while the stem is reduced to the deck-filename
-    alphabet (the same sanitization ``build_deck_filename`` applies, so
-    the appdata deck names pass through byte-unchanged); an entry whose
-    stem sanitizes to nothing is skipped with a log line. ``folder``
-    sanitization and user validation mirror :func:`deliver_draft` (any
-    ``..`` component, an empty folder or no user rejects the whole
-    delivery with an empty return). Writes are independent: one failing
-    entry logs and the remaining entries are still attempted, which is
-    what makes the partial return list possible. Overwrite semantics
-    are DAV PUT in place (Nextcloud's file versioning keeps the
-    history); no suffixing.
+    ``deck_stem`` is sanitized exactly like a draft's stem
+    (:func:`_sanitize_stem`, the same reducer ``build_deck_filename``
+    applies) and the sanitized stem is the subdirectory every file of
+    THIS delivery shares: one deck's bundle lands in
+    ``<folder>/<stem>/``, so multiple decks never pool into one flat
+    folder; a stem that sanitizes to nothing rejects the whole delivery
+    with a log line. Each name is sanitized as a delivery filename: the
+    final extension rides verbatim while the stem is reduced to the
+    deck-filename alphabet (so the appdata deck names pass through
+    byte-unchanged); an entry whose stem sanitizes to nothing is skipped
+    with a log line. ``folder`` sanitization and user validation mirror
+    :func:`deliver_draft` (any ``..`` component, an empty folder or no
+    user rejects the whole delivery with an empty return). Writes are
+    independent: one failing entry logs and the remaining entries are
+    still attempted, which is what makes the partial return list
+    possible. Overwrite semantics are DAV PUT in place (Nextcloud's file
+    versioning keeps the history); no suffixing.
     """
     written: list[str] = []
     components = _folder_components(folder)
@@ -201,7 +215,14 @@ def deliver_deck_files(
     if not user_id.strip():
         LOGGER.warning("Deck files not delivered: no user to deliver for.")
         return written
-    folder_path = "/".join(components)
+    subdir = _sanitize_stem(deck_stem)
+    if not subdir:
+        LOGGER.warning(
+            "Deck files not delivered: the deck stem %r sanitizes to nothing.",
+            deck_stem,
+        )
+        return written
+    folder_path = "/".join([*components, subdir])
     if not _open_delivery_folder(nc, user_id, folder_path, "The deck files"):
         return written
     for name, content, mime_type in files:

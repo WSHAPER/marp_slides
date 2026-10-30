@@ -1,10 +1,11 @@
 """User-Files draft delivery against a fake nc client (no network).
 
 The frozen contract under test: ``deliver_draft`` writes
-``<deck_stem>.draft.md`` into the user's Files folder (created when
-missing, overwritten when present) through the app-context DAV
-impersonation seam, tags the file with the AI system tag best-effort,
-and is fail-soft on every failure mode (logged False, never a raise).
+``<deck_stem>.draft.md`` into the per-deck subdirectory
+``<deck_stem>`` of the user's Files folder (both created when missing,
+overwritten when present) through the app-context DAV impersonation
+seam, tags the file with the AI system tag best-effort, and is fail-soft
+on every failure mode (logged False, never a raise).
 """
 
 from __future__ import annotations
@@ -220,8 +221,8 @@ def test_delivers_comment_frontmatter_and_done_slides(caplog):
     nc, files = make_nc()
     assert deliver_draft(nc, "alice", make_draft(), "Quarterly Review", FOLDER) is True
     assert nc.impersonated == ["alice"]
-    assert files.makedirs_calls == [(FOLDER, True)]
-    path = f"{FOLDER}/Quarterly-Review.draft.md"
+    assert files.makedirs_calls == [(f"{FOLDER}/Quarterly-Review", True)]
+    path = f"{FOLDER}/Quarterly-Review/Quarterly-Review.draft.md"
     assert set(files.file_ids) == {path}
     assert files.files[path] == HAPPY_DOCUMENT.encode("utf-8")
     # the AI tag, created when missing (the assistant's precedent)
@@ -234,8 +235,9 @@ def test_delivers_comment_frontmatter_and_done_slides(caplog):
 def test_creates_missing_folder_including_nested_components():
     nc, files = make_nc()
     assert deliver_draft(nc, "bob", make_draft(), "deck", "Deck drafts/2026/Q4") is True
-    assert files.makedirs_calls == [("Deck drafts/2026/Q4", True)]
-    assert set(files.file_ids) == {"Deck drafts/2026/Q4/deck.draft.md"}
+    # the per-deck subdir nests below the configured components
+    assert files.makedirs_calls == [("Deck drafts/2026/Q4/deck", True)]
+    assert set(files.file_ids) == {"Deck drafts/2026/Q4/deck/deck.draft.md"}
 
 
 def test_overwrite_newest_draft_of_the_same_stem_wins():
@@ -250,7 +252,7 @@ def test_overwrite_newest_draft_of_the_same_stem_wins():
         }
     )
     assert deliver_draft(nc, "alice", all_done, "Quarterly Review", FOLDER) is True
-    path = f"{FOLDER}/Quarterly-Review.draft.md"
+    path = f"{FOLDER}/Quarterly-Review/Quarterly-Review.draft.md"
     assert len(files.files) == 1  # one target, overwritten in place
     assert files.deleted == []
     # the newest draft's content won: slide 3 was absent from the first write
@@ -307,7 +309,7 @@ def test_stem_sanitization_matrix():
 def test_stem_traversal_sanitized_not_delivered_as_path():
     nc, files = make_nc()
     assert deliver_draft(nc, "alice", make_draft(), "../../evil", FOLDER) is True
-    assert set(files.file_ids) == {f"{FOLDER}/evil.draft.md"}
+    assert set(files.file_ids) == {f"{FOLDER}/evil/evil.draft.md"}
 
 
 def test_unsanitizable_stem_rejects_delivery(caplog):
@@ -351,7 +353,7 @@ def test_zero_done_slides_still_writes_a_render_seed():
     nc, files = make_nc()
     draft = make_draft(slides={3: SlideDraft(3, "Risks", SLIDE_3, SLIDE_FAILED, 2)})
     assert deliver_draft(nc, "alice", draft, "Quarterly Review", FOLDER) is True
-    path = f"{FOLDER}/Quarterly-Review.draft.md"
+    path = f"{FOLDER}/Quarterly-Review/Quarterly-Review.draft.md"
     assert files.files[path] == ZERO_DOCUMENT.encode("utf-8")
 
 
@@ -363,7 +365,9 @@ def test_ai_tag_failure_is_skipped_delivery_stands(caplog):
     assert deliver_draft(nc, "alice", make_draft(), "Quarterly Review", FOLDER) is True
     assert files.created_tags == []
     assert files.assigned_tags == []
-    assert set(files.file_ids) == {f"{FOLDER}/Quarterly-Review.draft.md"}
+    assert set(files.file_ids) == {
+        f"{FOLDER}/Quarterly-Review/Quarterly-Review.draft.md"
+    }
     assert "AI tag not applied" in caplog.text
 
 
@@ -385,19 +389,27 @@ DECK_FILES = [
 ]
 
 
+#: The deck stem of DECK_FILES as the task worker threads it (sliced off
+#: the first rendered filename): the per-deck subdirectory of delivery.
+DECK_STEM = "Quarterly-Review"
+
+#: The delivery subdirectory of every DECK_FILES write.
+SUBDIR = f"{FOLDER}/{DECK_STEM}"
+
+
 def test_deliver_deck_files_writes_every_file_and_opens_folder_once(caplog):
     caplog.set_level("INFO", logger="marp_slides.draft_delivery")
     nc, files = make_nc()
-    written = deliver_deck_files(nc, "alice", FOLDER, DECK_FILES)
+    written = deliver_deck_files(nc, "alice", FOLDER, DECK_STEM, DECK_FILES)
     assert written == [name for name, _b, _m in DECK_FILES]
     assert nc.impersonated == ["alice"]  # one impersonation, not one per file
-    assert files.makedirs_calls == [(FOLDER, True)]  # the folder opens ONCE
+    assert files.makedirs_calls == [(SUBDIR, True)]  # the folder opens ONCE
     for name, content, _mime in DECK_FILES:
-        assert files.files[f"{FOLDER}/{name}"] == content
+        assert files.files[f"{SUBDIR}/{name}"] == content
     # every written file is AI-tagged (the tag object itself is created once)
     assert files.created_tags == [AI_TAG_NAME]
     assert files.assigned_tags == [
-        (files.file_ids[f"{FOLDER}/{name}"], files.tags[AI_TAG_NAME])
+        (files.file_ids[f"{SUBDIR}/{name}"], files.tags[AI_TAG_NAME])
         for name, _b, _m in DECK_FILES
     ]
     assert files.deleted == []
@@ -408,19 +420,19 @@ def test_deliver_deck_files_partial_failure_returns_partial_names(caplog):
     caplog.set_level("WARNING", logger="marp_slides.draft_delivery")
     nc, files = make_nc()
     files.fail_uploads_at = {2}  # the html write fails; the rest still run
-    written = deliver_deck_files(nc, "alice", FOLDER, DECK_FILES)
+    written = deliver_deck_files(nc, "alice", FOLDER, DECK_STEM, DECK_FILES)
     assert written == [
         "Quarterly-Review.pptx",
         "Quarterly-Review.pdf",
         "Quarterly-Review.md",
     ]
     assert set(files.files) == {
-        f"{FOLDER}/Quarterly-Review.pptx",
-        f"{FOLDER}/Quarterly-Review.pdf",
-        f"{FOLDER}/Quarterly-Review.md",
+        f"{SUBDIR}/Quarterly-Review.pptx",
+        f"{SUBDIR}/Quarterly-Review.pdf",
+        f"{SUBDIR}/Quarterly-Review.md",
     }
     assert len(files.assigned_tags) == 3  # only the written ones
-    assert files.makedirs_calls == [(FOLDER, True)]  # still opened just once
+    assert files.makedirs_calls == [(SUBDIR, True)]  # still opened just once
     assert "could not be delivered" in caplog.text
 
 
@@ -428,11 +440,11 @@ def test_deliver_deck_files_full_failure_returns_empty_and_logs(caplog):
     caplog.set_level("WARNING", logger="marp_slides.draft_delivery")
     nc, files = make_nc()
     files.fail_upload = RuntimeError("507 Quota Exceeded")
-    assert deliver_deck_files(nc, "alice", FOLDER, DECK_FILES) == []
+    assert deliver_deck_files(nc, "alice", FOLDER, DECK_STEM, DECK_FILES) == []
     assert files.files == {}
     assert files.assigned_tags == []
     # the folder opened (that part worked); every write failed after it
-    assert files.makedirs_calls == [(FOLDER, True)]
+    assert files.makedirs_calls == [(SUBDIR, True)]
     assert "could not be delivered" in caplog.text
 
 
@@ -440,7 +452,7 @@ def test_deliver_deck_files_fail_soft_when_folder_open_fails(caplog):
     caplog.set_level("WARNING", logger="marp_slides.draft_delivery")
     nc, files = make_nc()
     files.fail_makedirs = RuntimeError("403 Forbidden")
-    assert deliver_deck_files(nc, "alice", FOLDER, DECK_FILES) == []
+    assert deliver_deck_files(nc, "alice", FOLDER, DECK_STEM, DECK_FILES) == []
     assert nc.impersonated == ["alice"]  # impersonation happened first
     assert files.files == {}
     assert "could not be delivered" in caplog.text
@@ -450,46 +462,76 @@ def test_deliver_deck_files_rejections_matrix(caplog):
     caplog.set_level("WARNING", logger="marp_slides.draft_delivery")
     # unsafe folder (a '..' component): nothing is opened or written
     nc, files = make_nc()
-    assert deliver_deck_files(nc, "alice", "../../etc", DECK_FILES) == []
+    assert deliver_deck_files(nc, "alice", "../../etc", DECK_STEM, DECK_FILES) == []
     assert nc.impersonated == []
     assert files.makedirs_calls == []
     assert "unsafe" in caplog.text
     # empty folder
-    assert deliver_deck_files(make_nc()[0], "alice", " / ", DECK_FILES) == []
+    assert deliver_deck_files(make_nc()[0], "alice", " / ", DECK_STEM, DECK_FILES) == []
     assert "no deliveries folder" in caplog.text
     # no user at all
     nc2, files2 = make_nc()
-    assert deliver_deck_files(nc2, "  ", FOLDER, DECK_FILES) == []
+    assert deliver_deck_files(nc2, "  ", FOLDER, DECK_STEM, DECK_FILES) == []
     assert nc2.impersonated == []
     assert files2.makedirs_calls == []
     assert "no user" in caplog.text
+    # a deck stem that sanitizes to nothing: the whole delivery is
+    # rejected before anything is opened (no subdir to nest under)
+    nc3, files3 = make_nc()
+    assert deliver_deck_files(nc3, "alice", FOLDER, "..", DECK_FILES) == []
+    assert nc3.impersonated == []
+    assert files3.makedirs_calls == []
+    assert "sanitizes to nothing" in caplog.text
 
 
 def test_deliver_deck_files_skips_unsanitizable_names(caplog):
     caplog.set_level("WARNING", logger="marp_slides.draft_delivery")
     nc, files = make_nc()
     written = deliver_deck_files(
-        nc, "alice", FOLDER, [("..", b"x", "text/plain"), *DECK_FILES[:1]]
+        nc, "alice", FOLDER, DECK_STEM, [("..", b"x", "text/plain"), *DECK_FILES[:1]]
     )
     assert written == ["Quarterly-Review.pptx"]
-    assert set(files.files) == {f"{FOLDER}/Quarterly-Review.pptx"}
+    assert set(files.files) == {f"{SUBDIR}/Quarterly-Review.pptx"}
     assert "sanitizes to nothing" in caplog.text
 
 
 def test_deliver_deck_files_overwrites_in_place_without_suffixing():
     nc, files = make_nc()
-    first = deliver_deck_files(nc, "alice", FOLDER, DECK_FILES)
+    first = deliver_deck_files(nc, "alice", FOLDER, DECK_STEM, DECK_FILES)
     assert first == [name for name, _b, _m in DECK_FILES]
     # a same-stem re-run writes the SAME target names: newest bytes win,
     # nothing is deleted, no suffix is ever appended (server versioning
     # keeps the history)
     rerendered = [("Quarterly-Review.pptx", b"PK\x03\x04edited", PPTX_MIME_TYPE)]
-    assert deliver_deck_files(nc, "alice", FOLDER, rerendered) == [
+    assert deliver_deck_files(nc, "alice", FOLDER, DECK_STEM, rerendered) == [
         "Quarterly-Review.pptx"
     ]
     assert len(files.files) == len(DECK_FILES)
-    assert files.files[f"{FOLDER}/Quarterly-Review.pptx"] == b"PK\x03\x04edited"
+    assert files.files[f"{SUBDIR}/Quarterly-Review.pptx"] == b"PK\x03\x04edited"
     assert files.deleted == []
+
+
+def test_two_stems_deliver_into_separate_subdirs_without_cross_mixing():
+    nc, files = make_nc()
+    other_files = [
+        ("Sales-2026.pptx", b"PK\x03\x04other deck", PPTX_MIME_TYPE),
+        ("Sales-2026.md", b"---\nmarp: true\n---\n\n# Sales\n", MARKDOWN_MIME_TYPE),
+    ]
+    assert deliver_deck_files(nc, "alice", FOLDER, DECK_STEM, DECK_FILES) == [
+        name for name, _b, _m in DECK_FILES
+    ]
+    # the raw stem sanitizes into its own subdirectory (no flat pooling)
+    assert deliver_deck_files(nc, "alice", FOLDER, "Sales 2026!", other_files) == [
+        name for name, _b, _m in other_files
+    ]
+    assert set(files.files) == {
+        f"{FOLDER}/Quarterly-Review/{name}" for name, _b, _m in DECK_FILES
+    } | {f"{FOLDER}/Sales-2026/{name}" for name, _b, _m in other_files}
+    # one folder open per delivery, each nesting its own subdir
+    assert files.makedirs_calls == [
+        (f"{FOLDER}/Quarterly-Review", True),
+        (f"{FOLDER}/Sales-2026", True),
+    ]
 
 
 def test_deliver_deck_files_tag_failure_keeps_every_write(caplog):
@@ -497,7 +539,7 @@ def test_deliver_deck_files_tag_failure_keeps_every_write(caplog):
     nc, files = make_nc()
     files.tags[AI_TAG_NAME] = 7  # the tag pre-exists: no create attempt
     files.fail_assign_tag = RuntimeError("405")
-    written = deliver_deck_files(nc, "alice", FOLDER, DECK_FILES)
+    written = deliver_deck_files(nc, "alice", FOLDER, DECK_STEM, DECK_FILES)
     assert written == [name for name, _b, _m in DECK_FILES]  # writes stand
     assert len(files.files) == len(DECK_FILES)
     assert files.created_tags == []
@@ -520,7 +562,7 @@ def test_delivery_with_failing_markdown_editor_guard_warns_once(caplog):
             "richdocuments": ["application/vnd.oasis.opendocument.presentation"]
         }
         nc, _files = make_nc(editors=office_only)
-        written = deliver_deck_files(nc, "alice", FOLDER, DECK_FILES)
+        written = deliver_deck_files(nc, "alice", FOLDER, DECK_STEM, DECK_FILES)
         assert written == [name for name, _b, _m in DECK_FILES]  # unaffected
         guard_warnings = [
             r

@@ -365,11 +365,12 @@ def record_delivery(recordings: list[dict], api: FakeTaskProcessingAPI):
     with the task-processing state at call time (upload/result counts),
     so tests can pin the delivery's ordering against the report."""
 
-    def fake_deliver(_nc, user_id, folder, files):
+    def fake_deliver(_nc, user_id, folder, deck_stem, files):
         recordings.append(
             {
                 "user_id": user_id,
                 "folder": folder,
+                "deck_stem": deck_stem,
                 "files": list(files),
                 "uploads_so_far": len(api.uploads),
                 "results_so_far": len(api.results),
@@ -404,6 +405,7 @@ def test_files_delivery_sends_rendered_files_and_source_before_report(
     (record,) = recordings
     assert record["user_id"] == "alice"  # threaded from process_task
     assert record["folder"] == "Marp Slides"  # the deployment default, on
+    assert record["deck_stem"] == "Quarterly-Review"  # the per-deck subdir
     assert record["files"] == [
         ("Quarterly-Review.pptx", b"PK-editable", PPTX_MIME_TYPE),
         ("Quarterly-Review.html", b"<html>standalone</html>", HTML_MIME_TYPE),
@@ -504,6 +506,7 @@ def test_re_render_path_delivers_files_too(monkeypatch, settings) -> None:
     (record,) = recordings
     assert record["user_id"] == "alice"
     assert record["folder"] == "Marp Slides"
+    assert record["deck_stem"] == "Quarterly-Review"
     assert record["files"] == [
         ("Quarterly-Review.pptx", b"PK-editable", PPTX_MIME_TYPE),
         ("Quarterly-Review.md", VALID_DECK.strip().encode("utf-8"), MARKDOWN_MIME_TYPE),

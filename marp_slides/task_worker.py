@@ -1315,18 +1315,21 @@ def _deliver_deck_files(
     markdown: str,
 ) -> None:
     """Fail-soft delivery of the generated deck files plus the deck's
-    Markdown source into the task owner's Files (the deployment's
-    ``deliveries_folder``, on by default: the owner keeps editable
-    artifacts next to the appdata task outputs, which stay unchanged).
-    ``rendered`` is every generated format's ``(filename, bytes, mime)``
-    in generation order, collected as the renders happen (the bytes are
-    loop-local otherwise); the source entry is precomputed here exactly
-    the way ``_report_deck_result`` names its own source upload
-    (``<stem>.md`` off the first rendered file, same bytes). MUST run
-    BEFORE :func:`_report_deck_result` and NEVER ping progress around
-    itself: a progress ping after the result report would resurrect the
-    finished task as a RUNNING zombie. Delivery problems only log; they
-    never affect the task's outcome or its reported outputs."""
+    Markdown source into the task owner's Files (a per-deck subdirectory
+    of the deployment's ``deliveries_folder``, on by default: the owner
+    keeps editable artifacts next to the appdata task outputs, which
+    stay unchanged, and each deck's bundle lands in its own
+    ``<deliveries_folder>/<deck_stem>/`` subdirectory). ``rendered`` is
+    every generated format's ``(filename, bytes, mime)`` in generation
+    order, collected as the renders happen (the bytes are loop-local
+    otherwise); the source entry is precomputed here exactly the way
+    ``_report_deck_result`` names its own source upload
+    (``<stem>.md`` off the first rendered file, same bytes), and that
+    same stem is the delivery subdirectory. MUST run BEFORE
+    :func:`_report_deck_result` and NEVER ping progress around itself:
+    a progress ping after the result report would resurrect the finished
+    task as a RUNNING zombie. Delivery problems only log; they never
+    affect the task's outcome or its reported outputs."""
     if not settings.deliveries_folder:
         return
     if not user_id:
@@ -1335,22 +1338,23 @@ def _deliver_deck_files(
             task_id,
         )
         return
+    source_name = source_markdown_filename(rendered[0][0])
+    deck_stem = source_name[: -len(".md")]
+    delivery_folder = f"{settings.deliveries_folder}/{deck_stem}"
     files = [
         *rendered,
-        (
-            source_markdown_filename(rendered[0][0]),
-            markdown.encode("utf-8"),
-            MARKDOWN_MIME_TYPE,
-        ),
+        (source_name, markdown.encode("utf-8"), MARKDOWN_MIME_TYPE),
     ]
     try:
-        written = deliver_deck_files(nc, user_id, settings.deliveries_folder, files)
+        written = deliver_deck_files(
+            nc, user_id, settings.deliveries_folder, deck_stem, files
+        )
     except Exception as exc:  # noqa: BLE001 - fail-soft by contract: delivery must never affect the task
         LOGGER.warning(
             "Task %s: delivery of the deck files to the Files folder %r of "
             "user %s failed (%s); the task result is unaffected",
             task_id,
-            settings.deliveries_folder,
+            delivery_folder,
             user_id,
             exc,
         )
@@ -1360,7 +1364,7 @@ def _deliver_deck_files(
             "Task %s: delivered %s to the Files folder %r of user %s",
             task_id,
             written,
-            settings.deliveries_folder,
+            delivery_folder,
             user_id,
         )
     else:
@@ -1368,7 +1372,7 @@ def _deliver_deck_files(
             "Task %s: no deck files could be delivered to the Files folder "
             "%r of user %s; the task result is unaffected",
             task_id,
-            settings.deliveries_folder,
+            delivery_folder,
             user_id,
         )
 
