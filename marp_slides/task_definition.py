@@ -98,6 +98,15 @@ TASK_TYPE = TaskType(
             ),
             shape_type=ShapeType.LIST_OF_FILES,
         ),
+        ShapeDescriptor(
+            name="slide_deck_source",
+            description=(
+                "The deck's editable source of truth: the final validated "
+                "Marp Markdown (<deckname>.md), so a later turn can make "
+                "small edits and re-render."
+            ),
+            shape_type=ShapeType.FILE,
+        ),
     ],
 )
 
@@ -156,17 +165,6 @@ PROVIDER = TaskProcessingProvider(
         "theme": THEME_AUTO,
         "max_slides": 8,
     },
-    optional_output_shape=[
-        ShapeDescriptor(
-            name="slide_deck_source",
-            description=(
-                "The deck's source of truth: the final validated Marp "
-                "Markdown (<deckname>.md), kept so a later turn can make "
-                "small edits."
-            ),
-            shape_type=ShapeType.FILE,
-        ),
-    ],
 )
 
 #: The deterministic re-render task type: renders an edited Marp Markdown
@@ -205,6 +203,15 @@ RE_RENDER_TASK_TYPE = TaskType(
             ),
             shape_type=ShapeType.LIST_OF_FILES,
         ),
+        ShapeDescriptor(
+            name="slide_deck_source",
+            description=(
+                "The deck's editable source of truth: the validated Marp "
+                "Markdown echoed back (<deckname>.md), so a later turn "
+                "can keep editing it."
+            ),
+            shape_type=ShapeType.FILE,
+        ),
     ],
 )
 
@@ -238,15 +245,4 @@ RE_RENDER_PROVIDER = TaskProcessingProvider(
     optional_input_shape_defaults={
         "output_format": OUTPUT_FORMAT_VALUES[0],
     },
-    optional_output_shape=[
-        ShapeDescriptor(
-            name="slide_deck_source",
-            description=(
-                "The deck's source of truth: the validated Marp Markdown "
-                "echoed back (<deckname>.md), so a later turn can keep "
-                "editing it."
-            ),
-            shape_type=ShapeType.FILE,
-        ),
-    ],
 )

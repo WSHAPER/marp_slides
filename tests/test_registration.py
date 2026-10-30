@@ -26,8 +26,9 @@ def test_task_type_shape() -> None:
     # deliverable line the Assistant panel renders); slide_deck_source is
     # an OPTIONAL output declared on the provider (merged into the task
     # type by the server from the provider registration)
-    assert [s.name for s in tt.output_shape] == ["slide_decks"]
+    assert [s.name for s in tt.output_shape] == ["slide_decks", "slide_deck_source"]
     assert tt.output_shape[0].shape_type == ShapeType.LIST_OF_FILES
+    assert tt.output_shape[1].shape_type == ShapeType.FILE
 
 
 def test_provider_shape() -> None:
@@ -126,14 +127,12 @@ def test_images_slot_description_is_one_clean_sentence() -> None:
     assert "#file:" not in images_slot.description
 
 
-def test_optional_output_declares_slide_deck_source() -> None:
-    provider = task_definition.PROVIDER
-    assert [s.name for s in provider.optional_output_shape] == ["slide_deck_source"]
-    (slot,) = provider.optional_output_shape
-    assert slot.shape_type == ShapeType.FILE
-    # the description teaches the retention rationale (feed back for edits)
-    assert "source of truth" in slot.description
-    assert "small edits" in slot.description
+def test_no_optional_outputs_remain() -> None:
+    """slide_deck_source moved to the REQUIRED output shape (it is always
+    filled) so the assistant form renders it without the advanced
+    toggle; nothing is left optional."""
+    assert task_definition.PROVIDER.optional_output_shape == []
+    assert task_definition.RE_RENDER_PROVIDER.optional_output_shape == []
 
 
 def test_descriptions_do_not_pack_pipe_separated_examples() -> None:
@@ -145,7 +144,8 @@ def test_descriptions_do_not_pack_pipe_separated_examples() -> None:
         *task_definition.TASK_TYPE.input_shape,
         *task_definition.TASK_TYPE.output_shape,
         *task_definition.PROVIDER.optional_input_shape,
-        *task_definition.PROVIDER.optional_output_shape,
+        *task_definition.RE_RENDER_TASK_TYPE.input_shape,
+        *task_definition.RE_RENDER_TASK_TYPE.output_shape,
     ]
     assert all("|" not in slot.description for slot in descriptors)
     assert all("\n" not in slot.description for slot in descriptors)

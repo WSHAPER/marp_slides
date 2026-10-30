@@ -88,8 +88,9 @@ def test_re_render_task_type_shape() -> None:
     assert [s.name for s in tt.input_shape] == ["markdown"]
     assert tt.input_shape[0].shape_type == ShapeType.TEXT
     assert "frontmatter" in tt.input_shape[0].description
-    assert [s.name for s in tt.output_shape] == ["slide_decks"]
+    assert [s.name for s in tt.output_shape] == ["slide_decks", "slide_deck_source"]
     assert tt.output_shape[0].shape_type == ShapeType.LIST_OF_FILES
+    assert tt.output_shape[1].shape_type == ShapeType.FILE
 
 
 def test_re_render_provider_shape() -> None:
@@ -113,8 +114,7 @@ def test_re_render_provider_shape() -> None:
         "all",
     ]
     assert provider.optional_input_shape_defaults == {"output_format": "pptx"}
-    assert [s.name for s in provider.optional_output_shape] == ["slide_deck_source"]
-    assert provider.optional_output_shape[0].shape_type == ShapeType.FILE
+    assert provider.optional_output_shape == []
 
 
 def test_re_render_output_format_enum_mirrors_the_authoring_provider() -> None:

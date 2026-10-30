@@ -101,6 +101,11 @@ DEFAULT_DRAFTS_ENABLED = True
 DEFAULT_DRAFTS_FOLDER = ""
 DEFAULT_DRAFTS_MAX_KEPT = 20
 
+#: Files-by-default delivery (wave source-in-files): every generated deck
+#: format plus the source markdown is written into this folder in the
+#: task owner's Files (DAV impersonation, fail-soft). Empty disables.
+DEFAULT_DELIVERIES_FOLDER = "Marp Slides"
+
 PPTX_MIME_TYPE = (
     "application/vnd.openxmlformats-officedocument.presentationml.presentation"
 )
@@ -167,6 +172,7 @@ class Settings:
     drafts_enabled: bool = DEFAULT_DRAFTS_ENABLED
     drafts_folder: str = DEFAULT_DRAFTS_FOLDER
     drafts_max_kept: int = DEFAULT_DRAFTS_MAX_KEPT
+    deliveries_folder: str = DEFAULT_DELIVERIES_FOLDER
 
     @classmethod
     def from_env(cls, env: Mapping[str, str] | None = None) -> Settings:
@@ -207,4 +213,6 @@ class Settings:
             drafts_max_kept=_env_int(
                 env, "MARP_SLIDES_DRAFTS_MAX_KEPT", DEFAULT_DRAFTS_MAX_KEPT
             ),
+            deliveries_folder=env.get("MARP_SLIDES_DELIVERIES_FOLDER", "").strip()
+            or DEFAULT_DELIVERIES_FOLDER,
         )
