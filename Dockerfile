@@ -31,6 +31,12 @@ WORKDIR /app
 COPY marp_slides marp_slides
 COPY main.py .
 
+# AppAPI persistent-storage convention path: pre-created with marp
+# ownership so a first-use named volume inherits it (docker copies the
+# image dir's ownership into a fresh volume mounted here). The draft
+# checkpoint store writes under this directory.
+RUN mkdir -p /nc_app_marp_slides_data && chown marp:marp /nc_app_marp_slides_data
+
 # The stock entrypoint gosu-drops to the `marp` user and execs marp-cli.js;
 # we cleanly override it: switch to the marp user directly and run uvicorn.
 # Chromium renders fine as this non-root user (verified against the base image).

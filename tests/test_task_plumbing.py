@@ -2,13 +2,19 @@
 
 The inner LLM is faked as a stream of ``core:text2text`` outputs: the FIRST
 call returns the Phase 1 outline JSON, every later call returns one slide
-Markdown attempt (a failed slide consumes a second output for its retry)."""
+Markdown attempt (a failed slide consumes a second output for its retry).
+The draft checkpoint store is faked at the task_worker namespace boundary
+(an in-memory FakeDraftStore), so no test touches the persistent volume;
+the resume end-to-end tests re-patch the seam to the REAL store on a
+tmp_path."""
 
 from __future__ import annotations
 
 import io
 import json
+import re
 from dataclasses import replace
+from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
@@ -16,6 +22,16 @@ from PIL import Image
 
 from marp_slides import task_worker
 from marp_slides.deck_pipeline import DeckError, _OverflowMeasurementError
+from marp_slides.draft_store import (
+    SLIDE_DONE,
+    SLIDE_FAILED,
+    DeckDraft,
+    DraftStoreError,
+    SlideDraft,
+)
+from marp_slides.draft_store import load_draft as store_load_draft
+from marp_slides.draft_store import prune_drafts as store_prune_drafts
+from marp_slides.draft_store import save_draft as store_save_draft
 from marp_slides.layout import SlideOverflow
 from marp_slides.ocs_tasks import NestedTaskError
 from marp_slides.outline import assemble_deck, parse_outline
@@ -199,6 +215,61 @@ def no_real_build(monkeypatch):
         task_worker, "measure_slide_overflow", lambda md, wd, **kw: None
     )
     monkeypatch.setattr(task_worker, "measure_deck_overflow", lambda md, wd, **kw: ())
+
+
+class FakeDraftStore:
+    """In-memory draft store standing in at the task_worker namespace
+    boundary (the same discipline as no_real_build): records every save,
+    load and prune together with the base_dir the worker resolved, keeps
+    drafts by id so a resume task finds what an earlier task saved. A
+    test that needs the REAL store re-patches the three functions to
+    draft_store's own implementations."""
+
+    def __init__(self) -> None:
+        self.saved: list[tuple[Path, DeckDraft]] = []
+        self.prunes: list[tuple[Path, int]] = []
+        self.base_dir = Path("/fake-draft-volume")
+        self._drafts: dict[str, DeckDraft] = {}
+
+    def save(self, base_dir: Path, draft: DeckDraft) -> DeckDraft:
+        self.saved.append((base_dir, draft))
+        self._drafts[draft.draft_id] = draft
+        return draft
+
+    def load(self, base_dir: Path, draft_id: str) -> DeckDraft:
+        draft = self._drafts.get(draft_id)
+        if draft is None:
+            if re.match(r"^[0-9a-f]{12}$", draft_id) is None:
+                raise DraftStoreError(
+                    f"Invalid draft id {draft_id!r}: expected 12 hex characters as "
+                    "reported in the failed task's message."
+                )
+            raise DraftStoreError(
+                f"No saved draft {draft_id!r}: it may have been pruned. Re-run "
+                "the task without draft_id to generate from scratch."
+            )
+        return draft
+
+    def prune(self, base_dir: Path, keep: int) -> list[str]:
+        self.prunes.append((base_dir, keep))
+        return []
+
+    def seed(self, draft: DeckDraft) -> None:
+        """Pre-load a checkpoint a resume task will pick up."""
+        self._drafts[draft.draft_id] = draft
+
+
+@pytest.fixture(autouse=True)
+def fake_draft_store(monkeypatch):
+    """Default: the worker's store seam is an in-memory fake, so no test
+    writes to the persistent volume and the volume-path resolution is
+    neutralized."""
+    store = FakeDraftStore()
+    monkeypatch.setattr(task_worker, "save_draft", store.save)
+    monkeypatch.setattr(task_worker, "load_draft", store.load)
+    monkeypatch.setattr(task_worker, "prune_drafts", store.prune)
+    monkeypatch.setattr(task_worker, "_drafts_base_dir", lambda: store.base_dir)
+    return store
 
 
 # --- the two-phase inner-LLM fake -------------------------------------------------
@@ -2134,3 +2205,526 @@ def test_overflow_check_env_round_trip() -> None:
         Settings.from_env({"MARP_SLIDES_OVERFLOW_CHECK": "true"}).overflow_check is True
     )
     assert Settings.from_env({"MARP_SLIDES_OVERFLOW_CHECK": ""}).overflow_check is True
+
+
+# --- draft checkpoints: cadence, resume, failure notice (wave draft-resume) ------
+
+
+#: A slide that fails per-slide validation on every attempt (empty
+### subheading), consuming both attempts of its retry.
+BAD_SLIDE = "## Bad\n\n### ###"
+
+
+def checkpoint_draft(**overrides: object) -> DeckDraft:
+    """A checkpoint matching OUTLINE (3 slides, theme default) that a
+    resume task picks up via draft_id 'abc123def456'."""
+    values: dict[str, object] = {
+        "prompt": "a deck about bees",
+        "theme": "default",
+        "max_slides": 8,
+        "image_file_ids": [],
+        "outline": json.loads(OUTLINE_JSON),
+        "slides": {},
+        "draft_id": "abc123def456",
+    }
+    values.update(overrides)
+    return DeckDraft(**values)  # type: ignore[arg-type]
+
+
+def test_checkpoint_created_at_outline_completion(
+    monkeypatch, settings, fake_draft_store
+) -> None:
+    """The FIRST checkpoint save happens at outline completion: the
+    outline dict stored in parse_outline's SOURCE JSON shape (so a resume
+    re-parses it through the same gate), slides still empty."""
+    fake, _calls = deck_scheduler()
+    monkeypatch.setattr(task_worker, "schedule_and_wait", fake)
+    nc, _api = make_fake_nc()
+    task_worker.process_task(nc, TASK, settings)
+    base_dir, first = fake_draft_store.saved[0]
+    assert base_dir == fake_draft_store.base_dir
+    assert first.slides == {}
+    assert first.outline["title"] == "Quarterly Review"
+    assert first.outline["theme"] == "default"
+    assert [s["title"] for s in first.outline["slides"]] == [
+        s["title"] for s in OUTLINE["slides"]
+    ]
+    # the stored outline dict round-trips through the strict gate
+    reparsed = parse_outline(json.dumps(first.outline))
+    assert [s.title for s in reparsed.slides] == [
+        s.title for s in parse_outline(OUTLINE_JSON).slides
+    ]
+    assert first.prompt == "a deck about bees"
+    assert first.theme == "default"  # the outline's concrete theme
+    assert first.max_slides == 8
+    assert re.match(r"^[0-9a-f]{12}$", first.draft_id)
+
+
+def test_every_slide_outcome_is_checkpointed_as_it_happens(
+    monkeypatch, settings, fake_draft_store
+) -> None:
+    """Per-slide cadence: one save per slide COMPLETION (not per attempt),
+    each cumulative snapshot carrying the slide's markdown verbatim and
+    the attempts it took (a corrected slide records 2)."""
+    slides = [SLIDES_OK[0], BAD_SLIDE, SLIDES_OK[1], SLIDES_OK[2]]
+    fake, _calls = deck_scheduler(slides)
+    monkeypatch.setattr(task_worker, "schedule_and_wait", fake)
+    nc, _api = make_fake_nc()
+    task_worker.process_task(nc, TASK, settings)
+    snapshots = [
+        [(n, s.status, s.attempts) for n, s in sorted(d.slides.items())]
+        for _base, d in fake_draft_store.saved
+    ]
+    assert snapshots == [
+        [],  # outline completion: slides empty
+        [(1, SLIDE_DONE, 1)],
+        [(1, SLIDE_DONE, 1), (2, SLIDE_DONE, 2)],  # corrected on the retry
+        [(1, SLIDE_DONE, 1), (2, SLIDE_DONE, 2), (3, SLIDE_DONE, 1)],
+    ]
+    final = fake_draft_store.saved[-1][1]
+    assert final.slides[1].markdown == SLIDES_OK[0]
+    assert final.slides[2].markdown == SLIDES_OK[1]  # the corrected attempt
+    # one draft id throughout the task, updated in place
+    assert len({d.draft_id for _b, d in fake_draft_store.saved}) == 1
+
+
+def test_slide_exhausting_retries_is_checkpointed_failed(
+    monkeypatch, settings, fake_draft_store
+) -> None:
+    """A slide whose retries are exhausted is saved status failed (so a
+    resume regenerates it) with the attempts spent; the completed slide
+    stays done and the failure notice names the draft."""
+    slides = [SLIDES_OK[0], BAD_SLIDE, "# Still bad\n\n### ###"]
+    fake, _calls = deck_scheduler(slides)
+    monkeypatch.setattr(task_worker, "schedule_and_wait", fake)
+    nc, api = make_fake_nc()
+    task_worker.process_task(nc, TASK, settings)
+    (result,) = api.results
+    assert result["output"] is None  # the task failed
+    final = fake_draft_store.saved[-1][1]
+    assert final.slides[1].status == SLIDE_DONE
+    assert final.slides[1].markdown == SLIDES_OK[0]
+    assert final.slides[2].status == SLIDE_FAILED
+    assert final.slides[2].attempts == 2
+    # retention ran after the reported failure, with the configured cap
+    assert fake_draft_store.prunes == [
+        (fake_draft_store.base_dir, settings.drafts_max_kept)
+    ]
+
+
+def test_nested_failure_mid_deck_still_checkpoints(
+    monkeypatch, settings, fake_draft_store
+) -> None:
+    """The NestedTaskError trap: an inner-task failure during slide 2 has
+    no DeckError handler inside _generate_slide, yet the completed slide
+    is durable, the interrupted slide is recorded failed with zero
+    completed attempts, and the failure message still names the draft."""
+    responses = [OUTLINE_JSON, SLIDES_OK[0]]
+    calls: list[dict] = []
+
+    def exploding(nc_, task_type, task_input, **kwargs):
+        calls.append(task_input)
+        if len(calls) > len(responses):
+            raise NestedTaskError("The internal core:text2text task failed: boom")
+        return {"output": responses[len(calls) - 1]}
+
+    monkeypatch.setattr(task_worker, "schedule_and_wait", exploding)
+    nc, api = make_fake_nc()
+    task_worker.process_task(nc, TASK, settings)
+    (result,) = api.results
+    assert result["output"] is None
+    assert "boom" in result["user_facing_error_message"]
+    final = fake_draft_store.saved[-1][1]
+    assert final.slides[1].status == SLIDE_DONE
+    assert final.slides[2].status == SLIDE_FAILED
+    assert final.slides[2].attempts == 0  # no attempt completed
+    assert (
+        "A draft of the completed slides was saved"
+        in (result["user_facing_error_message"])
+    )
+
+
+def test_resume_skips_done_slides(monkeypatch, settings, fake_draft_store) -> None:
+    """draft_id resume against the fake store: the checkpointed outline is
+    reused (no outline round), done slides ship verbatim (no LLM round),
+    and the fake LLM stream is consumed ONLY by the missing and failed
+    slides. The same draft id is updated in place."""
+    fake_draft_store.seed(
+        checkpoint_draft(
+            slides={
+                1: SlideDraft(1, "Quarterly Review", SLIDES_OK[0], SLIDE_DONE, 1),
+                2: SlideDraft(2, "Results", "## Results\n\nstale", SLIDE_FAILED, 2),
+            }
+        )
+    )
+    # the stream has NO outline JSON: slides 2 (failed) and 3 (missing) only
+    fake, calls = make_llm([SLIDES_OK[1], SLIDES_OK[2]])
+    monkeypatch.setattr(task_worker, "schedule_and_wait", fake)
+    nc, api = make_fake_nc()
+    task_worker.process_task(
+        nc,
+        dict(TASK, input={"prompt": "a deck about bees", "draft_id": "abc123def456"}),
+        settings,
+    )
+    (result,) = api.results
+    assert result["output"] == SUCCESS_OUTPUT
+    assert len(calls) == 2  # the two regenerated slides, no outline round
+    assert "Write ONLY slide 2 of 3" in calls[0]["input"]
+    assert "Write ONLY slide 3 of 3" in calls[1]["input"]
+    # slide 1 rode the checkpoint verbatim: the assembled deck is exact
+    assert api.uploads[1][1][1] == ASSEMBLED.encode("utf-8")
+    final = fake_draft_store.saved[-1][1]
+    assert final.draft_id == "abc123def456"  # same checkpoint, in place
+    assert final.slides[2].status == SLIDE_DONE
+    assert final.slides[3].status == SLIDE_DONE
+
+
+def test_resume_with_mismatched_theme_is_rejected(
+    monkeypatch, settings, fake_draft_store
+) -> None:
+    """Compatibility: the prompt may be rephrased, but a hard theme that
+    differs from the checkpoint's outline theme rejects the resume with
+    the actionable mismatch message (both themes named, remedy given)."""
+    fake_draft_store.seed(checkpoint_draft())  # outline theme 'default'
+    fake, calls = make_llm(["unused"])
+    monkeypatch.setattr(task_worker, "schedule_and_wait", fake)
+    nc, api = make_fake_nc()
+    task_worker.process_task(
+        nc,
+        dict(TASK, input={"prompt": "x", "theme": "gaia", "draft_id": "abc123def456"}),
+        settings,
+    )
+    assert calls == []  # rejected before any LLM round
+    (result,) = api.results
+    assert result["output"] is None
+    message = result["user_facing_error_message"]
+    assert "cannot be resumed" in message
+    assert "'default'" in message and "'gaia'" in message
+    assert "Re-run without draft_id" in message
+
+
+def test_resume_with_mismatched_max_slides_is_rejected(
+    monkeypatch, settings, fake_draft_store
+) -> None:
+    """Same rejection for a max_slides mismatch (the plan length is part
+    of the checkpoint's contract)."""
+    fake_draft_store.seed(checkpoint_draft())
+    fake, calls = make_llm(["unused"])
+    monkeypatch.setattr(task_worker, "schedule_and_wait", fake)
+    nc, api = make_fake_nc()
+    task_worker.process_task(
+        nc,
+        dict(TASK, input={"prompt": "x", "max_slides": 5, "draft_id": "abc123def456"}),
+        settings,
+    )
+    assert calls == []
+    (result,) = api.results
+    message = result["user_facing_error_message"]
+    assert "max_slides 8" in message and "max_slides 5" in message
+    assert "Re-run without draft_id" in message
+
+
+def test_resume_with_invalid_or_unknown_draft_id_reports_store_message(
+    monkeypatch, settings, fake_draft_store
+) -> None:
+    """A present-but-invalid draft_id fails with the STORE's message style
+    (12 hex characters), a well-formed but unknown id with the store's
+    re-run-without-draft_id remedy."""
+    nc, api = make_fake_nc()
+    task_worker.process_task(
+        nc, dict(TASK, input={"prompt": "x", "draft_id": "nope"}), settings
+    )
+    (invalid,) = api.results
+    assert "12 hex characters" in invalid["user_facing_error_message"]
+    nc, api = make_fake_nc()
+    task_worker.process_task(
+        nc, dict(TASK, input={"prompt": "x", "draft_id": "000000000000"}), settings
+    )
+    (missing,) = api.results
+    assert "Re-run the task without draft_id" in missing["user_facing_error_message"]
+
+
+def test_failed_task_carries_draft_notice_exactly_once(
+    monkeypatch, settings, fake_draft_store
+) -> None:
+    """The failure line: a failed generation task with at least one done
+    slide appends EXACTLY ONE draft-remedy line naming the draft id and
+    the resume input."""
+    slides = [SLIDES_OK[0], BAD_SLIDE, "# Still bad\n\n### ###"]
+    fake, _calls = deck_scheduler(slides)
+    monkeypatch.setattr(task_worker, "schedule_and_wait", fake)
+    nc, api = make_fake_nc()
+    task_worker.process_task(nc, TASK, settings)
+    (result,) = api.results
+    message = result["user_facing_error_message"]
+    draft_id = fake_draft_store.saved[0][1].draft_id
+    expected_line = (
+        f"A draft of the completed slides was saved (draft id: {draft_id}); "
+        f"re-run with draft_id={draft_id} to continue from it."
+    )
+    assert message.count("A draft of the completed slides was saved") == 1
+    assert message.endswith(expected_line)
+
+
+def test_no_draft_notice_when_drafts_disabled(monkeypatch, fake_draft_store) -> None:
+    """MARP_SLIDES_DRAFTS_ENABLED=false: no checkpoint is written at all,
+    so the failure message carries no draft line (nothing to resume)."""
+    slides = [SLIDES_OK[0], BAD_SLIDE, "# Still bad\n\n### ###"]
+    fake, _calls = deck_scheduler(slides)
+    monkeypatch.setattr(task_worker, "schedule_and_wait", fake)
+    nc, api = make_fake_nc()
+    task_worker.process_task(nc, TASK, Settings(drafts_enabled=False))
+    (result,) = api.results
+    assert result["output"] is None
+    assert "A draft of the completed slides" not in result["user_facing_error_message"]
+    assert fake_draft_store.saved == []
+
+
+def test_no_draft_notice_when_no_slide_completed(
+    monkeypatch, settings, fake_draft_store
+) -> None:
+    """An empty checkpoint (the outline saved but slide 1 failed on both
+    attempts) offers nothing to continue from: no draft line."""
+    fake, _calls = deck_scheduler([BAD_SLIDE, "# Still bad\n\n### ###"])
+    monkeypatch.setattr(task_worker, "schedule_and_wait", fake)
+    nc, api = make_fake_nc()
+    task_worker.process_task(nc, TASK, settings)
+    (result,) = api.results
+    assert result["output"] is None
+    assert fake_draft_store.saved  # the outline-only checkpoint exists
+    assert "A draft of the completed slides" not in result["user_facing_error_message"]
+
+
+def test_prune_runs_after_outcome_with_configured_cap(
+    monkeypatch, fake_draft_store
+) -> None:
+    """Retention: after a SUCCESSFUL outcome the store is pruned with the
+    configured cap (keep=drafts_max_kept)."""
+    fake, _calls = deck_scheduler()
+    monkeypatch.setattr(task_worker, "schedule_and_wait", fake)
+    nc, _api = make_fake_nc()
+    task_worker.process_task(nc, TASK, Settings(drafts_max_kept=5))
+    assert fake_draft_store.prunes == [(fake_draft_store.base_dir, 5)]
+
+
+def test_resume_rides_checkpoint_images_when_task_has_none(
+    monkeypatch, settings, fake_draft_store
+) -> None:
+    """A resume task that provides no images rides the checkpoint's image
+    ids: the outline's '#file:N' references stay resolvable end to end."""
+    fake_draft_store.seed(
+        checkpoint_draft(
+            outline=json.loads(IMG_OUTLINE_JSON),
+            image_file_ids=[101],
+            slides={
+                1: SlideDraft(1, "Img Deck", IMG_SLIDES_OK[0], SLIDE_DONE, 1),
+            },
+        )
+    )
+    fake, calls = make_llm([IMG_SLIDES_OK[1]])  # only slide 2 is missing
+    monkeypatch.setattr(task_worker, "schedule_and_wait", fake)
+    files = FakeFilesAPI({101: fake_node(101)}, {101: png_bytes()})
+    nc, api = make_fake_nc(files=files)
+    task_worker.process_task(
+        nc, dict(TASK, input={"prompt": "x", "draft_id": "abc123def456"}), settings
+    )
+    (result,) = api.results
+    assert result["output"] == SUCCESS_OUTPUT
+    assert len(calls) == 1
+    assert files.downloaded == [101]  # the ridden image id was fetched
+    assert api.uploads[1][1][1] == IMG_ASSEMBLED.encode("utf-8")
+
+
+def test_resume_task_images_win_over_checkpoint(
+    monkeypatch, settings, fake_draft_store
+) -> None:
+    """A resume task that DOES provide images wins over the checkpoint's
+    ids (the two lists are never merged: '#file:N' indexes one list)."""
+    fake_draft_store.seed(
+        checkpoint_draft(
+            outline=json.loads(IMG_OUTLINE_JSON),
+            image_file_ids=[101],
+            slides={
+                1: SlideDraft(1, "Img Deck", IMG_SLIDES_OK[0], SLIDE_DONE, 1),
+            },
+        )
+    )
+    fake, _calls = make_llm([IMG_SLIDES_OK[1]])
+    monkeypatch.setattr(task_worker, "schedule_and_wait", fake)
+    files = FakeFilesAPI(
+        {101: fake_node(101), 202: fake_node(202)},
+        {101: png_bytes(), 202: png_bytes()},
+    )
+    nc, api = make_fake_nc(files=files)
+    task_worker.process_task(
+        nc,
+        dict(TASK, input={"prompt": "x", "draft_id": "abc123def456", "images": [202]}),
+        settings,
+    )
+    (result,) = api.results
+    assert result["output"] == SUCCESS_OUTPUT
+    assert files.downloaded == [202]  # the task's image, never the stale one
+
+
+def test_delivery_seam_fail_soft_without_sibling_module(
+    monkeypatch, settings, fake_draft_store
+) -> None:
+    """drafts_folder configured but the sibling draft_delivery module does
+    not exist yet (separate branch): the ImportError path is a silent
+    no-op and the failed task's report is unaffected."""
+    slides = [SLIDES_OK[0], BAD_SLIDE, "# Still bad\n\n### ###"]
+    fake, _calls = deck_scheduler(slides)
+    monkeypatch.setattr(task_worker, "schedule_and_wait", fake)
+    nc, api = make_fake_nc()
+    task_worker.process_task(nc, TASK, replace(settings, drafts_folder="Slides/drafts"))
+    (result,) = api.results
+    assert result["output"] is None
+    assert (
+        "A draft of the completed slides was saved"
+        in (result["user_facing_error_message"])
+    )
+
+
+def test_delivery_seam_calls_sibling_when_present(
+    monkeypatch, settings, fake_draft_store
+) -> None:
+    """With the sibling module merged (simulated via sys.modules), the
+    seam calls deliver_draft(nc, user_id, draft, deck_stem) exactly once,
+    with the deck stem derived from the checkpointed outline title; a
+    raising delivery never fails the task report."""
+    import sys
+    import types
+
+    module = types.ModuleType("marp_slides.draft_delivery")
+    recorded: dict[str, object] = {}
+
+    def deliver_draft(nc, user_id, draft, deck_stem, folder):
+        recorded["call"] = (user_id, draft.draft_id, deck_stem, folder)
+        raise RuntimeError("DAV hiccup")  # delivery failures are fail-soft
+
+    module.deliver_draft = deliver_draft
+    monkeypatch.setitem(sys.modules, "marp_slides.draft_delivery", module)
+    slides = [SLIDES_OK[0], BAD_SLIDE, "# Still bad\n\n### ###"]
+    fake, _calls = deck_scheduler(slides)
+    monkeypatch.setattr(task_worker, "schedule_and_wait", fake)
+    nc, api = make_fake_nc()
+    task_worker.process_task(nc, TASK, replace(settings, drafts_folder="Slides/drafts"))
+    (result,) = api.results
+    assert result["output"] is None
+    draft_id = fake_draft_store.saved[0][1].draft_id
+    assert recorded["call"] == ("alice", draft_id, "Quarterly-Review", "Slides/drafts")
+    assert (
+        "A draft of the completed slides was saved"
+        in (result["user_facing_error_message"])
+    )
+
+
+def test_resume_end_to_end_with_real_store(
+    monkeypatch, settings, fake_draft_store, tmp_path
+) -> None:
+    """The full resume loop against the REAL store on disk: task 1 fails
+    after slide 1 (checkpoint persisted atomically), task 2 carries the
+    advertised draft_id and succeeds, reusing the checkpointed slide 1
+    byte-identically and generating ONLY the missing slides (2 LLM
+    rounds, 0 outline rounds). The prompt was rephrased between runs."""
+    monkeypatch.setattr(task_worker, "save_draft", store_save_draft)
+    monkeypatch.setattr(task_worker, "load_draft", store_load_draft)
+    monkeypatch.setattr(task_worker, "prune_drafts", store_prune_drafts)
+    monkeypatch.setattr(task_worker, "_drafts_base_dir", lambda: tmp_path)
+
+    # task 1: slide 2 fails both attempts; slide 1 is checkpointed done
+    failing, _c1 = deck_scheduler([SLIDES_OK[0], BAD_SLIDE, "# Still bad\n\n### ###"])
+    monkeypatch.setattr(task_worker, "schedule_and_wait", failing)
+    nc, api = make_fake_nc()
+    task_worker.process_task(nc, TASK, settings)
+    (failed_result,) = api.results
+    assert failed_result["output"] is None
+    match = re.search(
+        r"draft id: ([0-9a-f]{12})", failed_result["user_facing_error_message"]
+    )
+    assert match is not None
+    draft_id = match.group(1)
+
+    # the checkpoint is a real file on disk with the expected state
+    on_disk = store_load_draft(tmp_path, draft_id)
+    assert on_disk.slides[1].status == SLIDE_DONE
+    assert on_disk.slides[1].markdown == SLIDES_OK[0]
+    assert on_disk.slides[2].status == SLIDE_FAILED
+    assert on_disk.outline["title"] == "Quarterly Review"
+
+    # task 2: resume with a REPHRASED prompt; distinct markdown for the
+    # regenerated slides proves the reused slide 1 came from the checkpoint
+    variant2 = "## Results\n\n- Revenue up 99%\n- Churn down 9 points"
+    variant3 = "## Next steps\n\n1. Rewrite the onboarding\n2. Hire three"
+    resumed, calls2 = make_llm([variant2, variant3])
+    monkeypatch.setattr(task_worker, "schedule_and_wait", resumed)
+    nc2, api2 = make_fake_nc()
+    task_worker.process_task(
+        nc2,
+        dict(
+            TASK,
+            input={"prompt": "a rephrased request about bees", "draft_id": draft_id},
+        ),
+        settings,
+    )
+    (ok,) = api2.results
+    assert ok["output"] == SUCCESS_OUTPUT
+    assert len(calls2) == 2  # the two missing slides, 0 outline rounds
+    # byte-identical reuse: the shipped source is the checkpointed slide 1
+    # joined with the regenerated slides
+    disk_draft = store_load_draft(tmp_path, draft_id)
+    expected = assemble_deck(
+        parse_outline(OUTLINE_JSON),
+        [disk_draft.slides[1].markdown, variant2, variant3],
+    )
+    assert api2.uploads[1][1][1] == expected.encode("utf-8")
+    assert disk_draft.slides[1].markdown == SLIDES_OK[0]
+    # the resumed run updated the same draft in place, all slides done now
+    assert disk_draft.draft_id == draft_id
+    assert all(
+        s.status == SLIDE_DONE
+        for s in store_load_draft(tmp_path, draft_id).slides.values()
+    )
+
+
+def test_re_authoring_after_completeness_failure_updates_draft_in_place(
+    monkeypatch, settings, fake_draft_store
+) -> None:
+    """The image-completeness re-authoring trap: the second authoring
+    attempt re-plans through the LLM and RESETS the checkpoint in place
+    (same draft id, new outline, slides cleared - a new plan invalidates
+    the previous attempt's slide content), so the task reports exactly
+    one draft, never two."""
+    text_only = [
+        "# Img Deck\n\nOpening paragraph.",
+        "## Diagram\n\nThe diagram shows the flow.",
+    ]
+    stream = [IMG_OUTLINE_JSON, *text_only, IMG_OUTLINE_JSON, *text_only]
+    fake, _calls = make_llm(stream)
+    monkeypatch.setattr(task_worker, "schedule_and_wait", fake)
+    files = FakeFilesAPI({101: fake_node(101)}, {101: png_bytes()})
+    nc, api = make_fake_nc(files=files)
+    task_worker.process_task(
+        nc, dict(TASK, input={"prompt": "x", "images": [101]}), settings
+    )
+    (result,) = api.results
+    assert result["output"] is None
+    assert "never referenced" in result["user_facing_error_message"]
+    ids = {d.draft_id for _base, d in fake_draft_store.saved}
+    assert len(ids) == 1  # one draft per task
+    assert (
+        result["user_facing_error_message"].count(
+            "A draft of the completed slides was saved"
+        )
+        == 1
+    )
+    # the last save is the SECOND attempt's state: re-planned, both slides
+    # regenerated, still incomplete for the images gate
+    final = fake_draft_store.saved[-1][1]
+    assert set(final.slides) == {1, 2}
+    assert final.slides[1].status == SLIDE_DONE
+    assert final.slides[2].status == SLIDE_DONE
+    # the reset is visible mid-stream: after the first attempt's two
+    # slides, the second outline save has empty slides again
+    snapshots = [dict(d.slides) for _b, d in fake_draft_store.saved]
+    assert snapshots[3] == {}  # second outline completion cleared them

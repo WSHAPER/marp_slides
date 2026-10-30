@@ -67,10 +67,23 @@ image references resolve against the optional ``file_references`` input
 (LIST_OF_FILES, the same shape and the same rules as the authoring task's
 ``images`` slot), so a re-render can reference Files images that were not
 part of the original task.
+
+Draft checkpoints make the authoring pipeline resumable: with drafts
+enabled (``MARP_SLIDES_DRAFTS_ENABLED=false`` turns it off), every
+generation task checkpoints its outline and each completed slide as an
+atomic JSON document on the ExApp persistent volume
+(:mod:`marp_slides.draft_store`). A task that fails mid-flight appends
+one line to its user-facing error naming the draft id; a follow-up task
+carrying that id in the optional ``draft_id`` input resumes from the
+checkpoint: the stored outline is reused (no outline LLM round), slides
+checkpointed done ship verbatim (no LLM round), and only missing or
+failed slides are regenerated through the normal per-slide loop. Retention
+keeps the newest ``MARP_SLIDES_DRAFTS_MAX_KEPT`` drafts after every task.
 """
 
 from __future__ import annotations
 
+import json
 import logging
 import tempfile
 import threading
@@ -87,6 +100,7 @@ from niquests import ConnectionError as RequestsConnectionError
 from niquests import JSONDecodeError
 from niquests import Timeout as RequestsTimeout
 
+from .constructs import THEME_AUTO
 from .deck_pipeline import (
     DeckError,
     ValidatedDeck,
@@ -102,6 +116,16 @@ from .deck_pipeline import (
     validate_output_format,
     validate_prompt,
     validate_theme,
+)
+from .draft_store import (
+    SLIDE_DONE,
+    SLIDE_FAILED,
+    DeckDraft,
+    DraftStoreError,
+    SlideDraft,
+    load_draft,
+    prune_drafts,
+    save_draft,
 )
 from .editable_pptx import ParsedDeck, build_pptx
 from .images import (
@@ -473,15 +497,17 @@ def _generate_slide(
     task_id: int,
     image_file_ids: list[int],
     deadline: float,
-) -> str:
+) -> tuple[str, int]:
     """Phase 2: author and validate ONE slide. The slide prompt carries the
     whole plan for context but asks for exactly this slide's Markdown; the
     existing construct validator runs on the slide alone (wrapped in a
     synthetic frontmatter), and the image-reference bounds check runs per
     slide too, so a failed slide retries ITSELF (2 attempts) with the
     validation error as corrective feedback instead of costing the whole
-    deck. Scheduling failures propagate; the LAST attempt's DeckError is
-    raised when every attempt fails."""
+    deck. Returns the slide's validated Markdown together with the number
+    of LLM attempts it took (1 or 2: the draft checkpoint records it).
+    Scheduling failures propagate; the LAST attempt's DeckError is raised
+    when every attempt fails."""
     total = len(outline.slides)
     attempts = 2 if settings.retry_llm else 1
     _report_progress(
@@ -525,7 +551,7 @@ def _generate_slide(
             _reject_slide_overflow(
                 nc, slide_markdown, outline.theme, number, task_id, settings
             )
-            return slide_markdown.strip()
+            return slide_markdown.strip(), attempt
         except DeckError as exc:
             # heuristic repair first: trivially fixable issues cost nothing.
             # The repair module is frontmatter-bound (it repairs whole
@@ -558,7 +584,7 @@ def _generate_slide(
                         _reject_slide_overflow(
                             nc, repaired_md, outline.theme, number, task_id, settings
                         )
-                        return repaired_md.strip()
+                        return repaired_md.strip(), attempt
                     except DeckError:
                         pass  # repair insufficient, fall through to retry
             last_error = exc
@@ -570,6 +596,192 @@ def _generate_slide(
                 log_excerpt=settings.log_excerpt,
             )
     raise last_error
+
+
+# --- draft checkpoints: cadence, resume, retention (wave draft-resume) -----------
+
+
+#: AppAPI docker deployments mount the ExApp persistent volume at
+#: /nc_app_<app_id>_data (server app_api DeployActions/DockerActions.php:
+#: buildDefaultExAppVolume targets '/' . 'nc_app_' . appId . '_data').
+#: nc_py_api exposes no discovery API for that path (checked: no
+#: persistent-storage accessor anywhere in ex_app), so the convention path
+#: is probed at checkpoint time. A manual or local deployment without the
+#: mounted volume keeps drafts in a 'persistent_storage' directory beside
+#: the process working directory (the context_chat_backend convention for
+#: non-docker runs) - never a temp dir, which a resume checkpoint must
+#: outlive.
+PERSISTENT_VOLUME_DIR = Path(f"/nc_app_{APP_ID}_data")
+_LOCAL_DRAFTS_DIR = Path("persistent_storage")
+
+
+def _drafts_base_dir() -> Path:
+    """The draft store root on the ExApp persistent volume."""
+    if PERSISTENT_VOLUME_DIR.is_dir():
+        return PERSISTENT_VOLUME_DIR
+    return _LOCAL_DRAFTS_DIR
+
+
+def _outline_checkpoint_dict(outline: DeckOutline) -> dict[str, object]:
+    """Serialize a parsed outline back into the SOURCE JSON shape
+    :func:`parse_outline` consumes (title, theme, slides, optional
+    paginate/background/footer/header keys), so the checkpoint round-trips
+    through the same strict gate on resume. Design choice: the values
+    stored are the parsed and normalized ones (theme lowercased, colors
+    '#RRGGBB', background image canonical '#file:N'), not the raw LLM
+    text - every normalization is idempotent under re-parsing, and the
+    raw text is already discarded by the outline gate."""
+    data: dict[str, object] = {
+        "title": outline.title,
+        "theme": outline.theme,
+        "slides": [
+            {"title": s.title, "summary": s.summary, "has_image": s.has_image}
+            for s in outline.slides
+        ],
+    }
+    if outline.paginate:
+        data["paginate"] = True
+    if outline.background_color is not None:
+        data["backgroundColor"] = outline.background_color
+    if outline.background_image is not None:
+        data["backgroundImage"] = outline.background_image
+    if outline.footer is not None:
+        data["footer"] = outline.footer
+    if outline.header is not None:
+        data["header"] = outline.header
+    return data
+
+
+class _DraftSession:
+    """One generation task's checkpoint bookkeeping (fail-soft by
+    contract).
+
+    The session owns the checkpoint CADENCE (when a save happens); the
+    store owns HOW (atomicity, layout) and retention. ``process_task``
+    creates it for every task: for a re-render task (no authoring) and
+    for a generation task with drafts disabled it is a harmless null
+    object (every method no-ops, ``draft`` stays None). With drafts
+    enabled the cadence is: ONE save when the outline completes (a fresh
+    deck starts the draft with empty slides; a whole-deck re-authoring
+    RESETS it in place - same draft id, new outline, slides cleared,
+    because a new plan invalidates the previous attempt's slide content),
+    one save after every slide that passes validation (its markdown kept
+    verbatim), and one save when a slide exhausts its retries (status
+    failed, so a resume regenerates exactly that slide). Store failures
+    only log: a checkpoint is an optimization, never a dependency of the
+    generation."""
+
+    def __init__(self, *, enabled: bool, task_id: int) -> None:
+        self._enabled = enabled
+        self._task_id = task_id
+        #: The current checkpoint: None until the outline completes (or a
+        #: resumed draft is adopted). Always the latest saved state.
+        self.draft: DeckDraft | None = None
+        #: The outline rebuilt from a resumed checkpoint; consumed by the
+        #: FIRST authoring attempt, which then skips the outline LLM round.
+        self.resume_outline: DeckOutline | None = None
+        self._prompt = ""
+        self._max_slides = 8
+        self._image_file_ids: list[int] = []
+
+    def bind(
+        self,
+        *,
+        prompt: str,
+        max_slides: int,
+        image_file_ids: list[int],
+        resumed: DeckDraft | None = None,
+        resume_outline: DeckOutline | None = None,
+    ) -> None:
+        """Record the validated task inputs (they become a fresh draft's
+        fields at outline completion) and, with ``resumed``, adopt the
+        loaded checkpoint and its rebuilt outline for this task."""
+        self._prompt = prompt
+        self._max_slides = max_slides
+        self._image_file_ids = list(image_file_ids)
+        self.draft = resumed
+        self.resume_outline = resume_outline
+
+    def outline_ready(self, outline: DeckOutline) -> None:
+        """Checkpoint cadence 1: the outline completed. A fresh deck
+        creates the draft (slides empty, theme the outline's CONCRETE
+        theme - what the deck ships with, and what a resume's theme
+        compatibility checks against); a re-authoring attempt replaces
+        the outline and clears the slides of the SAME draft id."""
+        if not self._enabled:
+            return
+        draft_id = self.draft.draft_id if self.draft is not None else None
+        draft = DeckDraft(
+            prompt=self._prompt,
+            theme=outline.theme,
+            max_slides=self._max_slides,
+            image_file_ids=list(self._image_file_ids),
+            outline=_outline_checkpoint_dict(outline),
+        )
+        if draft_id is not None:
+            draft = replace(draft, draft_id=draft_id)
+        self.draft = draft
+        self._save()
+
+    def slide_done(self, number: int, title: str, markdown: str, attempts: int) -> None:
+        """Checkpoint cadence 2: slide ``number`` passed validation after
+        ``attempts`` LLM round(s); its markdown is kept verbatim so a
+        resume reuses it without an LLM round."""
+        self._record(number, SlideDraft(number, title, markdown, SLIDE_DONE, attempts))
+
+    def slide_failed(self, number: int, title: str, attempts: int) -> None:
+        """Checkpoint cadence 3: slide ``number`` is beyond rescue (its
+        validation retries are exhausted, or the shared LLM budget refused
+        its round); status failed with the rounds spent, so a resume
+        regenerates exactly this slide."""
+        self._record(number, SlideDraft(number, title, "", SLIDE_FAILED, attempts))
+
+    def slide_interrupted(self, number: int, title: str) -> None:
+        """A scheduling or unexpected failure killed the slide mid-authoring
+        (no attempt completed, e.g. a NestedTaskError escaping
+        ``_generate_slide`` untouched): recorded failed with zero
+        completed attempts so a resume regenerates it."""
+        self._record(number, SlideDraft(number, title, "", SLIDE_FAILED, 0))
+
+    def reusable_slide(self, number: int) -> str | None:
+        """The checkpointed markdown of a DONE slide (a resume ships it
+        verbatim, no LLM round); None when slide ``number`` must be
+        (re)generated."""
+        if self.draft is None:
+            return None
+        slide = self.draft.slides.get(number)
+        if slide is not None and slide.status == SLIDE_DONE and slide.markdown:
+            return slide.markdown
+        return None
+
+    @property
+    def done_slides(self) -> int:
+        """How many checkpointed slides are done (the resume-notice gate:
+        an empty draft offers nothing to continue from)."""
+        if self.draft is None:
+            return 0
+        return sum(1 for s in self.draft.slides.values() if s.status == SLIDE_DONE)
+
+    def _record(self, number: int, slide: SlideDraft) -> None:
+        if not self._enabled or self.draft is None:
+            return
+        slides = dict(self.draft.slides)
+        slides[number] = slide
+        self.draft = replace(self.draft, slides=slides)
+        self._save()
+
+    def _save(self) -> None:
+        draft = self.draft
+        if draft is None:
+            return
+        try:
+            self.draft = save_draft(_drafts_base_dir(), draft)
+        except Exception as exc:  # noqa: BLE001 - fail-soft by contract: checkpoint I/O must never fail the task
+            LOGGER.warning(
+                "Task %s: draft checkpoint write failed (%s); continuing without it",
+                self._task_id,
+                exc,
+            )
 
 
 def _validate_max_slides(raw: object, settings: Settings) -> int:
@@ -584,6 +796,104 @@ def _validate_max_slides(raw: object, settings: Settings) -> int:
     return max(1, min(value, settings.max_slides))
 
 
+def _load_resume_draft(
+    task_input: Mapping[str, Any], theme: str, max_slides: int
+) -> DeckDraft | None:
+    """Load the checkpoint named by the optional ``draft_id`` task input
+    (None when the input is absent; a present-but-empty or malformed value
+    is an invalid id and fails like any other). The store's own
+    DraftStoreError messages (bad id, pruned draft, corrupt file) are
+    user-correctable and surface verbatim as the task's DeckError so the
+    re-run remedy rides along. Compatibility: the prompt may be rephrased
+    freely (it is not compared), but theme and max_slides must match -
+    'auto' accepts whatever theme the checkpointed outline picked, any
+    other task theme must equal the checkpoint's. The flag
+    ``settings.drafts_enabled`` gates WRITING new checkpoints, not reading
+    a draft the user explicitly names."""
+    raw = task_input.get("draft_id")
+    if raw is None:
+        return None
+    draft_id = raw.strip() if isinstance(raw, str) else str(raw)
+    try:
+        draft = load_draft(_drafts_base_dir(), draft_id)
+    except DraftStoreError as exc:
+        raise DeckError(str(exc)) from exc
+    if theme not in (THEME_AUTO, draft.theme) or draft.max_slides != max_slides:
+        raise DeckError(
+            f"The saved draft {draft_id!r} cannot be resumed for this task: it "
+            f"was checkpointed with theme {draft.theme!r} and max_slides "
+            f"{draft.max_slides}, but this task asks for theme {theme!r} and "
+            f"max_slides {max_slides}. Re-run without draft_id to generate "
+            "from scratch."
+        )
+    return draft
+
+
+def _outline_from_checkpoint(
+    draft: DeckDraft, image_count: int, settings: Settings
+) -> DeckOutline:
+    """Rebuild the DeckOutline from the checkpoint's stored outline JSON:
+    re-serialized and re-parsed through the SAME strict outline gate
+    (:func:`parse_outline`: shapes, theme, bounds, image coverage), so a
+    resumed plan is exactly as valid as a fresh one and every downstream
+    consumer (slide prompts, assembly, chrome) sees a normal outline."""
+    try:
+        return parse_outline(
+            json.dumps(draft.outline), settings.max_slides, image_count
+        )
+    except DeckError as exc:
+        raise DeckError(
+            f"The saved draft {draft.draft_id!r} has an unusable outline "
+            f"({exc}). Re-run without draft_id to generate from scratch."
+        ) from exc
+
+
+def _author_slide_markdowns(
+    nc: NextcloudApp,
+    outline: DeckOutline,
+    settings: Settings,
+    task_id: int,
+    image_file_ids: list[int],
+    deadline: float,
+    drafts: _DraftSession,
+) -> list[str]:
+    """Phase 2 slide loop: author (or, on a resume, reuse from the
+    checkpoint) every planned slide in order, checkpointing each
+    completion and each retry exhaustion as it happens. A slide whose
+    attempts are exhausted raises the last DeckError. Scheduling and
+    unexpected failures (NestedTaskError, the shared-budget cap raised
+    outside the per-attempt handling, any bug) have NO DeckError handler
+    inside ``_generate_slide``, so they are caught here solely to
+    checkpoint the interrupted slide as failed before propagating: the
+    slides that did complete are already durable at that point."""
+    total_attempts = 2 if settings.retry_llm else 1
+    slide_markdowns: list[str] = []
+    for number in range(1, len(outline.slides) + 1):
+        title = outline.slides[number - 1].title
+        reused = drafts.reusable_slide(number)
+        if reused is not None:
+            slide_markdowns.append(reused)
+            continue
+        try:
+            markdown, attempts_used = _generate_slide(
+                nc, outline, number, settings, task_id, image_file_ids, deadline
+            )
+        except DeckError:
+            # retries exhausted, or the shared LLM budget refused the
+            # round (also a DeckError, raised outside the per-attempt
+            # try): either way the slide is regenerable on resume
+            drafts.slide_failed(number, title, total_attempts)
+            raise
+        except Exception:
+            # checkpoint-then-fail for everything that bypasses the
+            # per-slide retry machinery (see the docstring)
+            drafts.slide_interrupted(number, title)
+            raise
+        drafts.slide_done(number, title, markdown, attempts_used)
+        slide_markdowns.append(markdown)
+    return slide_markdowns
+
+
 def _author_validated_deck(
     nc: NextcloudApp,
     prompt: str,
@@ -592,6 +902,7 @@ def _author_validated_deck(
     task_id: int,
     image_file_ids: list[int],
     max_slides: int = 8,
+    drafts: _DraftSession | None = None,
 ) -> tuple[ValidatedDeck, str]:
     """Author the deck in two phases and strictly validate the result.
 
@@ -618,23 +929,48 @@ def _author_validated_deck(
     downloads, the PPTX build and prompt/output_format/theme/images-slot
     validation are never retried here: those are not output-quality
     failures.
+
+    Draft checkpoints (``drafts`` session): a resumed task consumes the
+    checkpointed outline on its FIRST attempt (no outline LLM round) and
+    the slide loop reuses done slides verbatim; every outline completion
+    (fresh or re-authoring) and every slide outcome is checkpointed as it
+    happens (see :class:`_DraftSession`). A re-authoring attempt resets
+    the checkpoint in place - one draft id per task.
     """
     deadline = monotonic() + settings.total_llm_timeout_s
+    # a missing session (direct callers) behaves like drafts disabled
+    if drafts is None:
+        drafts = _DraftSession(enabled=False, task_id=task_id)
     attempts = 2 if settings.retry_llm else 1
     feedback: str | None = None
     last_error = DeckError("deck authoring failed")
+    resume_outline = drafts.resume_outline
     for deck_attempt in range(1, attempts + 1):
-        outline = _generate_outline(
-            nc,
-            prompt,
-            theme,
-            settings,
-            task_id,
-            len(image_file_ids),
-            deadline,
-            feedback=feedback,
-            max_slides=max_slides,
-        )
+        if resume_outline is not None:
+            # a resumed task reuses the checkpointed plan verbatim; only
+            # the first attempt does (a re-authoring after a deck-level
+            # failure re-plans through the LLM like any fresh deck)
+            outline = resume_outline
+            resume_outline = None
+            LOGGER.info(
+                "Task %s: reusing checkpointed outline (%d slides, theme %s)",
+                task_id,
+                len(outline.slides),
+                outline.theme,
+            )
+        else:
+            outline = _generate_outline(
+                nc,
+                prompt,
+                theme,
+                settings,
+                task_id,
+                len(image_file_ids),
+                deadline,
+                feedback=feedback,
+                max_slides=max_slides,
+            )
+            drafts.outline_ready(outline)
         LOGGER.info(
             "Task %s: outline ready (%d slides, theme %s)",
             task_id,
@@ -644,12 +980,9 @@ def _author_validated_deck(
         _report_progress(
             nc, task_id, 10.0, f"outline ready ({len(outline.slides)} slides)"
         )
-        slide_markdowns = [
-            _generate_slide(
-                nc, outline, number, settings, task_id, image_file_ids, deadline
-            )
-            for number in range(1, len(outline.slides) + 1)
-        ]
+        slide_markdowns = _author_slide_markdowns(
+            nc, outline, settings, task_id, image_file_ids, deadline, drafts
+        )
         markdown = assemble_deck(outline, slide_markdowns)
         validated = validate_deck(
             markdown, settings.max_deck_bytes, settings.max_slides
@@ -1024,11 +1357,115 @@ def _report_error(
         LOGGER.exception("Failed to report error result for task %s", task_id)
 
 
+def _draft_deck_stem(draft: DeckDraft) -> str:
+    """The deck-stem half of the draft's user-Files name
+    (``<stem>.draft.md``): derived from the checkpointed outline title
+    through the SAME filename sanitizer every deliverable uses, with the
+    checkpointed prompt as the title fallback."""
+    title = draft.outline.get("title")
+    frontmatter = {"title": title} if isinstance(title, str) else None
+    deck_markdown_name = source_markdown_filename(
+        build_deck_filename(frontmatter, draft.prompt, "pptx")
+    )
+    return deck_markdown_name[: -len(".md")]
+
+
+def _deliver_draft_copy(
+    nc: NextcloudApp, user_id: str | None, draft: DeckDraft, settings: Settings
+) -> None:
+    """Fail-soft delivery of the draft into the user's Files via the
+    sibling draft-delivery unit (a separate wave unit: the LAZY import
+    keeps both branches independently green until the orchestrator
+    merges them). Called only when ``settings.drafts_folder`` is
+    non-empty: that folder is the deployment's opt-in for Files copies.
+    Delivery failures only log: they must never affect the (already
+    failed) task."""
+    if not settings.drafts_folder:
+        return
+    if not user_id:
+        LOGGER.debug(
+            "No task owner; skipping the Files copy of draft %s", draft.draft_id
+        )
+        return
+    try:
+        # the ignore covers both merge states: import-not-found while the
+        # sibling unit is absent, unused-ignore once it is merged in
+        from .draft_delivery import (  # type: ignore[import-not-found, unused-ignore]  # noqa: PLC0415 - lazy seam: the sibling unit may be absent until the branches merge
+            deliver_draft,
+        )
+    except ImportError:
+        LOGGER.debug(
+            "Draft delivery unit not available; skipping the Files copy of draft %s",
+            draft.draft_id,
+        )
+        return
+    try:
+        deliver_draft(
+            nc, user_id, draft, _draft_deck_stem(draft), settings.drafts_folder
+        )
+    except Exception as exc:  # noqa: BLE001 - fail-soft by contract: delivery must never affect the task
+        LOGGER.warning(
+            "Delivery of draft %s to the Files folder %r failed (%s); continuing",
+            draft.draft_id,
+            settings.drafts_folder,
+            exc,
+        )
+
+
+def _prune_draft_checkpoints(settings: Settings, task_id: int) -> None:
+    """Retention after the task's outcome is reported (success or failure
+    alike): keep at most ``settings.drafts_max_kept`` drafts, newest
+    first. Runs regardless of ``drafts_enabled`` so drafts written before
+    the feature was turned off are reaped too. Fail-soft: a pruning
+    problem logs and never affects the finished task."""
+    try:
+        removed = prune_drafts(_drafts_base_dir(), keep=settings.drafts_max_kept)
+    except Exception as exc:  # noqa: BLE001 - fail-soft by contract: retention must never fail the task
+        LOGGER.warning("Task %s: draft pruning failed (%s); continuing", task_id, exc)
+        return
+    if removed:
+        LOGGER.info("Task %s: pruned %d old draft checkpoint(s)", task_id, len(removed))
+
+
+def _report_task_failure(
+    nc: NextcloudApp,
+    task_id: int,
+    base_message: str,
+    technical_message: str,
+    drafts: _DraftSession,
+    user_id: str | None,
+    settings: Settings,
+) -> None:
+    """Report a failed task's result: the user-facing message is the base
+    error plus, when the checkpoint holds at least one completed slide,
+    EXACTLY ONE appended line naming the draft id and the resume input
+    (never when drafts are disabled - no checkpoint exists then - or the
+    checkpoint is empty: there would be nothing to continue from). The
+    same gate triggers the fail-soft user-Files copy of the draft when
+    the deployment configured ``drafts_folder`` (a failed task's output
+    panel hides files, so a Files copy is the owner's access path to the
+    partial deck)."""
+    message = base_message
+    draft = drafts.draft
+    if draft is not None and drafts.done_slides > 0:
+        _deliver_draft_copy(nc, user_id, draft, settings)
+        message = (
+            f"{message} A draft of the completed slides was saved "
+            f"(draft id: {draft.draft_id}); "
+            f"re-run with draft_id={draft.draft_id} to continue from it."
+        )
+    _report_error(nc, task_id, message, technical_message)
+
+
 def process_task(nc: NextcloudApp, task: Mapping[str, Any], settings: Settings) -> None:
     """Run the full pipeline for one claimed task; never raises (all failures
     are reported via ``report_result``). Dispatches on the task type: the
     authoring task (LLM round + shared render phase) or the deterministic
-    re-render task (validation + shared render phase, no LLM)."""
+    re-render task (validation + shared render phase, no LLM). Generation
+    tasks checkpoint their progress as a draft and, on failure, name the
+    draft id in the user-facing error so a follow-up task can resume;
+    after every task outcome the draft store is pruned to the retention
+    cap."""
     try:
         task_id = int(task["id"])
     except (KeyError, TypeError, ValueError):
@@ -1042,17 +1479,20 @@ def process_task(nc: NextcloudApp, task: Mapping[str, Any], settings: Settings) 
     re_render = task.get("type") == RE_RENDER_TASK_TYPE_ID
     verb = "re-render" if re_render else "generation"
     markdown: str | None = None
+    drafts = _DraftSession(enabled=settings.drafts_enabled, task_id=task_id)
+    user_id: str | None = None
     # Impersonate the scheduling user: app-context DAV/WebDAV requests (file
     # downloads for the images slot) authenticate as
     # AUTHORIZATION-APP-API: base64("<user>:<secret>") and an empty user is
     # a hard 401 (observed live; the nc_py_api session defaults _user to "").
     if task.get("userId"):
-        nc.set_user(str(task["userId"]))
+        user_id = str(task["userId"])
+        nc.set_user(user_id)
     try:
         if re_render:
             markdown = _re_render_deck(nc, task_input, settings, task_id)
         else:
-            markdown = _generate_deck(nc, task_input, settings, task_id)
+            markdown = _generate_deck(nc, task_input, settings, task_id, drafts)
     except DeckError as exc:
         _log_deck_failure(
             task_id,
@@ -1061,28 +1501,58 @@ def process_task(nc: NextcloudApp, task: Mapping[str, Any], settings: Settings) 
             exc,
             log_excerpt=settings.log_excerpt,
         )
-        _report_error(nc, task_id, f"Slide deck {verb} failed: {exc}", str(exc))
+        _report_task_failure(
+            nc,
+            task_id,
+            f"Slide deck {verb} failed: {exc}",
+            str(exc),
+            drafts,
+            user_id,
+            settings,
+        )
     except NestedTaskError as exc:
         LOGGER.warning("Task %s failed (inner LLM task): %s", task_id, exc)
-        _report_error(nc, task_id, f"Slide deck {verb} failed: {exc}", str(exc))
+        _report_task_failure(
+            nc,
+            task_id,
+            f"Slide deck {verb} failed: {exc}",
+            str(exc),
+            drafts,
+            user_id,
+            settings,
+        )
     except Exception as exc:
         LOGGER.exception("Task %s failed unexpectedly", task_id)
-        _report_error(
+        _report_task_failure(
             nc,
             task_id,
             f"Slide deck {verb} failed with an internal error. Please try again "
             "and report this to your administrator if it keeps happening.",
             repr(exc),
+            drafts,
+            user_id,
+            settings,
         )
+    # retention: after the outcome is reported, success or failure alike
+    _prune_draft_checkpoints(settings, task_id)
 
 
 def _generate_deck(
-    nc: NextcloudApp, task_input: Mapping[str, Any], settings: Settings, task_id: int
+    nc: NextcloudApp,
+    task_input: Mapping[str, Any],
+    settings: Settings,
+    task_id: int,
+    drafts: _DraftSession | None = None,
 ) -> str:
     """The authoring pipeline (the ``marp_slides:slide_deck_generation``
     task): validate the inputs, author the deck via the inner LLM, then
     render it through the shared render phase. Returns the validated
-    markdown (the caller's failure-logging excerpt source)."""
+    markdown (the caller's failure-logging excerpt source). The optional
+    ``draft_id`` input resumes a checkpointed draft: the stored outline is
+    rebuilt and reused (no outline LLM round), the checkpoint's image ids
+    ride along ONLY when the task provides none (provided images win and
+    bounds-check as usual), and the per-slide loop reuses done slides
+    verbatim while regenerating missing or failed ones."""
     output_format = validate_output_format(task_input.get("output_format"))
     theme = validate_theme(task_input.get("theme"))
     # The required input slot is 'input'; 'prompt' is read as a legacy
@@ -1090,11 +1560,41 @@ def _generate_deck(
     prompt = validate_prompt(
         task_input.get("input", task_input.get("prompt")), settings.max_prompt_chars
     )
-    image_file_ids = validate_images_slot(task_input.get("images"))
     max_slides = _validate_max_slides(task_input.get("max_slides"), settings)
-
+    image_file_ids = validate_images_slot(task_input.get("images"))
+    resumed = _load_resume_draft(task_input, theme, max_slides)
+    resume_outline: DeckOutline | None = None
+    if resumed is not None:
+        if not image_file_ids and resumed.image_file_ids:
+            image_file_ids = list(resumed.image_file_ids)
+        resume_outline = _outline_from_checkpoint(
+            resumed, len(image_file_ids), settings
+        )
+        LOGGER.info(
+            "Task %s: resuming from draft %s (%d of %d slides done)",
+            task_id,
+            resumed.draft_id,
+            sum(1 for s in resumed.slides.values() if s.status == SLIDE_DONE),
+            len(resume_outline.slides),
+        )
+    if drafts is None:
+        drafts = _DraftSession(enabled=False, task_id=task_id)
+    drafts.bind(
+        prompt=prompt,
+        max_slides=max_slides,
+        image_file_ids=image_file_ids,
+        resumed=resumed,
+        resume_outline=resume_outline,
+    )
     validated, markdown = _author_validated_deck(
-        nc, prompt, theme, settings, task_id, image_file_ids, max_slides=max_slides
+        nc,
+        prompt,
+        theme,
+        settings,
+        task_id,
+        image_file_ids,
+        max_slides=max_slides,
+        drafts=drafts,
     )
     # "all" expands to every format; each gets its own file and upload.
     # EVERY render and upload happens BEFORE the single result report:

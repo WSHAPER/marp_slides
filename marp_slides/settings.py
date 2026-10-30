@@ -94,6 +94,13 @@ DEFAULT_LOG_EXCERPT = True
 #: both gates with ``MARP_SLIDES_OVERFLOW_CHECK=false``.
 DEFAULT_OVERFLOW_CHECK = True
 
+#: Draft retention (wave draft-resume): failed attempts keep their
+#: authored slides as an atomic checkpoint on the ExApp volume so a
+#: follow-up task with draft_id resumes instead of regenerating.
+DEFAULT_DRAFTS_ENABLED = True
+DEFAULT_DRAFTS_FOLDER = ""
+DEFAULT_DRAFTS_MAX_KEPT = 20
+
 PPTX_MIME_TYPE = (
     "application/vnd.openxmlformats-officedocument.presentationml.presentation"
 )
@@ -157,6 +164,9 @@ class Settings:
     retry_llm: bool = DEFAULT_RETRY_LLM
     log_excerpt: bool = DEFAULT_LOG_EXCERPT
     overflow_check: bool = DEFAULT_OVERFLOW_CHECK
+    drafts_enabled: bool = DEFAULT_DRAFTS_ENABLED
+    drafts_folder: str = DEFAULT_DRAFTS_FOLDER
+    drafts_max_kept: int = DEFAULT_DRAFTS_MAX_KEPT
 
     @classmethod
     def from_env(cls, env: Mapping[str, str] | None = None) -> Settings:
@@ -188,5 +198,13 @@ class Settings:
             log_excerpt=_env_bool(env, "MARP_SLIDES_LOG_EXCERPT", DEFAULT_LOG_EXCERPT),
             overflow_check=_env_bool(
                 env, "MARP_SLIDES_OVERFLOW_CHECK", DEFAULT_OVERFLOW_CHECK
+            ),
+            drafts_enabled=_env_bool(
+                env, "MARP_SLIDES_DRAFTS_ENABLED", DEFAULT_DRAFTS_ENABLED
+            ),
+            drafts_folder=env.get("MARP_SLIDES_DRAFTS_FOLDER", "").strip()
+            or DEFAULT_DRAFTS_FOLDER,
+            drafts_max_kept=_env_int(
+                env, "MARP_SLIDES_DRAFTS_MAX_KEPT", DEFAULT_DRAFTS_MAX_KEPT
             ),
         )

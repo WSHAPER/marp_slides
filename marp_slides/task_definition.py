@@ -126,6 +126,16 @@ PROVIDER = TaskProcessingProvider(
             shape_type=ShapeType.NUMBER,
         ),
         ShapeDescriptor(
+            name="draft_id",
+            description=(
+                "Resume a previously failed generation: the 12-character "
+                "draft id named in the failed task's message. Completed "
+                "slides and the outline are reused; only missing slides "
+                "are generated. Omit to generate from scratch."
+            ),
+            shape_type=ShapeType.TEXT,
+        ),
+        ShapeDescriptor(
             name="images",
             description=(
                 "Optional images to place in the deck (PNG or JPEG, max 5 MB "

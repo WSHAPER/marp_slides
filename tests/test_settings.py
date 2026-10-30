@@ -76,3 +76,23 @@ def test_log_excerpt_knob() -> None:
 def test_invalid_number_raises() -> None:
     with pytest.raises(ValueError, match="APP_PORT"):
         Settings.from_env({"APP_PORT": "not-a-number"})
+
+
+def test_draft_settings_round_trip(monkeypatch) -> None:
+    """Draft retention knobs parse from env per the _env conventions:
+    bool toggle, stripped folder (empty falls back to the default), and
+    a positive int cap."""
+    monkeypatch.setenv("MARP_SLIDES_DRAFTS_ENABLED", "false")
+    monkeypatch.setenv("MARP_SLIDES_DRAFTS_FOLDER", "  Marp Slides drafts  ")
+    monkeypatch.setenv("MARP_SLIDES_DRAFTS_MAX_KEPT", "5")
+    s = Settings.from_env()
+    assert s.drafts_enabled is False
+    assert s.drafts_folder == "Marp Slides drafts"
+    assert s.drafts_max_kept == 5
+    monkeypatch.delenv("MARP_SLIDES_DRAFTS_ENABLED")
+    monkeypatch.delenv("MARP_SLIDES_DRAFTS_FOLDER")
+    monkeypatch.delenv("MARP_SLIDES_DRAFTS_MAX_KEPT")
+    s = Settings.from_env()
+    assert s.drafts_enabled is True
+    assert s.drafts_folder == ""
+    assert s.drafts_max_kept == 20

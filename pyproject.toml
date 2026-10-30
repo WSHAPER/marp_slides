@@ -142,6 +142,7 @@ layers = [
     "marp_slides.deck_pipeline",
     "marp_slides.images",
     "marp_slides.ocs_tasks",
+    "marp_slides.draft_delivery",
     "marp_slides.marp_cli",
     "marp_slides.editable_pptx",
     "marp_slides.builder",
