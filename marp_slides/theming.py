@@ -24,14 +24,23 @@ resolves identically in every consumer (the browserless gate, the
 overflow measurement's file:// page, the standalone HTML deliverable and
 the Chromium PDF render) with zero outbound fetches.
 
-The background image (when the admin set one) rides as an absolute,
-cache-busted URL on EVERY slide, UNDER a semi-opaque scrim of the
-instance color: an untinted photo can be any luminance, so the scrim
-alpha is solved from the WCAG contrast between ``background_text`` and
-the scrim blended over both a white and a black image, inside the
-0.55-0.75 design window (see :func:`_scrim_alpha`). A brand color that
-cannot reach the large-text contrast floor even at full window gets a
-neutral scrim instead, so the text stays readable under any branding.
+The background image (when the admin set one) rides the SAME data-URI
+posture: the marp conversion pipeline deliberately keeps
+``--allow-local-files`` off except for materialized deck images, and in
+that posture marp-cli's Chromium never fetches a remote ``url(...)`` at
+render time, so a theme CSS carrying the raw theming URL renders with
+the photographic background silently missing (verified in-container).
+:func:`write_theme_css` therefore fetches the image ONCE per render at
+CSS-generation time (bounded: raw bytes capped, socket timeout,
+fail-soft) and embeds it under a semi-opaque scrim of the instance
+color on EVERY slide. A failed, oversize or non-image fetch drops the
+background rule entirely: the flat instance color covers every slide
+(a branding image can never fail a render). The scrim alpha is solved
+from the WCAG contrast between ``background_text`` and the scrim
+blended over both a white and a black image, inside the 0.55-0.75
+design window (see :func:`_scrim_alpha`). A brand color that cannot
+reach the large-text contrast floor even at full window gets a neutral
+scrim instead, so the text stays readable under any branding.
 
 PPTX output ignores the theme entirely (python-pptx has no theme API);
 the theme affects html and pdf output only, matching the existing
@@ -41,7 +50,8 @@ background-image behavior.
 from __future__ import annotations
 
 import base64
-from collections.abc import Mapping
+import urllib.request
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from functools import lru_cache
 from pathlib import Path
@@ -126,6 +136,36 @@ _MID_LUMINANCE = 0.5
 #: accepts besides the 6-digit ``#RRGGBB``).
 _SHORT_HEX_DIGITS = 3
 
+#: Raw-byte cap for the admin background image fetch. The fetched bytes
+#: are embedded as base64 (4/3 inflation) into the theme CSS, which in
+#: turn rides inside the standalone HTML deliverable, so an oversized
+#: "background" must never enter the pipeline. An oversize fetch is a
+#: failed fetch: no background rule, the flat instance color instead.
+BACKGROUND_MAX_BYTES = 8 * 1024 * 1024
+
+#: Socket timeout (connect and reads) for the background fetch. The one
+#: fetch per render sits on the render's critical path, so it must give
+#: up quickly, not stall the task on a slow or dangling connection.
+_BACKGROUND_FETCH_TIMEOUT_S = 10.0
+
+#: Magic-byte signatures of the image types an admin background can be
+#: (the NC35 stock background is a webp) and that every render consumer
+#: (Chromium for the PDF, browsers for the HTML deliverable) decodes.
+#: Like the deck-image sniffing, the bytes themselves are the source of
+#: truth; the HTTP Content-Type header only breaks ties.
+_BACKGROUND_MAGIC: tuple[tuple[tuple[bytes, ...], str], ...] = (
+    ((b"\x89PNG\r\n\x1a\n",), "image/png"),
+    ((b"\xff\xd8\xff",), "image/jpeg"),
+    ((b"GIF87a", b"GIF89a"), "image/gif"),
+)
+
+#: The injected background fetch seam: takes the absolute cache-busted
+#: background URL, returns the materialized ``data:<mime>;base64,...``
+#: URI, or None on any failure (fail-soft). Production defaults to
+#: :func:`_fetch_background_uri`; unit tests inject fakes so the pure
+#: CSS generation and the plumbing both stay network-free.
+BackgroundFetch = Callable[[str], str | None]
+
 
 @dataclass(frozen=True)
 class ThemingValues:
@@ -167,7 +207,9 @@ class ThemingValues:
         )
 
 
-def generate_theme_css(values: ThemingValues) -> str:
+def generate_theme_css(
+    values: ThemingValues, *, background_data_uri: str | None = None
+) -> str:
     """Generate the complete Marp theme CSS for the given theming values.
 
     The CSS uses the ``@theme nextcloud`` metadata comment so marp-cli can
@@ -181,8 +223,16 @@ def generate_theme_css(values: ThemingValues) -> str:
     metrics (font sizes, paddings, heading sizes) are never overridden:
     only colors, fonts and backgrounds, so a nextcloud-theme deck
     measures, gates and fits exactly like a default-theme deck.
+
+    This function is pure (no network): when the admin background is an
+    http(s) URL, the image bytes must have been fetched by the caller and
+    passed as ``background_data_uri`` (a ``data:<mime>;base64,...`` URI,
+    the form :func:`write_theme_css` materializes once per render). A URL
+    background without a data URI emits no background rule at all - the
+    fail-soft flat instance color - because the remote-URL form renders
+    hollow everywhere the pipeline runs (see the module docstring).
     """
-    background_css = _background_css(values)
+    background_css = _background_css(values, background_data_uri)
     return f"""/*! @theme {THEME_NAME} */
 /* Instance-branded theme generated from Nextcloud theming values. */
 /* Regenerated on every render; changes to admin branding apply to the next deck. */
@@ -261,11 +311,32 @@ table tbody tr:nth-child(even) {{
 {background_css}"""
 
 
-def write_theme_css(values: ThemingValues, workdir: str | Path) -> Path:
+def write_theme_css(
+    values: ThemingValues,
+    workdir: str | Path,
+    *,
+    background_fetch: BackgroundFetch | None = None,
+) -> Path:
     """Write the generated theme CSS into the render workdir and return
-    its path (for passing to marp-cli's ``--theme-set``)."""
+    its path (for passing to marp-cli's ``--theme-set``).
+
+    This is the background materialization seam: the theme CSS is written
+    once per render, and an http(s) admin background is fetched ONCE here
+    (not once per slide; the bytes embed into the one CSS) and handed to
+    :func:`generate_theme_css` as a base64 data URI. ``background_fetch``
+    defaults to the bounded, fail-soft :func:`_fetch_background_uri`;
+    tests inject fakes so nothing in the unit suite touches the network.
+    A failed fetch means no background rule in the CSS: the flat
+    instance color covers every slide, and the render proceeds.
+    """
+    fetch = _fetch_background_uri if background_fetch is None else background_fetch
+    data_uri: str | None = None
+    if values.background.startswith(("http://", "https://")):
+        data_uri = fetch(_cache_busted_background_url(values))
     css_path = Path(workdir) / f"{THEME_NAME}-theme.css"
-    css_path.write_text(generate_theme_css(values), encoding="utf-8")
+    css_path.write_text(
+        generate_theme_css(values, background_data_uri=data_uri), encoding="utf-8"
+    )
     return css_path
 
 
@@ -287,14 +358,22 @@ def _inter_font_css() -> str:
     return "\n".join(face(*spec) for spec in _INTER_FACES)
 
 
-def _background_css(values: ThemingValues) -> str:
+def _background_css(values: ThemingValues, background_data_uri: str | None) -> str:
     """Generate the every-slide background block from the theming values.
 
     A plain ``#RRGGBB`` becomes a solid color; an http(s) URL becomes a
-    ``background-image`` with the cache-buster appended for freshness, and
-    a semi-opaque scrim of the instance color layered over the image (the
-    first background layer paints on top) so ``background-text`` stays
-    readable over an arbitrary photo.
+    ``background-image`` carrying the ALREADY-FETCHED ``background_data_uri``
+    (base64 bytes embedded in the CSS, zero remote fetches downstream:
+    the pipeline's marp conversions keep ``--allow-local-files`` off
+    except for materialized deck images, and under that posture nothing
+    ever loads a remote ``url(...)``, so the URL form would render
+    hollow), with a semi-opaque scrim of the instance color layered over
+    the image (the first background layer paints on top) so
+    ``background-text`` stays readable over an arbitrary photo. A URL
+    background without a data URI (the fetch failed, was oversize, or
+    the value is neither a color nor http(s)) emits no rule at all: the
+    flat instance color of the base ``section`` rule covers every slide,
+    fail-soft by design.
 
     The rule targets EVERY section through the plain ``section`` token —
     the one selector marp-cli's container-scoping rewrite handles
@@ -332,18 +411,79 @@ def _background_css(values: ThemingValues) -> str:
             f"    color: {values.background_text};\n"
             f"}}\n"
         )
-    separator = "&" if "?" in background else "?"
-    url = f"{background}{separator}v={values.cache_buster}"
+    if background_data_uri is None:
+        return ""
     scrim_alpha, scrim_tint = _scrim_alpha(values.color, values.background_text)
     scrim = _rgba_css(scrim_tint, scrim_alpha)
     return (
         f"\n{selector} {{\n"
-        f"    background-image: linear-gradient({scrim}, {scrim}), url('{url}');\n"
+        f"    background-image: linear-gradient({scrim}, {scrim}), "
+        f"url('{background_data_uri}');\n"
         f"    background-size: cover;\n"
         f"    background-position: center;\n"
         f"    color: {values.background_text};\n"
         f"}}\n"
     )
+
+
+def _cache_busted_background_url(values: ThemingValues) -> str:
+    """The absolute background URL with the theming cache-buster appended:
+    the exact URL a browser session on the instance would load (fresh
+    through any proxy), and therefore the URL the one background fetch
+    per render asks for. The URL is used verbatim as the theming values
+    carry it - never reconstructed - because instance configs (ported
+    stacks, overwritehost) are the source of truth for their own URLs."""
+    separator = "&" if "?" in values.background else "?"
+    return f"{values.background}{separator}v={values.cache_buster}"
+
+
+def _sniff_image_mime(data: bytes) -> str | None:
+    """The image MIME type read from the bytes' magic signatures (PNG,
+    JPEG, GIF, WebP), or None when the bytes are none of those. Bytes
+    over server metadata, same as the deck-image sniffing."""
+    for signatures, mime in _BACKGROUND_MAGIC:
+        if data.startswith(signatures):
+            return mime
+    if data[0:4] == b"RIFF" and data[8:12] == b"WEBP":
+        return "image/webp"
+    return None
+
+
+def _background_data_uri(data: bytes, content_type: str) -> str | None:
+    """Turn fetched bytes into a CSS-embeddable ``data:<mime>;base64,...``
+    URI, or None when the bytes are unusable: oversize past the raw-byte
+    cap, or identifiable as an image by neither magic bytes nor an
+    ``image/*`` Content-Type header."""
+    if len(data) > BACKGROUND_MAX_BYTES:
+        return None
+    mime = _sniff_image_mime(data)
+    if not mime and content_type.startswith("image/"):
+        mime = content_type
+    if not mime:
+        return None
+    encoded = base64.b64encode(data).decode("ascii")
+    return f"data:{mime};base64,{encoded}"
+
+
+def _fetch_background_uri(url: str) -> str | None:
+    """Fetch the admin background image once and return it as a base64
+    data URI, or None on any failure (fail-soft: no background rule, the
+    flat instance color). The fetch is bounded on every axis: http(s)
+    URLs only, one socket timeout for connect and reads, and a read of
+    at most one byte past the raw-byte cap (a larger body is abandoned
+    mid-stream, never buffered). The scheme gate and the exception net
+    (network errors, HTTP error statuses, bad URLs) both fail soft."""
+    if not url.startswith(("http://", "https://")):
+        return None
+    try:
+        with urllib.request.urlopen(  # noqa: S310 - scheme-gated http(s), the instance's own theming URL
+            url, timeout=_BACKGROUND_FETCH_TIMEOUT_S
+        ) as response:
+            data = response.read(BACKGROUND_MAX_BYTES + 1)
+            content_type = str(response.headers.get_content_type())
+    except (OSError, ValueError):
+        return None
+    return _background_data_uri(data, content_type)
 
 
 def _rgb(color: str) -> tuple[int, int, int]:

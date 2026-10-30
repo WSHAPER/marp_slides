@@ -1,18 +1,24 @@
 """The generated nextcloud theme: default-derivation, bundled Inter, the
-contrast-derived background scrim, and the heading treatment, all pinned
+contrast-derived background scrim (embedded as a fetched data URI), the
+heading treatment, and the background materialization seam, all pinned
 against the reference theme (rnd195's modern.css structure: derive from
 ``default``, override branding, never the slide metrics)."""
 
 from __future__ import annotations
 
 import base64
+import email.message
 import re
+import urllib.request
 
 from marp_slides.theming import (
     _SCRIM_ALPHA_WINDOW,
+    BACKGROUND_MAX_BYTES,
     THEME_NAME,
     ThemingValues,
+    _background_data_uri,
     _contrast,
+    _fetch_background_uri,
     _scrim_alpha,
     generate_theme_css,
     write_theme_css,
@@ -38,6 +44,12 @@ LIVE_CAPS = {
 def caps(**overrides: str) -> ThemingValues:
     merged = {**LIVE_CAPS, **overrides}
     return ThemingValues.from_capabilities(merged)
+
+
+#: Tiny fake PNG bytes and their materialized data URI: what an injected
+#: fetch returns in the seam tests below.
+_PNG_BYTES = b"\x89PNG\r\n\x1a\n" + b"payload" * 4
+_PNG_DATA_URI = f"data:image/png;base64,{base64.b64encode(_PNG_BYTES).decode('ascii')}"
 
 
 # --- derivation: default metrics, branding on top -------------------------------
@@ -158,24 +170,24 @@ def test_inter_faces_embedded_as_data_uris() -> None:
 
 
 def test_background_image_and_scrim_on_every_slide() -> None:
-    """An admin background image is baked onto EVERY slide, not just the
-    first: the rule's selector is the plain ``section`` token (marp-cli's
-    container-scoping rewrite expands it to every rendered section in
-    the svg scaffold), under a semi-opaque scrim of the instance color
-    (first background layer paints on top) with the cache-buster
-    appended, and the slide text color switches to background_text —
-    the pairing the scrim alpha is solved for."""
-    css = generate_theme_css(caps())
+    """An admin background image is baked onto EVERY slide as an embedded
+    base64 data URI (bytes fetched once at CSS-generation time, the same
+    posture as the bundled Inter faces and the deck images), under a
+    semi-opaque scrim of the instance color (first background layer
+    paints on top), and the slide text color switches to background_text
+    — the pairing the scrim alpha is solved for. The remote-URL form is
+    pinned OUT: under the pipeline's deliberate no-remote-fetch posture
+    (``--allow-local-files`` stays off) nothing ever loads it, so it
+    renders hollow (the silent-vanishing background this fix replaces)."""
+    css = generate_theme_css(caps(), background_data_uri=_PNG_DATA_URI)
     block = re.search(r"section \{[^}]*background-image:[^}]*\}", css)
     assert block is not None
     rule = block.group(0)
     assert "linear-gradient(" in rule
     assert rule.index("linear-gradient(") < rule.index("url('")  # scrim on top
-    assert (
-        "url('http://nextcloud.local:8350/apps/theming/img/background"
-        "/jo-myoung-hee-fluid.webp?v=1d9e0e2e')" in rule
-    )
+    assert f"url('{_PNG_DATA_URI}')" in rule
     assert "color: #ffffff" in rule
+    assert "nextcloud.local" not in rule  # no remote URL rides the CSS
 
 
 def test_background_rule_has_no_first_slide_scoping() -> None:
@@ -190,7 +202,7 @@ def test_background_rule_has_no_first_slide_scoping() -> None:
     is the LAST section block in the CSS (same-specificity cascade over
     the base rule's background-color/color), not an override hanging off
     a positional selector."""
-    css = generate_theme_css(caps())
+    css = generate_theme_css(caps(), background_data_uri=_PNG_DATA_URI)
     body = re.sub(r"/\*.*?\*/", "", css, flags=re.DOTALL)
     # every rule whose selector targets a section must be positional-free
     section_selectors = [
@@ -211,7 +223,9 @@ def test_scrim_only_when_background_image_set() -> None:
     """No background value: no background block at all (the solid
     instance color already covers every slide, and the base rule is the
     only section block). A plain color: a uniform section block carries
-    the color swap and there is no image and no scrim to solve for."""
+    the color swap and there is no image and no scrim to solve for. A
+    URL background whose fetch yielded nothing (no data URI): the same
+    no-block fail-soft, because the remote-URL form renders hollow."""
     empty = generate_theme_css(caps(background=""))
     assert empty.count("section {") == 1  # only the base branding rule
     plain = generate_theme_css(caps(background="#102a43"))
@@ -219,6 +233,9 @@ def test_scrim_only_when_background_image_set() -> None:
     assert block is not None
     assert "linear-gradient" not in block.group(0)
     assert "url(" not in block.group(0)
+    hollow = generate_theme_css(caps())
+    assert "background-image" not in hollow
+    assert hollow.count("section {") == 1  # fail-soft to the flat color
 
 
 def test_pptx_path_stays_theme_less() -> None:
@@ -337,10 +354,149 @@ def test_light_branding_tints_flip_with_the_text_color() -> None:
     assert "rgba(34, 34, 34, 0.12)" in css
 
 
-# --- write_theme_css ------------------------------------------------------------
+# --- write_theme_css: the background materialization seam ------------------------
 
 
 def test_write_theme_css_writes_regenerated_css(tmp_path) -> None:
-    path = write_theme_css(caps(), tmp_path)
+    path = write_theme_css(
+        caps(), tmp_path, background_fetch=lambda _url: _PNG_DATA_URI
+    )
     assert path.name == f"{THEME_NAME}-theme.css"
-    assert path.read_text() == generate_theme_css(caps())
+    assert path.read_text() == generate_theme_css(
+        caps(), background_data_uri=_PNG_DATA_URI
+    )
+
+
+def test_write_theme_css_fetches_the_background_once(tmp_path) -> None:
+    """The seam contract: an http(s) background is fetched exactly ONCE
+    per write (the CSS embeds the bytes; one fetch per render, not one
+    per slide), at the cache-busted URL a browser session on the
+    instance would load, and the returned data URI is the one embedded
+    in the written CSS."""
+    calls: list[str] = []
+
+    def recording_fetch(url: str) -> str | None:
+        calls.append(url)
+        return _PNG_DATA_URI
+
+    css = write_theme_css(caps(), tmp_path, background_fetch=recording_fetch)
+    assert calls == [
+        (
+            "http://nextcloud.local:8350/apps/theming/img/background/"
+            "jo-myoung-hee-fluid.webp?v=1d9e0e2e"
+        )
+    ]
+    assert f"url('{_PNG_DATA_URI}')" in css.read_text()
+
+
+def test_write_theme_css_fetch_failure_fails_soft_to_flat_color(tmp_path) -> None:
+    """A failed fetch (unreachable, oversize, timeout - the one None
+    shape) never fails the render: no background-image rule, and the
+    flat instance color of the base section rule covers every slide."""
+    css = write_theme_css(
+        caps(), tmp_path, background_fetch=lambda _url: None
+    ).read_text()
+    assert "background-image" not in css
+    assert "background-color: #00679e" in css
+
+
+def test_write_theme_css_plain_backgrounds_never_fetch(tmp_path) -> None:
+    """Only an http(s) background triggers the fetch: an empty or a plain
+    color background never asks the network for anything."""
+    calls: list[str] = []
+
+    def recording_fetch(url: str) -> str | None:
+        calls.append(url)
+        return _PNG_DATA_URI
+
+    write_theme_css(caps(background=""), tmp_path, background_fetch=recording_fetch)
+    write_theme_css(
+        caps(background="#102a43"), tmp_path, background_fetch=recording_fetch
+    )
+    assert calls == []
+
+
+# --- the bounded background fetch -------------------------------------------------
+
+
+def test_background_data_uri_sniffs_and_caps() -> None:
+    """The pure fetch-result builder: magic bytes pick the MIME (PNG,
+    JPEG, GIF, and the WebP of the NC35 stock background) over any
+    header, an image/* Content-Type header breaks ties for unknown
+    bytes, the raw-byte cap rejects oversize payloads (base64 inflates
+    them 4/3 into the HTML deliverable), and unidentifiable bytes never
+    embed."""
+    for payload, mime in (
+        (b"\x89PNG\r\n\x1a\nrest", "image/png"),
+        (b"\xff\xd8\xffrest", "image/jpeg"),
+        (b"GIF89arest", "image/gif"),
+        (b"RIFF\x00\x00\x00\x00WEBPVP8 ", "image/webp"),
+    ):
+        assert _background_data_uri(payload, "application/octet-stream") == (
+            f"data:{mime};base64,{base64.b64encode(payload).decode('ascii')}"
+        )
+    assert _background_data_uri(b"opaque-bytes", "image/webp") == (
+        f"data:image/webp;base64,{base64.b64encode(b'opaque-bytes').decode('ascii')}"
+    )
+    assert _background_data_uri(b"opaque-bytes", "text/html") is None
+    oversize = b"\x89PNG\r\n\x1a\n" + b"0" * BACKGROUND_MAX_BYTES
+    assert _background_data_uri(oversize + b"!", "image/png") is None
+
+
+def test_fetch_background_uri_is_bounded_and_fail_soft(monkeypatch) -> None:
+    """The network wrapper: only http(s) URLs ever reach urlopen (any
+    other scheme is refused without a request), the socket timeout is
+    the documented bound, transport failures return None (fail-soft),
+    and a successful response is read at most one byte past the cap
+    before the data URI is built from its sniffed content."""
+    opened: list[tuple[str, float]] = []
+
+    class _FakeResponse:
+        def __init__(self, data: bytes, content_type: str) -> None:
+            self._data = data
+            self.headers = email.message.Message()
+            self.headers["Content-Type"] = content_type
+
+        def read(self, size: int = -1) -> bytes:
+            return self._data if size < 0 else self._data[:size]
+
+        def __enter__(self) -> _FakeResponse:
+            return self
+
+        def __exit__(self, *_args: object) -> None:
+            return None
+
+    def fake_urlopen(url: str, timeout: float = -1) -> _FakeResponse:
+        opened.append((url, timeout))
+        return _FakeResponse(b"\x89PNG\r\n\x1a\npayload", "image/png")
+
+    monkeypatch.setattr(urllib.request, "urlopen", fake_urlopen)
+    uri = _fetch_background_uri("https://cloud.example/instance-bg")
+    assert uri is not None
+    assert uri.startswith("data:image/png;base64,")
+    assert uri == _background_data_uri(b"\x89PNG\r\n\x1a\npayload", "image/png")
+    assert opened == [("https://cloud.example/instance-bg", 10.0)]
+
+    # non-http(s) targets never issue a request
+    opened.clear()
+    assert _fetch_background_uri("file:///etc/passwd") is None
+    assert _fetch_background_uri("apps/theming/img/background/x.webp") is None
+    assert opened == []
+
+    # transport failure: fail-soft None, never an exception
+    def dead_urlopen(url: str, timeout: float = -1) -> _FakeResponse:
+        raise OSError("unreachable")
+
+    monkeypatch.setattr(urllib.request, "urlopen", dead_urlopen)
+    assert _fetch_background_uri("https://cloud.example/instance-bg") is None
+
+    # oversize body: the bounded read alone caps the download, no URI
+    big = _FakeResponse(
+        b"\x89PNG\r\n\x1a\n" + b"0" * (BACKGROUND_MAX_BYTES + 5), "image/png"
+    )
+
+    def big_urlopen(url: str, timeout: float = -1) -> _FakeResponse:
+        return big
+
+    monkeypatch.setattr(urllib.request, "urlopen", big_urlopen)
+    assert _fetch_background_uri("https://cloud.example/instance-bg") is None
