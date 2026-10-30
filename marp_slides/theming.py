@@ -25,8 +25,8 @@ overflow measurement's file:// page, the standalone HTML deliverable and
 the Chromium PDF render) with zero outbound fetches.
 
 The background image (when the admin set one) rides as an absolute,
-cache-busted URL on the title slide only, UNDER a semi-opaque scrim of
-the instance color: an untinted photo can be any luminance, so the scrim
+cache-busted URL on EVERY slide, UNDER a semi-opaque scrim of the
+instance color: an untinted photo can be any luminance, so the scrim
 alpha is solved from the WCAG contrast between ``background_text`` and
 the scrim blended over both a white and a black image, inside the
 0.55-0.75 design window (see :func:`_scrim_alpha`). A brand color that
@@ -175,8 +175,8 @@ def generate_theme_css(values: ThemingValues) -> str:
     ``@import "default"`` (default slide metrics: the density contract the
     authoring prompts teach against), and layers the instance branding on
     top: the bundled Inter faces, the instance color as the slide
-    background with its ``color-text`` pair, the title-slide background
-    image behind a contrast-checked scrim, and translucent re-tints of
+    background with its ``color-text`` pair, the background image behind
+    a contrast-checked scrim on every slide, and translucent re-tints of
     code blocks, tables and quotes that adapt to any branding. Box
     metrics (font sizes, paddings, heading sizes) are never overridden:
     only colors, fonts and backgrounds, so a nextcloud-theme deck
@@ -288,7 +288,7 @@ def _inter_font_css() -> str:
 
 
 def _background_css(values: ThemingValues) -> str:
-    """Generate the title-slide background block from the theming values.
+    """Generate the every-slide background block from the theming values.
 
     A plain ``#RRGGBB`` becomes a solid color; an http(s) URL becomes a
     ``background-image`` with the cache-buster appended for freshness, and
@@ -296,28 +296,38 @@ def _background_css(values: ThemingValues) -> str:
     first background layer paints on top) so ``background-text`` stays
     readable over an arbitrary photo.
 
-    The rule targets the FIRST rendered slide through marpit's positional
-    section id (``id="1"``, emitted structurally, paginate or not) as the
-    CSS-escaped selector ``section#\\31`` (an id may not start with a
-    digit, so the literal ``section#1`` is not a valid selector and the
-    parser would drop the rule). The naive alternatives do not work:
-    ``section:first-of-type`` matches EVERY slide (each section is the
-    only section child of its own ``foreignObject`` in marp's svg
-    scaffold), and selectors that qualify an ancestor before the
-    ``section`` token get mangled by marp-cli's container-scoping
-    rewrite (it expands ``section`` into
-    ``div > svg > foreignObject > section`` wherever it stands). Without
-    a background value there is no rule at all: the solid instance color
-    covers every slide. The scrim alpha is solved from the text/brand
-    contrast, not assumed (see :func:`_scrim_alpha`).
+    The rule targets EVERY section through the plain ``section`` token —
+    the one selector marp-cli's container-scoping rewrite handles
+    verbatim (it expands ``section`` into
+    ``div > svg > foreignObject > section`` wherever it stands, verified
+    against a real render) — and it is appended LAST so its declarations
+    win the same-specificity cascade over the base ``section`` rule
+    above. The earlier title-slide scoping (``section#\\31``, marpit's
+    positional ``id="1"``: the CSS-escaped id selector matched only the
+    first rendered section, the exact live-observed failure — slide 1
+    carried the brand image, slides 2+ fell back to the flat instance
+    color) is gone, and no positional form may come back: an id may not
+    start with a digit (the literal ``section#1`` is not a valid
+    selector), and selectors that qualify an ancestor before the
+    ``section`` token get mangled by the container-scoping rewrite.
+
+    Per-slide ``![bg]`` directives are unaffected and keep working on
+    top: marpit paints them on a ``<figure>`` inside a dedicated
+    background-layer section and forces that slide's content/pseudo
+    layers ``background: transparent !important`` (its own rules carry
+    the ``!important``, verified in the rendered HTML), so the user's
+    image covers the brand background wherever the author placed it.
+    Without a background value there is no rule at all: the solid
+    instance color covers every slide. The scrim alpha is solved from
+    the text/brand contrast, not assumed (see :func:`_scrim_alpha`).
     """
     background = values.background
     if not background:
         return ""
-    selector = r"section#\31 "
+    selector = "section"
     if background.startswith("#"):
         return (
-            f"\n{selector}{{\n"
+            f"\n{selector} {{\n"
             f"    background-color: {background};\n"
             f"    color: {values.background_text};\n"
             f"}}\n"
@@ -327,7 +337,7 @@ def _background_css(values: ThemingValues) -> str:
     scrim_alpha, scrim_tint = _scrim_alpha(values.color, values.background_text)
     scrim = _rgba_css(scrim_tint, scrim_alpha)
     return (
-        f"\n{selector}{{\n"
+        f"\n{selector} {{\n"
         f"    background-image: linear-gradient({scrim}, {scrim}), url('{url}');\n"
         f"    background-size: cover;\n"
         f"    background-position: center;\n"

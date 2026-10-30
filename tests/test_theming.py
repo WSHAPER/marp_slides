@@ -71,7 +71,7 @@ def test_section_never_overrides_slide_metrics() -> None:
     assert section_block is not None
     for forbidden in ("font-size", "padding", "line-height", "width", "height"):
         assert forbidden not in section_block.group(0)
-        assert f"section {forbidden}" not in css.replace("section:first", "")
+        assert f"section {forbidden}" not in css
 
 
 def test_section_carries_the_branding() -> None:
@@ -157,18 +157,16 @@ def test_inter_faces_embedded_as_data_uris() -> None:
 # --- the background scrim -------------------------------------------------------
 
 
-def test_background_image_gets_scrim_and_cache_buster() -> None:
-    """An admin background image is painted on the title slide only,
-    selected by marpit's positional id (section#\\31, the CSS escape
-    for id="1": the literal section#1 is not a valid selector, an id may
-    not start with a digit; section:first-of-type would match every
-    slide in the svg scaffold), under a semi-opaque scrim of the
-    instance color (first background layer paints on top) with the
-    cache-buster appended, and the slide text color switches to
-    background_text."""
+def test_background_image_and_scrim_on_every_slide() -> None:
+    """An admin background image is baked onto EVERY slide, not just the
+    first: the rule's selector is the plain ``section`` token (marp-cli's
+    container-scoping rewrite expands it to every rendered section in
+    the svg scaffold), under a semi-opaque scrim of the instance color
+    (first background layer paints on top) with the cache-buster
+    appended, and the slide text color switches to background_text —
+    the pairing the scrim alpha is solved for."""
     css = generate_theme_css(caps())
-    selector = r"section#\31 "
-    block = re.search(re.escape(selector.strip()) + r"\s*\{[^}]*\}", css)
+    block = re.search(r"section \{[^}]*background-image:[^}]*\}", css)
     assert block is not None
     rule = block.group(0)
     assert "linear-gradient(" in rule
@@ -180,19 +178,68 @@ def test_background_image_gets_scrim_and_cache_buster() -> None:
     assert "color: #ffffff" in rule
 
 
-def test_scrim_only_when_background_image_set() -> None:
-    """No background value: no title-slide rule at all (the solid
-    instance color already covers every slide). A plain color: the rule
-    exists but there is no image and no scrim to solve for."""
-    empty = generate_theme_css(caps(background=""))
-    selector = r"section#\31 "
-    assert selector.strip() not in empty
-    plain = generate_theme_css(caps(background="#102a43"))
-    block = re.search(re.escape(selector.strip()) + r"\s*\{[^}]*\}", plain)
+def test_background_rule_has_no_first_slide_scoping() -> None:
+    """The regression this fix pins: the background+scrim block must not
+    scope itself to the first slide in ANY positional form. The original
+    implementation selected marpit's positional id (``section#\\\\31``,
+    the CSS escape for ``id="1"``) and matched only slide 1 — the exact
+    live-observed failure: the brand image on slide 1, the flat admin
+    color on every slide after. ``:first``/``:nth``/``:only``/``:last``
+    pseudo-class forms are pinned out too, and the background
+    declarations must live in a plain unqualified ``section`` block that
+    is the LAST section block in the CSS (same-specificity cascade over
+    the base rule's background-color/color), not an override hanging off
+    a positional selector."""
+    css = generate_theme_css(caps())
+    body = re.sub(r"/\*.*?\*/", "", css, flags=re.DOTALL)
+    # every rule whose selector targets a section must be positional-free
+    section_selectors = [
+        sel.strip() for sel in re.findall(r"([^{}]+)\{", body) if "section" in sel
+    ]
+    assert section_selectors, "no section rules found in the generated CSS"
+    for selector in section_selectors:
+        for token in (r"#\31", ":first", ":nth", ":only", ":last"):
+            assert token not in selector, (
+                f"positional scoping token {token!r} in selector {selector!r}"
+            )
+    block = re.search(r"section \{[^}]*background-image:[^}]*\}", css)
     assert block is not None
-    assert "background-color: #102a43" in block.group(0)
+    assert css.rindex("section {") == block.start()  # appended last: wins cascade
+
+
+def test_scrim_only_when_background_image_set() -> None:
+    """No background value: no background block at all (the solid
+    instance color already covers every slide, and the base rule is the
+    only section block). A plain color: a uniform section block carries
+    the color swap and there is no image and no scrim to solve for."""
+    empty = generate_theme_css(caps(background=""))
+    assert empty.count("section {") == 1  # only the base branding rule
+    plain = generate_theme_css(caps(background="#102a43"))
+    block = re.search(r"section \{[^}]*background-color: #102a43[^}]*\}", plain)
+    assert block is not None
     assert "linear-gradient" not in block.group(0)
     assert "url(" not in block.group(0)
+
+
+def test_pptx_path_stays_theme_less() -> None:
+    """No regression for the pptx output: python-pptx has no theme
+    surface, so the pptx builder must never consume this module's CSS —
+    the brand background is a marp-render concern (html/pdf) only. The
+    full pipeline pin (a theme=nextcloud pptx task still builds the
+    plain editable deck while the marp gate gets the branded values)
+    lives in tests/test_task_plumbing.py
+    (test_nextcloud_theme_pptx_logs_that_pptx_ignores_it); this pins the
+    structural side from the theme module: the pptx builder modules
+    carry no reference to this module."""
+    import inspect
+
+    from marp_slides import builder, editable_pptx
+
+    for module in (builder, editable_pptx):
+        source = inspect.getsource(module)
+        assert "theming" not in source.lower(), (
+            f"{module.__name__} grew a theming reference"
+        )
 
 
 def test_scrim_alpha_derives_from_contrast_not_assumptions() -> None:
