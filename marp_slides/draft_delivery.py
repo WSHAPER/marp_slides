@@ -61,6 +61,7 @@ from dataclasses import replace
 
 from nc_py_api import NextcloudApp, NextcloudException, NextcloudExceptionNotFound
 
+from .capability_guards import sweep_capability_guards
 from .draft_store import SLIDE_DONE, DeckDraft
 from .outline import assemble_deck, parse_outline
 from .settings import MARKDOWN_MIME_TYPE
@@ -263,6 +264,13 @@ def _write_delivered_file(
         )
         return False
     _tag_ai_generated(nc, subject, node.file_id)
+    # Instance capability sweep: the file just delivered RELIES on apps
+    # this ExApp does not control (an editor for the .md sources). The
+    # client is impersonated for this user here - what the probes need -
+    # and the sweep is fail-soft by its own contract, so it can never
+    # affect the delivery; it warns once per gap (docker logs, the
+    # admin-visible surface).
+    sweep_capability_guards(nc)
     LOGGER.info(
         "%s delivered to '%s' in the Files of user %s (%s).",
         subject,

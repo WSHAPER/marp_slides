@@ -13,6 +13,7 @@ from types import SimpleNamespace
 
 from nc_py_api import NextcloudException, NextcloudExceptionNotFound
 
+from marp_slides import capability_guards
 from marp_slides.deck_pipeline import build_deck_filename
 from marp_slides.draft_delivery import (
     AI_TAG_NAME,
@@ -163,9 +164,26 @@ class FakeFilesAPI:
         self.assigned_tags.append((file_id, tag_id))
 
 
-def make_nc(files: FakeFilesAPI | None = None, set_user_error: Exception | None = None):
+#: The healthy direct-editing answer (the live nc35 shape): the text
+#: app's editor covers markdown, richdocuments the office formats. The
+#: default keeps the per-delivery capability sweep silent in every
+#: other test.
+DIRECT_EDITING_HEALTHY = {
+    "text": [MARKDOWN_MIME_TYPE, "text/plain"],
+    "richdocuments": ["application/vnd.oasis.opendocument.presentation"],
+}
+
+
+def make_nc(
+    files: FakeFilesAPI | None = None,
+    set_user_error: Exception | None = None,
+    editors: dict[str, list[str]] | None = None,
+):
     """The fake app client: the files API plus a recording ``set_user``
-    (the impersonation seam; raising models a failed user resolution)."""
+    (the impersonation seam; raising models a failed user resolution)
+    and the OCS surface the capability guards probe (``editors``
+    configures the direct-editing answer; defaults to the healthy
+    instance, with ``ocs_calls`` recording what the guards asked)."""
     if files is None:
         files = FakeFilesAPI()
     impersonated: list[str] = []
@@ -175,7 +193,25 @@ def make_nc(files: FakeFilesAPI | None = None, set_user_error: Exception | None 
             raise set_user_error
         impersonated.append(user_id)
 
-    nc = SimpleNamespace(files=files, set_user=set_user, impersonated=impersonated)
+    ocs_calls: list[tuple[str, str]] = []
+    resolved_editors = DIRECT_EDITING_HEALTHY if editors is None else editors
+
+    def ocs(method, path, **kwargs):
+        ocs_calls.append((method, path))
+        return {
+            "editors": {
+                editor: {"mimetypes": mimetypes}
+                for editor, mimetypes in resolved_editors.items()
+            }
+        }
+
+    nc = SimpleNamespace(
+        files=files,
+        set_user=set_user,
+        impersonated=impersonated,
+        ocs=ocs,
+        ocs_calls=ocs_calls,
+    )
     return nc, files
 
 
@@ -467,6 +503,52 @@ def test_deliver_deck_files_tag_failure_keeps_every_write(caplog):
     assert files.created_tags == []
     assert files.assigned_tags == []
     assert "AI tag not applied" in caplog.text
+
+
+def test_delivery_with_failing_markdown_editor_guard_warns_once(caplog):
+    """The delivery plumbing sweeps the capability guards after every
+    successful write: a multi-file delivery onto an instance with NO
+    markdown editor (the observed dead edit-flow incident) warns
+    exactly once - the warn-once latch holds across the per-file
+    sweeps - while the delivery itself and its completion logs are
+    unaffected."""
+    caplog.set_level("INFO", logger="marp_slides.draft_delivery")
+    caplog.set_level("INFO", logger="marp_slides.capability_guards")
+    capability_guards._WARNED.clear()  # the latch is process state
+    try:
+        office_only = {
+            "richdocuments": ["application/vnd.oasis.opendocument.presentation"]
+        }
+        nc, _files = make_nc(editors=office_only)
+        written = deliver_deck_files(nc, "alice", FOLDER, DECK_FILES)
+        assert written == [name for name, _b, _m in DECK_FILES]  # unaffected
+        guard_warnings = [
+            r
+            for r in caplog.records
+            if r.name == "marp_slides.capability_guards" and r.levelname == "WARNING"
+        ]
+        assert len(guard_warnings) == 1  # four writes, ONE warning
+        assert "markdown_editor" in guard_warnings[0].getMessage()
+        assert "enable an app that edits text/markdown in Files" in (
+            guard_warnings[0].getMessage()
+        )
+        # the route answered, so the files_app guard stayed healthy
+        assert not any("files_app" in r.getMessage() for r in guard_warnings)
+        # the guards probed the direct-editing route once per guard per
+        # write (4 writes x 2 guards)
+        assert len(nc.ocs_calls) == len(DECK_FILES) * len(capability_guards.GUARDS)
+        assert set(nc.ocs_calls) == {
+            ("GET", "/ocs/v2.php/apps/files/api/v1/directEditing")
+        }
+        # the delivery completion logs ride exactly as before
+        assert sum(
+            1
+            for r in caplog.records
+            if r.name == "marp_slides.draft_delivery"
+            and "delivered to" in r.getMessage()
+        ) == len(DECK_FILES)
+    finally:
+        capability_guards._WARNED.clear()
 
 
 def test_delivery_filename_sanitization_is_identity_for_deck_names():

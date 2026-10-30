@@ -105,6 +105,7 @@ from niquests import ConnectionError as RequestsConnectionError
 from niquests import JSONDecodeError
 from niquests import Timeout as RequestsTimeout
 
+from .capability_guards import sweep_capability_guards
 from .constructs import THEME_AUTO
 from .deck_pipeline import (
     DeckError,
@@ -1713,6 +1714,15 @@ def _generate_deck(
 def task_worker_loop(settings: Settings) -> None:
     """Poll for tasks; claim one at a time and process it."""
     poll_interval_s = max(1.0, settings.poll_interval_s)
+    # Startup capability sweep: surface instance capability gaps the
+    # delivered artifacts rely on as early as possible. Best-effort by
+    # design: the fresh client carries no impersonated user, so the
+    # probes read unknown at DEBUG until a user context exists (the
+    # live-checked 401), and the authoritative re-check rides every
+    # successful Files delivery in draft_delivery. Fail-soft both ways:
+    # client construction problems and probe problems only log.
+    with suppress(Exception):
+        sweep_capability_guards(NextcloudApp())
     while not THREAD_STOP_EVENT.is_set():
         if not APP_ENABLED.is_set():
             sleep(DISABLED_SLEEP_S)
