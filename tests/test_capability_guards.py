@@ -4,7 +4,7 @@ The frozen contract under test: each guard probes the instance through
 the impersonated direct-editing route (ok / missing / unknown), the
 warn-once latch warns exactly once per guard and re-arms on recovery,
 unknown probes (errors) never warn, and the sweep is thread-safe and
-never raises. The healthy/missing shapes mirror the live nc35 answers
+never raises. The healthy/missing shapes mirror a live instance's answers
 (see marp_slides/capability_guards.py's module docstring for the
 mechanism evidence).
 """
@@ -21,7 +21,7 @@ from marp_slides import capability_guards
 from marp_slides.capability_guards import GUARDS, sweep_capability_guards
 from marp_slides.settings import MARKDOWN_MIME_TYPE
 
-#: The live nc35 shape: the text app's editor covers markdown (and
+#: A live instance's healthy shape: the text app's editor covers markdown (and
 #: more), richdocuments the office formats.
 HEALTHY_EDITORS = {
     "text": [MARKDOWN_MIME_TYPE, "text/plain", "application/yaml"],

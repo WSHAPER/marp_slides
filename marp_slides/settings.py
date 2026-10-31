@@ -82,7 +82,6 @@ DEFAULT_RETRY_LLM = True
 #: single line) for docker-logs diagnosability. The excerpt is prompt-derived
 #: deck content: privacy-sensitive deployments can suppress it with
 #: ``MARP_SLIDES_LOG_EXCERPT=false``; the error line itself always stays
-#: (security audit F6).
 DEFAULT_LOG_EXCERPT = True
 
 #: Early slide-fit gates: every authored slide is measured against its
@@ -94,14 +93,14 @@ DEFAULT_LOG_EXCERPT = True
 #: both gates with ``MARP_SLIDES_OVERFLOW_CHECK=false``.
 DEFAULT_OVERFLOW_CHECK = True
 
-#: Draft retention (wave draft-resume): failed attempts keep their
+#: Draft retention: failed attempts keep their
 #: authored slides as an atomic checkpoint on the ExApp volume so a
 #: follow-up task with draft_id resumes instead of regenerating.
 DEFAULT_DRAFTS_ENABLED = True
 DEFAULT_DRAFTS_FOLDER = ""
 DEFAULT_DRAFTS_MAX_KEPT = 20
 
-#: Files-by-default delivery (wave source-in-files): every generated deck
+#: Files-by-default delivery: every generated deck
 #: format plus the source markdown is written into this folder in the
 #: task owner's Files (DAV impersonation, fail-soft). Empty disables.
 DEFAULT_DELIVERIES_FOLDER = "Marp Slides"

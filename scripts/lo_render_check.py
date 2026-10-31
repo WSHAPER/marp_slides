@@ -19,7 +19,7 @@ Usage:
     python3 scripts/lo_render_check.py FIXTURE.md [--keep DIR]
 
 The Collabora container name comes from the COLLABORA_CONTAINER
-environment variable (default: nc35-collabora-code).
+environment variable (default: collabora-code).
 """
 
 from __future__ import annotations
@@ -41,7 +41,7 @@ from marp_slides.deck_pipeline import validate_deck
 from marp_slides.editable_pptx import build_pptx
 
 # Deployment-specific container name; override per environment.
-COLLABORA_CONTAINER = os.environ.get("COLLABORA_CONTAINER", "nc35-collabora-code")
+COLLABORA_CONTAINER = os.environ.get("COLLABORA_CONTAINER", "collabora-code")
 COLLABORA_SOFFICE = "/opt/collaboraoffice/program/soffice.bin"
 PAGE_W_PT = 960.0  # 13.333 in at 72 pt/in
 PAGE_H_PT = 540.0  # 7.5 in

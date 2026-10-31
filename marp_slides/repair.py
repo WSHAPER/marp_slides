@@ -56,6 +56,30 @@ _FRONTMATTER_DELIM = "---"
 _BULLET_LINE_RE = re.compile(r"^\s*(?:[-*+]|\d+\.)\s+\S")
 
 
+def strip_scoped_chrome(markdown: str) -> str | None:
+    """Remove every scoped footer/header comment line ('<!-- _footer:
+    ... -->' / '<!-- _header: ... -->') from a slide's markdown, content
+    untouched; None when the slide carries none. The overflow rescue
+    calls this when a slide's own scoped chrome is the measured
+    offender: chrome neither trims as bullets nor scales with the
+    section font, so dropping the decorative lines the model added is
+    the only lossless fix (observed live)."""
+    kept = [
+        line
+        for line in markdown.splitlines()
+        if not _is_scoped_chrome_line(line.strip())
+    ]
+    if len(kept) == len(markdown.splitlines()):
+        return None
+    return "\n".join(kept).rstrip() + "\n"
+
+
+def _is_scoped_chrome_line(stripped: str) -> bool:
+    """A complete scoped footer/header comment directive line."""
+    match = DECK_DIRECTIVE_LINE_RE.match(stripped)
+    return match is not None and match.group("scoped") is not None
+
+
 def drop_trailing_bullets(markdown: str, count: int) -> tuple[str | None, list[str]]:
     """Deterministic shrink-to-fit helper: drop the LAST ``count`` bullet
     lines from a slide's Markdown and return ``(shrunk_markdown,
@@ -126,6 +150,12 @@ def repair_deck_markdown(markdown: str) -> tuple[str, list[str]]:
        fix the model itself makes on retry, applied deterministically).
     6. Raw ``<span>`` tags wrapping slide text cannot become native
        content; the tags are stripped, keeping the inner text.
+    7. A markdown link with no URL at all (``[label]()``, or a reference
+       link whose ``[ref]:`` definition is empty) is rejected by the
+       hyperlink gate; the link syntax is stripped to its label text and
+       the empty definition lines drop out (observed live: a density retry
+       introduced ``[label]()`` and spent all of the slide's attempts after the slide's
+       attempts were spent).
     """
     lines = markdown.splitlines()
     frontmatter_end = _frontmatter_end(lines)
@@ -140,6 +170,7 @@ def repair_deck_markdown(markdown: str) -> tuple[str, list[str]]:
         _dedent_code_fences,
         _demote_double_title,
         _strip_span_tags,
+        _strip_empty_links,
     ):
         lines, applied = pattern(lines, start)
         repairs += applied
@@ -336,6 +367,62 @@ def _strip_span_tags(lines: list[str], start: int) -> tuple[list[str], list[str]
             stripped += 1
         result.append(cleaned)
     return result, ["stripped a raw <span> tag, keeping the inner text"] * stripped
+
+
+#: An inline markdown link whose URL is empty: '[label]()',
+#: '[label](  )' or '[label](<>)'. The label keeps any emphasis.
+_EMPTY_URL_INLINE_RE = re.compile(r"(?<!\!)\[(?P<label>[^\[\]]*)\]\(\s*(?:<\s*>)?\s*\)")
+
+#: A reference-style link use: '[label][ref]' or the collapsed '[label][]'.
+_REF_USE_RE = re.compile(r"(?<!\!)\[(?P<label>[^\[\]]+)\]\[(?P<ref>[^\[\]]*)\]")
+
+#: A link reference definition line: '[ref]: url' (url may be empty).
+_REF_DEF_RE = re.compile(r"^\s{0,3}\[(?P<ref>[^\[\]]+)\]:\s*(?P<url>\S*)\s*$")
+
+
+def _strip_empty_links(lines: list[str], start: int) -> tuple[list[str], list[str]]:
+    """Pattern 7: a link the hyperlink gate rejects for having NO url -
+    ``[label]()`` inline, or ``[label][ref]`` whose ``[ref]:`` definition
+    exists but is empty - is not a judgement call: the link carries
+    nowhere to go, so the syntax strips to its label and the empty
+    definition lines drop out. Definitions with a real url are honoured
+    (their uses stay links); reference uses with NO definition at all
+    stay for the retry (a one-character typo may name a real ref)."""
+    # first pass: which refs carry a real URL, and which are empty defs?
+    defined: set[str] = set()
+    empty_refs: set[str] = set()
+    empty_def_rows: set[int] = set()
+    for idx, line, state in _iter_fence_states(lines, start):
+        if state != "text":
+            continue
+        match = _REF_DEF_RE.match(line)
+        if match is None:
+            continue
+        if match.group("url"):
+            defined.add(match.group("ref").strip().lower())
+        else:
+            empty_refs.add(match.group("ref").strip().lower())
+            empty_def_rows.add(idx)
+    stripped = 0
+    result: list[str] = lines[:start]
+    for idx, line, state in _iter_fence_states(lines, start):
+        if state != "text":
+            result.append(line)  # code stays code
+            continue
+        if idx in empty_def_rows:
+            continue  # an empty definition carries nothing: drop it
+        cleaned, inline_n = _EMPTY_URL_INLINE_RE.subn(r"\g<label>", line)
+
+        def _ref_sub(match: re.Match[str]) -> str:
+            ref = match.group("ref").strip().lower()
+            if ref in defined or ref not in empty_refs:
+                return match.group(0)  # resolves, or no def at all: retry's call
+            return match.group("label")
+
+        ref_cleaned = _REF_USE_RE.sub(_ref_sub, cleaned)
+        stripped += inline_n + (ref_cleaned != cleaned)
+        result.append(ref_cleaned)
+    return result, ["stripped a link with no URL to its label text"] * stripped
 
 
 def _process_heading(

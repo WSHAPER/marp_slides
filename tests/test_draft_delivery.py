@@ -165,7 +165,7 @@ class FakeFilesAPI:
         self.assigned_tags.append((file_id, tag_id))
 
 
-#: The healthy direct-editing answer (the live nc35 shape): the text
+#: The healthy direct-editing answer (a live instance's shape): the text
 #: app's editor covers markdown, richdocuments the office formats. The
 #: default keeps the per-delivery capability sweep silent in every
 #: other test.
@@ -607,7 +607,7 @@ def test_delivery_filename_sanitization_is_identity_for_deck_names():
 def test_ai_tag_conflict_on_retag_is_idempotent_success(caplog):
     """Re-delivering over an already-tagged file answers 409 Conflict
     (the tag relation exists): that is success, not a warning - the
-    observed re-run sprayed a traceback per file (task 923)."""
+    observed re-run sprayed a traceback per file (observed live)."""
     from marp_slides.draft_delivery import (
         _TAG_ALREADY_ASSIGNED_STATUS,
         _tag_ai_generated,

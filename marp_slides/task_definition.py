@@ -145,6 +145,16 @@ PROVIDER = TaskProcessingProvider(
             shape_type=ShapeType.TEXT,
         ),
         ShapeDescriptor(
+            name="draft_file",
+            description=(
+                "Pick a previously saved draft .md from your Files to "
+                "resume an interrupted generation. The draft id in its "
+                "header comment is used to continue from the completed "
+                "slides."
+            ),
+            shape_type=ShapeType.FILE,
+        ),
+        ShapeDescriptor(
             name="images",
             description=(
                 "Optional images to place in the deck (PNG or JPEG, max 5 MB "
@@ -171,8 +181,12 @@ PROVIDER = TaskProcessingProvider(
 #: source through the same validation and rendering pipeline as the
 #: authoring task, with no language model involved. This is the second half
 #: of the edit-source-then-re-render flow: the authoring task retains the
-#: deck source, a later turn edits it (by hand or by a chat LLM) and feeds
-#: it back here.
+#: deck source (and delivers it into the owner's Files), a later turn edits
+#: it (by hand or by a chat LLM) and feeds it back here. The source arrives
+#: as EITHER the ``markdown`` text OR the ``deck_source_file`` file input
+#: (both optional on the provider: picking the .md from Files is the same
+#: deliberate act as pasting the text), so the task type itself declares no
+#: required input.
 RE_RENDER_TASK_TYPE = TaskType(
     id=RE_RENDER_TASK_TYPE_ID,
     name="Re-render a slide deck",
@@ -182,16 +196,7 @@ RE_RENDER_TASK_TYPE = TaskType(
         "same rendering as the generation task, deterministically. Edit the "
         "retained Markdown source and re-render to update the deck."
     ),
-    input_shape=[
-        ShapeDescriptor(
-            name="markdown",
-            description=(
-                "The complete Marp Markdown deck source to re-render, "
-                "including the frontmatter block."
-            ),
-            shape_type=ShapeType.TEXT,
-        ),
-    ],
+    input_shape=[],
     output_shape=[
         ShapeDescriptor(
             name="slide_decks",
@@ -224,6 +229,25 @@ RE_RENDER_PROVIDER = TaskProcessingProvider(
     task_type=RE_RENDER_TASK_TYPE_ID,
     expected_runtime=RE_RENDER_EXPECTED_RUNTIME_S,
     optional_input_shape=[
+        ShapeDescriptor(
+            name="markdown",
+            description=(
+                "The complete Marp Markdown deck source to re-render, "
+                "including the frontmatter block. Either this text or the "
+                "deck source file must be given."
+            ),
+            shape_type=ShapeType.TEXT,
+        ),
+        ShapeDescriptor(
+            name="deck_source_file",
+            description=(
+                "Pick the deck's Markdown source from your Files (the .md "
+                "delivered alongside the deck, or any Marp Markdown file). "
+                "Its content is rendered as-is: no AI generation, every "
+                "slide renders exactly as written."
+            ),
+            shape_type=ShapeType.FILE,
+        ),
         ShapeDescriptor(
             name="output_format",
             description=OUTPUT_FORMAT_SLOT_DESCRIPTION,

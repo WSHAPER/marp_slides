@@ -40,7 +40,7 @@ MONO_FONT = "Consolas"
 # exactly as before — byte-identical builds.
 
 #: Section base font px per theme, MEASURED through the marp render
-#: (probe 2026-10-31: default 29 / gaia 35 / uncover 40; nextcloud
+#: (against the pinned marp-cli v4.5.1 base image: default 29 / gaia 35 / uncover 40; nextcloud
 #: inherits default metrics — theming.py never overrides sizes). The
 #: mirror divides the fit block's px by the theme base; unknown themes
 #: fall back to the default base.

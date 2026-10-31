@@ -168,7 +168,7 @@ Render audit (build a fixture, convert with Collabora or host LibreOffice, verif
 Standalone boot for debugging (the heartbeat serves even without a reachable Nextcloud; the worker retries):
 
 ```bash
-NEXTCLOUD_URL=http://nextcloud.local APP_ID=marp_slides APP_VERSION=0.1.0 \
+NEXTCLOUD_URL=https://cloud.example.com APP_ID=marp_slides APP_VERSION=0.1.0 \
 APP_SECRET=... AA_VERSION=2.2.0 APP_PORT=9090 .venv/bin/python main.py
 ```
 

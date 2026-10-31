@@ -549,7 +549,7 @@ def test_prompt_skeleton_passes_validation() -> None:
 
 def test_compact_nonbreaking_hyphen_currency_range_not_math() -> None:
     """The compact price-range form with U+2011 between the amounts
-    (no spaces, non-breaking hyphen) is prose, not math (live: task 1315):
+    (no spaces, non-breaking hyphen) is prose, not math (observed live):
     tight flanks, but a digit chases the closing '$'."""
     deck = (
         "---\nmarp: true\n---\n\n# Costs\n\n"

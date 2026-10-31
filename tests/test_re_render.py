@@ -85,9 +85,10 @@ def no_llm_no_real_render(monkeypatch):
 def test_re_render_task_type_shape() -> None:
     tt = task_definition.RE_RENDER_TASK_TYPE
     assert tt.id == RE_RENDER_TASK_TYPE_ID == "marp_slides:re_render"
-    assert [s.name for s in tt.input_shape] == ["markdown"]
-    assert tt.input_shape[0].shape_type == ShapeType.TEXT
-    assert "frontmatter" in tt.input_shape[0].description
+    # no required inputs: the deck source arrives as EITHER the optional
+    # 'markdown' text OR the optional 'deck_source_file' file (declared on
+    # the provider below), enforced exactly-one-of by the worker
+    assert tt.input_shape == []
     assert [s.name for s in tt.output_shape] == ["slide_decks", "slide_deck_source"]
     assert tt.output_shape[0].shape_type == ShapeType.LIST_OF_FILES
     assert tt.output_shape[1].shape_type == ShapeType.FILE
@@ -99,10 +100,14 @@ def test_re_render_provider_shape() -> None:
     assert provider.task_type == RE_RENDER_TASK_TYPE_ID
     assert provider.expected_runtime == 10  # deterministic: render cost only
     assert [s.name for s in provider.optional_input_shape] == [
+        "markdown",
+        "deck_source_file",
         "output_format",
         "file_references",
     ]
-    fmt_slot, files_slot = provider.optional_input_shape
+    text_slot, file_slot, fmt_slot, files_slot = provider.optional_input_shape
+    assert text_slot.shape_type == ShapeType.TEXT
+    assert file_slot.shape_type == ShapeType.FILE
     assert fmt_slot.shape_type == ShapeType.ENUM
     assert files_slot.shape_type == ShapeType.LIST_OF_FILES
     assert [
@@ -115,6 +120,19 @@ def test_re_render_provider_shape() -> None:
     ]
     assert provider.optional_input_shape_defaults == {"output_format": "pptx"}
     assert provider.optional_output_shape == []
+
+
+def test_re_render_source_slots_teach_the_either_of_choice() -> None:
+    """The two source inputs teach what to send: the text slot names the
+    frontmatter requirement and the either-or, the file slot promises the
+    as-is render (no AI round) and where the .md comes from."""
+    provider = task_definition.RE_RENDER_PROVIDER
+    text_slot, file_slot, _fmt, _files = provider.optional_input_shape
+    assert "frontmatter" in text_slot.description
+    assert "deck source file" in text_slot.description
+    assert "Markdown source" in file_slot.description
+    assert "rendered as-is" in file_slot.description
+    assert "no AI generation" in file_slot.description
 
 
 def test_re_render_output_format_enum_mirrors_the_authoring_provider() -> None:

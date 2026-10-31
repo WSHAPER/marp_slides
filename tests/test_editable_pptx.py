@@ -1216,16 +1216,16 @@ def test_dollar_pairs_passing_pandoc_flanking_still_reject_as_math(body: str) ->
 @pytest.mark.parametrize(
     "body",
     [
-        # every live math failure from the cycling-economy E2E battery,
+        # every live math failure from live-observed currency/math failure shapes,
         # pinned with its task id — the '$...$' span each reported
         # (occ taskprocessing:task:get, 2026-10-31)
-        "$300\u2011$800 frames",  # task 1315: U+2011, digit after the closer
-        "$200k\u2013$500k",  # task 1325: tight en dash, digit after the closer
-        "$20 M \u2013 $500k",  # task 1335: space before the closer
-        "$1.2 k, mid\u2011range \u2248 $500k",  # task 1344: words + ≈ between
-        "it is $\u2248$200 total",  # task 1373: degenerate '≈' span, digit after
-        "$1\u20115k, professional contracts $2,000",  # task 1382: words between
-        "$1,200 for entry-level to $22,000",  # task 1309: the prompt's own pair
+        "$300\u2011$800 frames",  # U+2011, digit after the closer
+        "$200k\u2013$500k",  # tight en dash, digit after the closer
+        "$20 M \u2013 $500k",  # space before the closer
+        "$1.2 k, mid\u2011range \u2248 $500k",  # words + ≈ between
+        "it is $\u2248$200 total",  # degenerate '≈' span, digit after
+        "$1\u20115k, professional contracts $2,000",  # words between
+        "$1,200 for entry-level to $22,000",  # the prompt's own pair
     ],
 )
 def test_live_currency_failures_stay_literal_via_flanking(body: str) -> None:

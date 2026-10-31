@@ -73,7 +73,15 @@ A second task type, ``marp_slides:re_render`` (provider
 edit-source-then-re-render flow: it takes a complete Marp Markdown source
 (typically the retained ``slide_deck_source`` after edits), runs it
 through the SAME validator and the SAME render phase, and never calls the
-LLM: no authoring, no retry loop, no outline generation. Its ``#file:N``
+LLM: no authoring, no retry loop, no outline generation. The source
+arrives as EITHER the ``markdown`` text input OR the ``deck_source_file``
+file input (the .md delivered into the owner's Files, picked back from
+there: closing the edit-and-rerender loop without a copy-paste); the
+worker enforces exactly-one-of before any render work, and when both ride
+along the FILE wins (picking a concrete artifact is the more deliberate
+choice). The file content downloads through the same app-context
+by_id/download path the images use, decodes as UTF-8 text and then flows
+through the identical validate -> render path. Its ``#file:N``
 image references resolve against the optional ``file_references`` input
 (LIST_OF_FILES, the same shape and the same rules as the authoring task's
 ``images`` slot), so a re-render can reference Files images that were not
@@ -88,7 +96,13 @@ one line to its user-facing error naming the draft id; a follow-up task
 carrying that id in the optional ``draft_id`` input resumes from the
 checkpoint: the stored outline is reused (no outline LLM round), slides
 checkpointed done ship verbatim (no LLM round), and only missing or
-failed slides are regenerated through the normal per-slide loop. Retention
+failed slides are regenerated through the normal per-slide loop. The same
+resume can be started by picking the delivered draft .md with the
+optional ``draft_file`` file input: its leading header comment names the
+draft id (the shape :mod:`marp_slides.draft_delivery` pins), the worker
+extracts it and routes into the existing ``draft_id`` resume path, so a
+pruned checkpoint surfaces the store's actionable remedy either way.
+Retention
 keeps the newest ``MARP_SLIDES_DRAFTS_MAX_KEPT`` drafts after every task.
 """
 
@@ -96,6 +110,7 @@ from __future__ import annotations
 
 import json
 import logging
+import re
 import tempfile
 import threading
 from collections.abc import Mapping
@@ -162,7 +177,11 @@ from .outline import (
     validate_outline_theme,
     validate_slide_markdown,
 )
-from .repair import drop_trailing_bullets, repair_deck_markdown
+from .repair import (
+    drop_trailing_bullets,
+    repair_deck_markdown,
+    strip_scoped_chrome,
+)
 from .settings import (
     APP_ID,
     HTML_MIME_TYPE,
@@ -514,7 +533,7 @@ def _reject_slide_overflow(
         return
     # One line-height grace: sub-line overflow (content within one
     # rendered line of fitting) is invisible and rejecting it burns
-    # the retry budget on marginal noise (live: task 1309 died at
+    # the retry budget on marginal noise (observed live: a deck died at
     # 1.02x, 25px over, less than one line). Real clipping (>1 line
     # over) still rejects.
     if report.overflow_y_px > report.line_px:
@@ -580,6 +599,180 @@ def _shrink_slide_to_fit(
     return shrunk
 
 
+#: The deterministic font-scale ladder of the rescue tier: factors applied
+#: to the measured section font, coarser cuts first, floored at 0.80 (the
+#: sane-range design in marp_slides/slides.py documents round(base * k) for
+#: k in [0.80, 0.95]; below that the type is unreadably small and the
+#: slide genuinely needs a split, not a shrink).
+_FIT_SCALE_LADDER: tuple[float, ...] = (0.95, 0.90, 0.85, 0.80)
+
+
+def _fit_style_block(px: float) -> str:
+    """The exact machine-managed three-line fit-scaling block for one px
+    value (the only raw-HTML shape the parser allows; marp scopes it to
+    the slide and the native PPTX build mirrors the scale)."""
+    return f"<style scoped>\nsection {{ font-size: {px:g}px; }}\n</style>"
+
+
+def _scale_slide_to_fit(
+    nc: NextcloudApp,
+    slide_markdown: str,
+    theme: str,
+    number: int,
+    task_id: int,
+    settings: Settings,
+) -> str | None:
+    """The LAST deterministic rescue for a slide that exhausted its LLM
+    attempts on a measured overflow AND cannot be trimmed enough (no
+    trailing bullets, or the cut slide still overflows): keep every word,
+    shrink the type - the PowerPoint-autofit equivalent that never costs
+    an LLM round. Walks the scale ladder starting at the first factor the
+    measured overflow could plausibly satisfy (safe area over content
+    height, with margin), inserting the machine-managed fit-scaling style
+    block and re-measuring each candidate; the first candidate the
+    measurement accepts (None report) wins. Returns None when the slide
+    already carries a fit block (at most one per slide), the measurement
+    is unavailable, or even the 0.80 floor cannot fit the content - in
+    all those cases the original overflow failure stands."""
+    if not settings.overflow_check:
+        return None
+    if "<style scoped>" in slide_markdown:
+        # the parser allows at most one block per slide; replacing a
+        # foreign one is out of contract, so there is nothing to do
+        return None
+    report = _measure_slide_fit(nc, slide_markdown, theme, number, task_id)
+    if report is None or report.overflow_y_px <= 0:
+        return None  # fits after all, or unmeasurable: nothing to scale
+    # first plausible factor: content height shrinks roughly linearly with
+    # the section font, so safe/content (with a 2 percent margin for
+    # non-scaling paddings) bounds the factor from below
+    needed = report.safe_px[1] / max(1, report.content_h_px) * 0.98
+    factors = tuple(
+        f for f in _FIT_SCALE_LADDER if f <= max(needed, _FIT_SCALE_LADDER[-1])
+    )
+    for factor in factors:
+        px = round(report.font_px * factor, 1)
+        candidate = f"{slide_markdown.rstrip()}\n\n{_fit_style_block(px)}\n"
+        if _measure_slide_fit(nc, candidate, theme, number, task_id) is None:
+            LOGGER.info(
+                "Task %s: slide %d fits at a scaled font of %s px (factor "
+                "%.2f); keeping every word",
+                task_id,
+                number,
+                f"{px:g}",
+                factor,
+            )
+            return candidate
+    LOGGER.info(
+        "Task %s: slide %d does not fit even at the %.2f font-scale floor",
+        task_id,
+        number,
+        _FIT_SCALE_LADDER[-1],
+    )
+    return None
+
+
+def _strip_overflowing_slide_chrome(
+    nc: NextcloudApp,
+    slide_markdown: str,
+    theme: str,
+    number: int,
+    task_id: int,
+    settings: Settings,
+) -> str | None:
+    """The lossless first rescue for a slide whose measured overflow
+    starts at its own scoped footer or header (observed live: a slide
+    that converged to 1.10x with '<footer> Slide 5 - ...' as the first
+    offender; chrome neither trims as bullets nor scales with the
+    section font, so the other tiers cannot save it): the scoped
+    chrome lines the model added drop out (the pure line filter lives
+    in :func:`marp_slides.repair.strip_scoped_chrome`), content
+    untouched, and the caller's gate re-measures. None when the
+    offender is real content or the slide carries no scoped chrome."""
+    if not settings.overflow_check:
+        return None
+    report = _measure_slide_fit(nc, slide_markdown, theme, number, task_id)
+    if report is None or report.first_offender is None:
+        return None
+    tag, _text = report.first_offender
+    if tag.lower() not in ("footer", "header"):
+        return None
+    stripped = strip_scoped_chrome(slide_markdown)
+    if stripped is None:
+        return None
+    LOGGER.info(
+        "Task %s: slide %d overflows at its own scoped footer/header; "
+        "stripping the chrome lines",
+        task_id,
+        number,
+    )
+    return stripped
+
+
+def _rescue_overflowing_slide(
+    nc: NextcloudApp,
+    slide_markdown: str,
+    theme: str,
+    number: int,
+    task_id: int,
+    settings: Settings,
+    image_file_ids: list[int],
+    slide_count: int,
+) -> str | None:
+    """The deterministic exhaustion path for one MEASURED overflowing
+    slide: try the trailing-bullet trim first (:func:`_shrink_slide_to_fit`,
+    readability preserved when a small cut suffices), then the font-scale
+    rescue (:func:`_scale_slide_to_fit`, keeps every word at a smaller
+    type). Each candidate re-runs the SAME construct, image-bounds and
+    fit gates the authored slide faced, so what ships is exactly what the
+    gates checked; None means no rescue fit and the original overflow
+    failure stands. No LLM round: a third identical re-ask would not
+    converge either."""
+
+    def _gated(candidate: str, via: str) -> str | None:
+        try:
+            validated = validate_slide_markdown(
+                candidate, settings.max_deck_bytes, slide_count
+            )
+            validate_image_references(validated.deck, image_file_ids)
+            _reject_slide_overflow(nc, candidate, theme, number, task_id, settings)
+        except DeckError:
+            LOGGER.info(
+                "Task %s: slide %d does not fit after the %s; trying the next rescue",
+                task_id,
+                number,
+                via,
+            )
+            return None
+        LOGGER.info(
+            "Task %s: slide %d fits after the %s; proceeding",
+            task_id,
+            number,
+            via,
+        )
+        return candidate
+
+    candidate = slide_markdown
+    dechromed = _strip_overflowing_slide_chrome(
+        nc, candidate, theme, number, task_id, settings
+    )
+    if dechromed is not None:
+        stripped = _gated(dechromed, "scoped-chrome strip")
+        if stripped is not None:
+            return stripped
+        candidate = dechromed  # the chrome-less slide is the better base
+    shrunk = _shrink_slide_to_fit(nc, candidate, theme, number, task_id, settings)
+    if shrunk is not None:
+        trimmed = _gated(shrunk, "deterministic shrink")
+        if trimmed is not None:
+            return trimmed
+        candidate = shrunk  # the cut helped partway: scale the cut slide
+    scaled = _scale_slide_to_fit(nc, candidate, theme, number, task_id, settings)
+    if scaled is not None:
+        return _gated(scaled, "font-scale rescue")
+    return None
+
+
 def _reject_deck_overflow(
     markdown: str,
     theming_values: ThemingValues | None,
@@ -637,6 +830,300 @@ def _reject_deck_overflow(
         )
 
 
+_FIT_BLOCK_RE = re.compile(
+    r"<style scoped>\nsection \{ font-size: \d{1,3}(?:\.\d+)?px;? \}\n</style>\n?",
+)
+
+
+def _fence_spans(lines: list[str]) -> list[tuple[int, int]] | None:
+    """The (open, close) line-index spans of every code fence, or None
+    when a fence never closes (refuse to split a deck we cannot see
+    whole)."""
+    spans: list[tuple[int, int]] = []
+    open_idx: int | None = None
+    for i, line in enumerate(lines):
+        if line.startswith(("```", "~~~")):
+            if open_idx is None:
+                open_idx = i
+            elif line[:3] == lines[open_idx][:3]:
+                spans.append((open_idx, i))
+                open_idx = None
+    return None if open_idx is not None else spans
+
+
+def _slide_separator_lines(
+    lines: list[str], fences: list[tuple[int, int]]
+) -> list[int]:
+    """Indices of every bare '---' line OUTSIDE code fences (the
+    frontmatter delimiters and the slide separators; slides cannot carry
+    '---' lines of their own, the validator rejects thematic breaks)."""
+
+    def _in_fence(idx: int) -> bool:
+        return any(a <= idx <= b for a, b in fences)
+
+    return [
+        i for i, line in enumerate(lines) if line.strip() == "---" and not _in_fence(i)
+    ]
+
+
+def _split_deck_markdown(markdown: str) -> tuple[str, list[str]] | None:
+    """Split an ASSEMBLED deck markdown into its head (frontmatter plus
+    any deck chrome directives) and the verbatim slide texts, so a rescue
+    can patch one slide and the deck reassemble byte-faithfully. Returns
+    None whenever the split does not round-trip exactly (anything but the
+    assembly shape of :func:`marp_slides.outline.assemble_deck`), because
+    a patchy rewrite must never change uninvolved slides."""
+    lines = markdown.split("\n")
+    if not lines or lines[0].strip() != "---":
+        return None
+    fences = _fence_spans(lines)
+    if fences is None:
+        return None
+    separators = _slide_separator_lines(lines, fences)
+    if not separators:
+        return None
+    head = "\n".join(lines[: separators[0]])
+    slides = []
+    for j, sep in enumerate(separators):
+        end = separators[j + 1] if j + 1 < len(separators) else len(lines)
+        slides.append("\n".join(lines[sep + 1 : end]))
+    if head + "\n\n" + "\n\n---\n\n".join(slides) != markdown:
+        return None
+    return head, slides
+
+
+def _force_fit_floor(slide_markdown: str, font_px: int) -> str:
+    """Set a slide's fit-scaling block to the ladder floor (0.80 of its
+    measured section font), replacing an existing block or appending one;
+    the last deterministic word before the render gate gives up."""
+    px = round(font_px * _FIT_SCALE_LADDER[-1], 1)
+    block = _fit_style_block(px)
+    if _FIT_BLOCK_RE.search(slide_markdown):
+        return _FIT_BLOCK_RE.sub(block + "\n", slide_markdown, count=1)
+    return f"{slide_markdown.rstrip()}\n\n{block}\n"
+
+
+def _measure_deck_reports(
+    markdown: str,
+    theming_values: ThemingValues | None,
+    task_id: int,
+) -> tuple[SlideOverflow, ...] | None:
+    """One batch measurement of a deck (None on measurement
+    infrastructure failure), sharing the branded-theme kwarg discipline
+    of the render gate."""
+    measure_kwargs: dict[str, ThemingValues] = (
+        {"theming_values": theming_values} if theming_values is not None else {}
+    )
+    try:
+        with tempfile.TemporaryDirectory(prefix="marp_slides-fit-") as workdir:
+            return measure_deck_overflow(markdown, Path(workdir), **measure_kwargs)
+    except _OverflowMeasurementError as exc:
+        LOGGER.warning(
+            "Task %s: deck overflow measurement unavailable (%s); "
+            "continuing without the render-time fit pass",
+            task_id,
+            exc,
+        )
+        return None
+
+
+def _fit_deck_for_render(
+    nc: NextcloudApp,
+    validated: ValidatedDeck,
+    markdown: str,
+    task_id: int,
+    settings: Settings,
+) -> tuple[ValidatedDeck, str]:
+    """The render-time fit PASS (before any format renders): measure the
+    assembled deck once and give every slide that blocks (overflow beyond
+    the shared one-line grace) the deterministic per-slide scale rescue
+    (:func:`_scale_slide_to_fit`, the same ladder the authoring
+    exhaustion path uses); still-blocking slides get the floor forced.
+    The patched source is what renders, uploads and delivers, so every
+    surface derives the scale from the deck source itself. Best-effort by
+    contract: when the pass cannot produce a fitting, valid deck the
+    caller's markdown is returned unchanged and the render gate inside
+    :func:`_render_deck_file` decides exactly as before. No-op when
+    ``settings.overflow_check`` is False."""
+    if not settings.overflow_check:
+        return validated, markdown
+    theme = validated.frontmatter.get("theme")
+    theming_values = (
+        _resolve_theming_values(nc, task_id) if theme == THEME_NAME else None
+    )
+    reports = _measure_deck_reports(markdown, theming_values, task_id)
+    if not reports:
+        return validated, markdown
+    blocking = tuple(r for r in reports if r.overflow_y_px > r.line_px)
+    if not blocking:
+        return validated, markdown
+    split = _split_deck_markdown(markdown)
+    if split is None:
+        LOGGER.warning(
+            "Task %s: deck source does not round-trip a slide split; "
+            "skipping the render-time fit pass",
+            task_id,
+        )
+        return validated, markdown
+    head, slides = split
+    theme_name = theme if isinstance(theme, str) else "default"
+    patched = _scale_slides_in_place(
+        nc, head, slides, blocking, theme_name, task_id, settings
+    )
+    if patched is None or patched == markdown:
+        return validated, markdown  # nothing rescuable: the gate decides
+    reports2 = _measure_deck_reports(patched, theming_values, task_id)
+    if reports2:
+        still = tuple(r for r in reports2 if r.overflow_y_px > r.line_px)
+        if still:
+            patched = _force_fit_floors(head, slides, still) or patched
+            reports3 = _measure_deck_reports(patched, theming_values, task_id)
+            if reports3 and any(r.overflow_y_px > r.line_px for r in reports3):
+                LOGGER.info(
+                    "Task %s: slides still overflow after the render-time "
+                    "fit pass; leaving the source to the render gate",
+                    task_id,
+                )
+                return validated, markdown
+    try:
+        re_validated = validate_deck(
+            patched, settings.max_deck_bytes, settings.max_slides
+        )
+    except DeckError as exc:
+        LOGGER.warning(
+            "Task %s: the render-time fit pass produced an invalid deck "
+            "(%s); leaving the source unchanged",
+            task_id,
+            exc,
+        )
+        return validated, markdown
+    LOGGER.info(
+        "Task %s: render-time fit pass patched %d slide(s); the scaled source ships",
+        task_id,
+        len(blocking),
+    )
+    return re_validated, patched
+
+
+def _reassemble_deck(head: str, slides: list[str]) -> str:
+    """Rebuild the deck source exactly the way it was split (the
+    round-trip identity the splitter guarantees)."""
+    return f"{head}\n\n" + "\n\n---\n\n".join(slides)
+
+
+#: A bullet or subheading line of a slide's markdown (any list marker,
+#: any nesting), the shape the structural prescription counts.
+_STRUCTURE_ITEM_RE = re.compile(r"^\s*(?:[-*+]|\d+\.|#{3,})\s+\S")
+
+#: Rough rendered width of one source line against the default and
+#: nextcloud themes' about-70-character line (the teaching's own number).
+_PRESCRIPTION_LINE_CHARS = 70
+
+#: Wrapped-item count above which the prescription tightens from 5 to 4
+#: bullets (the density teaching's own full-slide budget).
+_PRESCRIPTION_DENSE_WRAPPED = 9
+
+
+#: The attempt number whose feedback is the structural prescription (the
+#: overflow-only third round of :func:`_generate_slide`).
+_PRESCRIPTION_ATTEMPT = 3
+
+
+def _slide_retry_feedback(
+    attempt: int, last_error: DeckError, last_slide_markdown: str | None
+) -> str:
+    """The corrective feedback appended to a slide's authoring prompt on
+    retry: the validation error with a plain correction ask (attempt 2),
+    or the structural prescription (attempt 3, overflow-only - the model
+    demonstrably cannot execute 'cut roughly N lines' reliably under
+    content pressure, so the third round prescribes an exact, countable
+    shape instead)."""
+    if attempt < _PRESCRIPTION_ATTEMPT:
+        return (
+            f"Your previous attempt for this slide failed validation: "
+            f"{last_error}. Return ONLY the corrected slide."
+        )
+    return (
+        f"Your previous attempt failed validation: {last_error}. "
+        f"{_overflow_structure_prescription(last_slide_markdown)}"
+    )
+
+
+def _overflow_structure_prescription(slide_markdown: str | None) -> str:
+    """The third-attempt structural prescription for a slide that
+    overflowed twice: an exact, countable shape (title, no subheadings,
+    at most N single-line bullets) instead of another appeal to 'cut
+    roughly N lines', which the model demonstrably cannot execute
+    reliably under content pressure. The bullet ceiling N derives from
+    the failed slide's own wrapped-line count, so denser failures get
+    tighter ceilings."""
+    if slide_markdown is None:
+        return (
+            "Write the corrected slide as: the title heading and at most 5 "
+            "bullets, each a single line of at most 70 characters, with no "
+            "subheadings. Return ONLY the corrected slide."
+        )
+    items = [
+        line for line in slide_markdown.splitlines() if _STRUCTURE_ITEM_RE.match(line)
+    ]
+    wrapped = sum(
+        max(1, -(-len(line.strip()) // _PRESCRIPTION_LINE_CHARS)) for line in items
+    )
+    ceiling = 5 if wrapped <= _PRESCRIPTION_DENSE_WRAPPED else 4
+    return (
+        "Your two previous attempts were too dense for this slide. Write "
+        "the corrected slide with EXACTLY this structure: the title "
+        "heading, NO subheadings, NO scoped footer or header directives, "
+        f"and at most {ceiling} bullets, each fitting on ONE line of at "
+        f"most {_PRESCRIPTION_LINE_CHARS} characters. Drop every point "
+        "that does not fit; the deck's other slides cover the rest. Do "
+        "not add links, tables or new constructs. Return ONLY the "
+        "corrected slide."
+    )
+
+
+def _scale_slides_in_place(
+    nc: NextcloudApp,
+    head: str,
+    slides: list[str],
+    blocking: tuple[SlideOverflow, ...],
+    theme_name: str,
+    task_id: int,
+    settings: Settings,
+) -> str | None:
+    """Ladder-rescue every blocking slide of a split deck in place and
+    return the reassembled markdown (None when no slide was rescuable)."""
+    patched_any = False
+    for report in blocking:
+        idx = report.slide - 1
+        if idx >= len(slides):
+            continue
+        scaled = _scale_slide_to_fit(
+            nc, slides[idx], theme_name, report.slide, task_id, settings
+        )
+        if scaled is not None:
+            slides[idx] = scaled.rstrip("\n")
+            patched_any = True
+            LOGGER.info(
+                "Task %s: render-time fit pass scaled slide %d",
+                task_id,
+                report.slide,
+            )
+    return _reassemble_deck(head, slides) if patched_any else None
+
+
+def _force_fit_floors(
+    head: str, slides: list[str], still: tuple[SlideOverflow, ...]
+) -> str | None:
+    """Force the ladder floor on every still-blocking slide of a split
+    deck (the last deterministic word before the render gate gives up)."""
+    for report in still:
+        idx = report.slide - 1
+        if idx < len(slides):
+            slides[idx] = _force_fit_floor(slides[idx], report.font_px).rstrip("\n")
+    return _reassemble_deck(head, slides)
+
+
 def _generate_slide(
     nc: NextcloudApp,
     outline: DeckOutline,
@@ -650,30 +1137,33 @@ def _generate_slide(
     whole plan for context but asks for exactly this slide's Markdown; the
     existing construct validator runs on the slide alone (wrapped in a
     synthetic frontmatter), and the image-reference bounds check runs per
-    slide too, so a failed slide retries ITSELF (2 attempts) with the
-    validation error as corrective feedback instead of costing the whole
-    deck. Returns the slide's validated Markdown together with the number
-    of LLM attempts it took (1 or 2: the draft checkpoint records it).
+    slide too, so a failed slide retries ITSELF (2 attempts, plus a THIRD
+    reserved for slides that overflowed twice: the feedback retry alone
+    demonstrably does not converge on them, so the third round carries a
+    structural prescription) instead of costing the whole deck. Returns
+    the slide's validated Markdown together with the number of LLM
+    attempts it took (1 to 3: the draft checkpoint records it).
     Scheduling failures propagate; the LAST attempt's DeckError is raised
     when every attempt fails - except when that failure is a MEASURED
-    overflow: then a deterministic shrink-to-fit (:func:`_shrink_slide_to_fit`)
-    cuts the computed number of trailing bullets and the cut slide ships
-    when it re-passes the same validation and fit gates."""
+    overflow: then the deterministic rescue tiers (trim, then font
+    scaling) try to make the last candidate ship through the same
+    validation and fit gates."""
     total = len(outline.slides)
-    attempts = 2 if settings.retry_llm else 1
+    attempts = 3 if settings.retry_llm else 1
     _report_progress(
         nc, task_id, 10.0 + (number / total) * 80.0, f"Slide {number} of {total}"
     )
     last_error = DeckError(f"slide {number} authoring failed")
     last_slide_markdown: str | None = None
     for attempt in range(1, attempts + 1):
+        if attempt == _PRESCRIPTION_ATTEMPT and not isinstance(
+            last_error, SlideOverflowError
+        ):
+            break  # the third round is reserved for repeat overflows only
         llm_input = build_slide_prompt(outline, number, len(image_file_ids))
         if attempt > 1:
-            llm_input = (
-                f"{llm_input}\n\n"
-                f"Your previous attempt for this slide failed validation: {last_error}. "
-                "Return ONLY the corrected slide."
-            )
+            feedback = _slide_retry_feedback(attempt, last_error, last_slide_markdown)
+            llm_input = f"{llm_input}\n\n{feedback}"
         LOGGER.info(
             "Task %s: scheduling slide %d/%d LLM task (attempt %d)",
             task_id,
@@ -753,39 +1243,29 @@ def _generate_slide(
     # its trailing bullets cut by the measured line count instead of
     # failing the whole deck - the PowerPoint-autofit equivalent, and no
     # LLM round (a third identical re-ask would not converge either).
-    # The cut markdown re-runs the SAME validation and fit gates, so an
-    # insufficient or invalidating cut still surfaces the original
+    # When there is nothing to cut or the cut is not enough, the
+    # font-scale rescue tier follows: keep every word, shrink the type
+    # (the machine-managed fit-scaling block the parser, marp and the
+    # PPTX mirror all honor). Both re-run the SAME validation and fit
+    # gates, so an insufficient rescue still surfaces the original
     # overflow failure.
     if last_slide_markdown is not None and isinstance(last_error, SlideOverflowError):
-        shrunk = _shrink_slide_to_fit(
-            nc, last_slide_markdown, outline.theme, number, task_id, settings
+        rescued = _rescue_overflowing_slide(
+            nc,
+            last_slide_markdown,
+            outline.theme,
+            number,
+            task_id,
+            settings,
+            image_file_ids,
+            total,
         )
-        if shrunk is not None:
-            try:
-                validated = validate_slide_markdown(
-                    shrunk, settings.max_deck_bytes, total
-                )
-                validate_image_references(validated.deck, image_file_ids)
-                _reject_slide_overflow(
-                    nc, shrunk, outline.theme, number, task_id, settings
-                )
-                LOGGER.info(
-                    "Task %s: slide %d fits after the deterministic shrink; proceeding",
-                    task_id,
-                    number,
-                )
-                return shrunk.strip(), attempts
-            except DeckError:
-                LOGGER.info(
-                    "Task %s: slide %d still does not fit after the "
-                    "deterministic shrink; failing the slide",
-                    task_id,
-                    number,
-                )
+        if rescued is not None:
+            return rescued.strip(), attempts
     raise last_error
 
 
-# --- draft checkpoints: cadence, resume, retention (wave draft-resume) -----------
+# --- draft checkpoints: cadence, resume, retention ---------------------------
 
 
 #: AppAPI docker deployments mount the ExApp persistent volume at
@@ -1016,6 +1496,52 @@ def _load_resume_draft(
     return draft
 
 
+#: The draft-id header comment of a delivered draft .md, exactly as
+#: :func:`marp_slides.draft_delivery._draft_document` pins it. The 'id;'
+#: form (not the trailing draft_id= repetition) is captured: it identifies
+#: the leading comment unambiguously.
+_DRAFT_FILE_ID_RE = re.compile(r"<!--\s*draft id:\s*(?P<id>[0-9a-f]{12})\s*;")
+
+
+def _resume_input_with_draft_file(
+    nc: NextcloudApp,
+    task_input: Mapping[str, Any],
+    settings: Settings,
+    task_id: int,
+) -> Mapping[str, Any]:
+    """The task input the draft-resume path consults: with the optional
+    ``draft_file`` file input present, its content is downloaded (the
+    same by_id/download mechanism the images use), the 12-hex draft id is
+    extracted from the leading draft comment and substituted for
+    ``draft_id`` (the file wins when both are given: picking the concrete
+    draft artifact is the more deliberate choice). The substitution routes
+    into the EXISTING ``draft_id`` resume path unchanged, so a pruned or
+    corrupt checkpoint surfaces the store's actionable remedy either way.
+    Without ``draft_file`` the mapping passes through untouched."""
+    raw = task_input.get("draft_file")
+    if raw is None:
+        return task_input
+    file_id = _file_input_id(raw, "draft_file")
+    name, text = _download_text_file(nc, file_id, "draft_file", settings.max_deck_bytes)
+    match = _DRAFT_FILE_ID_RE.search(text)
+    if match is None:
+        raise DeckError(
+            f"The file '{name}' picked as 'draft_file' carries no draft id "
+            "in its header comment, so it cannot resume a generation. Pick "
+            "the draft .md a failed generation saved to your Files, or "
+            "pass the advertised id with the 'draft_id' input."
+        )
+    draft_id = match.group("id")
+    LOGGER.info(
+        "Task %s: draft file %r (file id %s) names draft %s; resuming it",
+        task_id,
+        name,
+        file_id,
+        draft_id,
+    )
+    return {**task_input, "draft_id": draft_id}
+
+
 def _outline_from_checkpoint(
     draft: DeckDraft, image_count: int, settings: Settings
 ) -> DeckOutline:
@@ -1221,18 +1747,118 @@ def _fetch_deck_images(
     return fetch_image_blobs(nc, image_file_ids, image_indices)
 
 
+def _file_input_id(raw: object, slot: str) -> int:
+    """Validate a single-valued FILE task input: the Nextcloud file id the
+    server resolved and access-checked at schedule time (the same contract
+    the images list builds on, one id instead of a list)."""
+    if isinstance(raw, bool) or not isinstance(raw, int) or raw < 1:
+        raise DeckError(
+            f"The task input '{slot}' must be a single Nextcloud file id "
+            f"(a positive integer), got {raw!r}."
+        )
+    return raw
+
+
+def _download_text_file(
+    nc: NextcloudApp, file_id: int, slot: str, max_bytes: int
+) -> tuple[str, str]:
+    """Download one picked file's content as UTF-8 text through the same
+    app-context ``nc.files.by_id`` + ``nc.files.download`` mechanism
+    :func:`marp_slides.images.fetch_image_blobs` uses (the id was already
+    access-checked server-side at schedule time; the worker only
+    downloads). Returns ``(name, text)``; every failure raises DeckError
+    with an actionable message (an input-data failure, never retried).
+    The server's mimetype is deliberately NOT enforced: Files stores .md
+    as text/markdown, but a renamed or extensionless Markdown source is
+    equally valid, and the strict UTF-8 decode plus the downstream deck
+    gates are the authority on what is usable text."""
+    node = nc.files.by_id(file_id)
+    if node is None:
+        raise DeckError(
+            f"The file picked as '{slot}' (file id {file_id}) could not be "
+            "found on the server or is not accessible. Pick a valid file "
+            "from your Files."
+        )
+    if getattr(node, "is_dir", False):
+        raise DeckError(
+            f"The file picked as '{slot}' (file id {file_id}) is a folder, "
+            "not a Markdown file. Pick a file instead."
+        )
+    name = str(getattr(node, "name", file_id))
+    reported_size = node.info.content_length
+    if reported_size > max_bytes:
+        raise DeckError(
+            f"The file '{name}' picked as '{slot}' is {reported_size} "
+            f"bytes; the maximum is {max_bytes} bytes. Use a smaller file."
+        )
+    data = nc.files.download(node)
+    if len(data) > max_bytes:
+        raise DeckError(
+            f"The file '{name}' picked as '{slot}' downloaded as "
+            f"{len(data)} bytes; the maximum is {max_bytes} bytes. Use a "
+            "smaller file."
+        )
+    try:
+        text = data.decode("utf-8")
+    except UnicodeDecodeError as exc:
+        raise DeckError(
+            f"The file '{name}' picked as '{slot}' is not UTF-8 text, so "
+            "it cannot be read as Markdown. Pick the matching .md file "
+            "from your Files."
+        ) from exc
+    return name, text
+
+
 def _input_deck_markdown(value: object) -> str:
-    """Validate the re-render task's required ``markdown`` input: the
+    """Validate the re-render task's optional ``markdown`` text input: the
     complete Marp Markdown deck source including the frontmatter. Returns
     the stripped markdown (mirroring :func:`extract_markdown`'s only touch
     on the authoring path, so the echoed source matches what the authoring
     task would have retained)."""
     if not isinstance(value, str) or not value.strip():
         raise DeckError(
-            "The task input is missing a non-empty 'markdown' text with the "
-            "complete Marp Markdown deck source (including the frontmatter)."
+            "The task input is missing the deck source: send the complete "
+            "Marp Markdown deck source (including the frontmatter) as the "
+            "'markdown' text, or pick the deck's .md file with the "
+            "'deck_source_file' input."
         )
     return value.strip()
+
+
+def _re_render_source_markdown(
+    nc: NextcloudApp,
+    task_input: Mapping[str, Any],
+    settings: Settings,
+    task_id: int,
+) -> str:
+    """Resolve the re-render deck source: exactly one of the optional
+    ``markdown`` text input and the optional ``deck_source_file`` file
+    input, BEFORE any render work. Both empty fails with the actionable
+    either-or message; both present resolves to the FILE (picking a
+    concrete artifact from Files is the more deliberate choice). The file
+    content decodes as UTF-8 text and passes the same non-empty gate as
+    the text input, so what flows onward is byte-identical regardless of
+    which input carried it."""
+    raw_file = task_input.get("deck_source_file")
+    if raw_file is not None:
+        file_id = _file_input_id(raw_file, "deck_source_file")
+        name, text = _download_text_file(
+            nc, file_id, "deck_source_file", settings.max_deck_bytes
+        )
+        if not text.strip():
+            raise DeckError(
+                f"The deck source file '{name}' (file id {file_id}) is "
+                "empty. Pick the .md source delivered with the deck, or "
+                "send the source as the 'markdown' text input."
+            )
+        LOGGER.info(
+            "Task %s: re-rendering the deck source file %r (file id %s)",
+            task_id,
+            name,
+            file_id,
+        )
+        return text.strip()
+    return _input_deck_markdown(task_input.get("markdown"))
 
 
 def _re_render_file_ids(task_input: Mapping[str, Any]) -> list[int]:
@@ -1257,7 +1883,9 @@ def _re_render_deck(
 ) -> str:
     """Deterministic re-render of an edited deck source: the SAME strict
     validation (same rules, same error messages) and the SAME render phase
-    as the authoring pipeline, minus the LLM call. One deliberate
+    as the authoring pipeline, minus the LLM call. The source is the
+    ``markdown`` text or the ``deck_source_file`` file input (exactly one;
+    see :func:`_re_render_source_markdown`). One deliberate
     difference from the authoring gate: image completeness is NOT required
     here (the markdown is user-authored and may deliberately show only
     some of the provided files); the bounds check still runs. No
@@ -1269,7 +1897,7 @@ def _re_render_deck(
     fail-soft Files delivery of the rendered files."""
     output_format = validate_output_format(task_input.get("output_format"))
     image_file_ids = _re_render_file_ids(task_input)
-    markdown = _input_deck_markdown(task_input.get("markdown"))
+    markdown = _re_render_source_markdown(nc, task_input, settings, task_id)
 
     LOGGER.info(
         "Task %s: re-rendering submitted markdown source as %s", task_id, output_format
@@ -1283,6 +1911,10 @@ def _re_render_deck(
     # "all" expands like the authoring pipeline; every render and upload
     # precedes the single result report (render phases ping progress, and
     # a ping after report_result resurrects the task as a RUNNING zombie).
+    # The render-time fit pass runs ONCE here, exactly like authoring.
+    validated, markdown = _fit_deck_for_render(
+        nc, validated, markdown, task_id, settings
+    )
     formats = (
         list(OUTPUT_FORMAT_VALUES[:3]) if output_format == "all" else [output_format]
     )
@@ -1575,8 +2207,8 @@ def _report_deck_result(
     back to STATUS_RUNNING (no terminal-state guard), so any progress
     report after the result would resurrect the finished task as a
     permanent RUNNING zombie with its output already stored (observed
-    live: task 544, status=2/progress=1.0/output present, never
-    SUCCESSFUL; then task 737, status=2/progress=0.92 with all four
+    live twice: a task at status=2/progress=1.0 with output present,
+    never SUCCESSFUL; then one at status=2/progress=0.92 with all four
     files uploaded, after the 'all formats' loop rendered html/pdf past
     the pptx report)."""
     primary_filename = deck_files[0][0]
@@ -1642,9 +2274,9 @@ def _deliver_draft_copy(
     nc: NextcloudApp, user_id: str | None, draft: DeckDraft, settings: Settings
 ) -> None:
     """Fail-soft delivery of the draft into the user's Files via the
-    sibling draft-delivery unit (a separate wave unit: the LAZY import
-    keeps both branches independently green until the orchestrator
-    merges them). Called only when ``settings.drafts_folder`` is
+    user's Files via the draft-delivery unit (imported lazily behind
+    a fail-soft seam, so the delivery unit stays optional and
+    independently testable. Called only when ``settings.drafts_folder`` is
     non-empty: that folder is the deployment's opt-in for Files copies.
     Delivery failures only log: they must never affect the (already
     failed) task."""
@@ -1656,9 +2288,8 @@ def _deliver_draft_copy(
         )
         return
     try:
-        # the ignore covers both merge states: import-not-found while the
-        # sibling unit is absent, unused-ignore once it is merged in
-        from .draft_delivery import (  # type: ignore[import-not-found, unused-ignore]  # noqa: PLC0415 - lazy seam: the sibling unit may be absent until the branches merge
+        # the ignore pair covers the optional-seam import; the lazy import is kept for the fail-soft contract
+        from .draft_delivery import (  # type: ignore[import-not-found, unused-ignore]  # noqa: PLC0415 - lazy seam: the delivery unit stays optional
             deliver_draft,
         )
     except ImportError:
@@ -1823,8 +2454,11 @@ def _generate_deck(
     rebuilt and reused (no outline LLM round), the checkpoint's image ids
     ride along ONLY when the task provides none (provided images win and
     bounds-check as usual), and the per-slide loop reuses done slides
-    verbatim while regenerating missing or failed ones. ``user_id`` (the
-    task owner, threaded from process_task) gates the fail-soft Files
+    verbatim while regenerating missing or failed ones. The optional
+    ``draft_file`` input starts the same resume by picking the delivered
+    draft .md from Files: its header comment names the draft id (see
+    :func:`_resume_input_with_draft_file`). ``user_id`` (the task
+    owner, threaded from process_task) gates the fail-soft Files
     delivery of the generated files."""
     output_format = validate_output_format(task_input.get("output_format"))
     theme = validate_theme(task_input.get("theme"))
@@ -1835,7 +2469,8 @@ def _generate_deck(
     )
     max_slides = _validate_max_slides(task_input.get("max_slides"), settings)
     image_file_ids = validate_images_slot(task_input.get("images"))
-    resumed = _load_resume_draft(task_input, theme, max_slides)
+    resume_input = _resume_input_with_draft_file(nc, task_input, settings, task_id)
+    resumed = _load_resume_draft(resume_input, theme, max_slides)
     resume_outline: DeckOutline | None = None
     if resumed is not None:
         if not image_file_ids and resumed.image_file_ids:
@@ -1872,9 +2507,14 @@ def _generate_deck(
     # "all" expands to every format; each gets its own file and upload.
     # EVERY render and upload happens BEFORE the single result report:
     # render phases ping progress, and a progress ping after
-    # report_result resurrects the task as a RUNNING zombie (task 737).
+    # report_result resurrects the task as a RUNNING zombie (observed live).
     # The fail-soft Files delivery (no pings of its own) sits between the
-    # uploads and the report for the same reason.
+    # uploads and the report for the same reason. The render-time fit
+    # pass runs ONCE here (not per format): it may patch the source, and
+    # every format then renders the SAME patched markdown.
+    validated, markdown = _fit_deck_for_render(
+        nc, validated, markdown, task_id, settings
+    )
     formats = (
         list(OUTPUT_FORMAT_VALUES[:3]) if output_format == "all" else [output_format]
     )

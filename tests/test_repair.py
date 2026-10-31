@@ -150,6 +150,62 @@ def test_code_fence_contents_are_never_touched() -> None:
     assert repairs == []
 
 
+# --- pattern 7: links with no URL strip to their label ------------------------
+
+
+def test_empty_url_link_strips_to_label_and_passes() -> None:
+    """The live retry-regression shape (observed live): '[label]()' has no
+    URL, so the hyperlink gate rejects it; the repair strips the link
+    syntax to the label text, keeps real links and the emphasis inside
+    the label, and the repaired deck validates."""
+    broken = (
+        "---\nmarp: true\ntitle: Sponsorship\n---\n\n"
+        "# Sponsorship Deals\n\n"
+        "- **Team INNOVATE** case study: see [the partnership]()\n"
+        "- Real link stays: [UCI](https://www.uci.org)\n"
+    )
+    assert_rejected(broken)
+    repaired, repairs = repair_deck_markdown(broken)
+    assert repairs == ["stripped a link with no URL to its label text"]
+    assert "see the partnership" in repaired
+    assert "[the partnership]" not in repaired
+    assert "[UCI](https://www.uci.org)" in repaired
+    validate_deck(repaired)
+
+
+def test_reference_link_with_empty_definition_strips() -> None:
+    """'[label][ref]' whose '[ref]:' definition exists but is empty
+    resolves to an empty URL and rejects: the use strips to its label and
+    the empty definition line drops out. Uses with NO definition stay
+    (a typo may name a real ref; that judgement is the retry's)."""
+    empty_def = (
+        "---\nmarp: true\ntitle: Sponsorship\n---\n\n"
+        "# Sponsorship Deals\n\n"
+        "- Case study: [team site][site]\n\n[site]:\n"
+    )
+    assert_rejected(empty_def)
+    repaired, repairs = repair_deck_markdown(empty_def)
+    assert repairs == ["stripped a link with no URL to its label text"]
+    assert "Case study: team site" in repaired
+    assert "[site]:" not in repaired
+    validate_deck(repaired)
+
+
+def test_defined_reference_links_and_undefined_uses_are_kept() -> None:
+    """A reference with a real definition stays a link; a reference with
+    no definition at all is a judgement call (typo of a real ref?) and
+    stays for the retry, so the repair reports nothing."""
+    defined = (
+        "---\nmarp: true\ntitle: Sponsorship\n---\n\n"
+        "# Sponsorship Deals\n\n"
+        "- [UCI][uci] and [typo][ucii]\n\n[uci]: https://www.uci.org\n"
+    )
+    assert_rejected(defined)  # the undefined use rejects, un-repaired
+    repaired, repairs = repair_deck_markdown(defined)
+    assert repaired == defined
+    assert repairs == []
+
+
 # --- worker wiring: repair before the retry ------------------------------------
 
 TASK = {
@@ -221,7 +277,7 @@ def recording_scheduler(outputs: list[str]) -> tuple[object, list[dict]]:
 
 
 def test_repair_rescues_unquoted_colon_title() -> None:
-    """The exact failure from live task 474: unquoted colon in title."""
+    """The exact failure from live-observed failure unquoted colon in title."""
     markdown = (
         "---\nmarp: true\ntitle: Track Cycling Essentials: Everything You Need to Know\n"
         "theme: default\npaginate: true\n---\n\n# Title\n"
@@ -233,7 +289,7 @@ def test_repair_rescues_unquoted_colon_title() -> None:
 
 
 def test_repair_moves_footer_from_slide_body() -> None:
-    """The exact failure from live task 474 attempt 2: footer inside a slide."""
+    """The exact failure from live-observed: footer inside a slide."""
     markdown = (
         "---\nmarp: true\ntitle: T\n---\n\n# Slide 1\n\n---\n\n"
         "<!-- footer: Track Safety Rules | Page 3 -->\n\n# Slide 2\n"
@@ -256,7 +312,7 @@ def test_repair_noop_on_valid_markdown() -> None:
 
 
 def test_repair_dedents_indented_code_fence() -> None:
-    """The exact failure from live task 496 slide 5 attempt 2: a code
+    """The exact failure from live live-observed: a code
     fence with leading spaces."""
     markdown = (
         "---\nmarp: true\ntitle: T\n---\n\n# Slide\n\n"
@@ -269,7 +325,7 @@ def test_repair_dedents_indented_code_fence() -> None:
 
 
 def test_repair_demotes_double_title_h2() -> None:
-    """The exact failure from live task 496 slide 5 attempt 1: '# Title'
+    """The exact failure from live live-observed: '# Title'
     plus '## Subtitle' on one slide."""
     markdown = (
         "---\nmarp: true\ntitle: T\n---\n\n"
@@ -294,7 +350,7 @@ def test_repair_demotes_duplicate_h1() -> None:
 
 
 def test_repair_strips_raw_span_tags() -> None:
-    """The exact failure from live task 522 slide 8 attempt 1: slide text
+    """The exact failure from live live-observed: slide text
     wrapped in a raw style span, which the native-only construct set
     rejects wholesale."""
     markdown = (

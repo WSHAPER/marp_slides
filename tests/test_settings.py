@@ -64,7 +64,7 @@ def test_retry_llm_knob() -> None:
 
 
 def test_log_excerpt_knob() -> None:
-    """F6: the deck-failure markdown excerpt defaults ON (diagnosability) and
+    """The deck-failure markdown excerpt defaults ON (diagnosability) and
     MARP_SLIDES_LOG_EXCERPT=false suppresses it."""
     assert Settings.from_env({}).log_excerpt is DEFAULT_LOG_EXCERPT is True
     assert Settings.from_env({"MARP_SLIDES_LOG_EXCERPT": "false"}).log_excerpt is False

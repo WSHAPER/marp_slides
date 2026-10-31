@@ -41,9 +41,10 @@ def test_provider_shape() -> None:
         "theme",
         "max_slides",
         "draft_id",
+        "draft_file",
         "images",
     ]
-    fmt_slot, theme_slot, _max_slides, _draft, images_slot = (
+    fmt_slot, theme_slot, _max_slides, _draft, _draft_file, images_slot = (
         provider.optional_input_shape
     )
     assert fmt_slot.shape_type == ShapeType.ENUM
@@ -83,7 +84,9 @@ def test_theme_slot_enum_mirrors_the_constructs_constant() -> None:
 
 def test_theme_description_states_values_and_pptx_limit() -> None:
     provider = task_definition.PROVIDER
-    (_fmt, theme_slot, _ms, _draft, _images) = provider.optional_input_shape
+    (_fmt, theme_slot, _ms, _draft, _draft_file, _images) = (
+        provider.optional_input_shape
+    )
     assert "'auto'" in theme_slot.description
     for name in ("default", "gaia", "uncover"):
         assert f"'{name}'" in theme_slot.description
@@ -92,7 +95,9 @@ def test_theme_description_states_values_and_pptx_limit() -> None:
 
 def test_draft_id_slot_is_optional_text_with_resume_teaching() -> None:
     provider = task_definition.PROVIDER
-    (_fmt, _theme, _ms, draft_slot, _images) = provider.optional_input_shape
+    (_fmt, _theme, _ms, draft_slot, _draft_file, _images) = (
+        provider.optional_input_shape
+    )
     assert draft_slot.name == "draft_id"
     assert draft_slot.shape_type == ShapeType.TEXT
     assert "12-character draft id" in draft_slot.description
@@ -105,9 +110,29 @@ def test_draft_id_slot_is_optional_text_with_resume_teaching() -> None:
     assert "draft_id" not in re_render_slots
 
 
+def test_draft_file_slot_is_optional_file_with_resume_teaching() -> None:
+    """The Files-side resume entry: picking the delivered draft .md is the
+    same act as typing the advertised draft_id, so its label teaches where
+    the id comes from (the header comment) and what resumes (the completed
+    slides)."""
+    provider = task_definition.PROVIDER
+    (_fmt, _theme, _ms, _draft, draft_file_slot, _images) = (
+        provider.optional_input_shape
+    )
+    assert draft_file_slot.name == "draft_file"
+    assert draft_file_slot.shape_type == ShapeType.FILE
+    assert "draft .md" in draft_file_slot.description
+    assert "header comment" in draft_file_slot.description
+    assert "completed slides" in draft_file_slot.description
+    # the re-render task has no draft resume of its own
+    assert "draft_file" not in [
+        s.name for s in task_definition.RE_RENDER_PROVIDER.optional_input_shape
+    ]
+
+
 def test_enum_description_is_one_clean_sentence() -> None:
     provider = task_definition.PROVIDER
-    (fmt, _theme, _ms, _draft, _images) = provider.optional_input_shape
+    (fmt, _theme, _ms, _draft, _draft_file, _images) = provider.optional_input_shape
     # one short human sentence: the dropdown options already enumerate the
     # formats, so the label only states the purpose and the default
     assert fmt.description == (
@@ -117,7 +142,9 @@ def test_enum_description_is_one_clean_sentence() -> None:
 
 def test_images_slot_description_is_one_clean_sentence() -> None:
     provider = task_definition.PROVIDER
-    (_fmt, _theme, _ms, _draft, images_slot) = provider.optional_input_shape
+    (_fmt, _theme, _ms, _draft, _draft_file, images_slot) = (
+        provider.optional_input_shape
+    )
     assert images_slot.description == (
         "Optional images to place in the deck (PNG or JPEG, max 5 MB "
         "each; SVG is not supported)."

@@ -12,7 +12,7 @@ dependency) instead of dying silently. Guards never raise, never block
 and never change any task's outcome.
 
 Probe mechanism (each guard's mechanism is live-verified against the
-nc35 dev instance, 2026-10-30, read-only from the ExApp container):
+Nextcloud 35 dev instance, read-only from the ExApp container):
 
 - ``nc.apps.get_list()`` (OCS ``GET /ocs/v1.php/cloud/apps``) answers
   ``401 Unauthorized`` from app context: the apps-list endpoint is

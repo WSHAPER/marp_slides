@@ -518,6 +518,132 @@ def test_re_render_path_delivers_files_too(monkeypatch, settings) -> None:
     assert result["output"] == SUCCESS_OUTPUT
 
 
+# --- the deck source picked from Files (deck_source_file) ---------------------
+
+
+#: A one-slide deck that is VALID but different from conftest's VALID_DECK,
+#: so a test can tell which of the two inputs the worker actually used.
+OTHER_DECK = "---\nmarp: true\ntitle: Other Deck\n---\n\n# Other deck\n"
+
+
+def re_render_task(task_input: dict) -> dict:
+    """A re-render task payload carrying ``task_input`` verbatim."""
+    return {
+        "id": 8,
+        "type": "marp_slides:re_render",
+        "status": "STATUS_RUNNING",
+        "userId": "alice",
+        "appId": "marp_slides",
+        "input": task_input,
+    }
+
+
+def md_node(file_id: int, content: bytes, name: str):
+    """A Files node carrying text/markdown metadata and the given bytes
+    (the metadata shape Files reports for a .md; the worker's authority is
+    the decode + deck gates, not this mimetype)."""
+    return fake_node(file_id, mimetype="text/markdown", size=len(content), name=name)
+
+
+def test_re_render_with_deck_source_file_flows_through(settings) -> None:
+    """The file-id source path: the .md picked from Files downloads via
+    by_id/download and its content flows through the SAME validate ->
+    render path, echoed byte-identically as the retained source."""
+    content = VALID_DECK.encode("utf-8")
+    files = FakeFilesAPI(
+        {303: md_node(303, content, "Quarterly-Review.md")}, {303: content}
+    )
+    nc, api = make_fake_nc(files=files)
+    task_worker.process_task(nc, re_render_task({"deck_source_file": 303}), settings)
+    (result,) = api.results
+    assert result["output"] == SUCCESS_OUTPUT
+    assert files.downloaded == [303]  # exactly the picked file was fetched
+    assert api.uploads[0][1][1] == b"PK-editable"  # rendered as any source
+    assert api.uploads[1][1][1] == VALID_DECK.strip().encode("utf-8")
+
+
+def test_re_render_deck_source_file_wins_over_markdown_text(settings) -> None:
+    """Both source inputs riding along resolves to the FILE: picking a
+    concrete artifact from Files is the more deliberate choice, so the
+    text input is quietly ignored (never merged)."""
+    content = VALID_DECK.encode("utf-8")
+    files = FakeFilesAPI(
+        {303: md_node(303, content, "Quarterly-Review.md")}, {303: content}
+    )
+    nc, api = make_fake_nc(files=files)
+    task_worker.process_task(
+        nc,
+        re_render_task({"markdown": OTHER_DECK, "deck_source_file": 303}),
+        settings,
+    )
+    (result,) = api.results
+    assert result["output"] == SUCCESS_OUTPUT
+    assert api.uploads[1][1][1] == VALID_DECK.strip().encode("utf-8")
+
+
+def test_re_render_without_any_deck_source_fails_actionably(settings) -> None:
+    """Neither source input given: the either-or guard fires BEFORE any
+    render work and names both remedies."""
+    nc, api = make_fake_nc()
+    task_worker.process_task(nc, re_render_task({}), settings)
+    (result,) = api.results
+    assert result["output"] is None
+    assert "'markdown'" in result["user_facing_error_message"]
+    assert "'deck_source_file'" in result["user_facing_error_message"]
+    assert api.uploads == []  # nothing rendered, nothing echoed
+
+
+def test_re_render_blank_markdown_text_is_not_a_source(settings) -> None:
+    """Whitespace-only markdown text counts as absent, so the task fails
+    with the same either-or message (a blank text must not slip through
+    as 'provided')."""
+    nc, api = make_fake_nc()
+    task_worker.process_task(nc, re_render_task({"markdown": "   \n\n  "}), settings)
+    (result,) = api.results
+    assert result["output"] is None
+    assert "'deck_source_file'" in result["user_facing_error_message"]
+
+
+def test_re_render_missing_deck_source_file_fails_actionably(settings) -> None:
+    """A file id the server no longer resolves (deleted, unshared) is an
+    actionable input failure, never an internal error."""
+    files = FakeFilesAPI({}, {})
+    nc, api = make_fake_nc(files=files)
+    task_worker.process_task(nc, re_render_task({"deck_source_file": 404}), settings)
+    (result,) = api.results
+    assert result["output"] is None
+    assert "could not be found" in result["user_facing_error_message"]
+    assert "404" in result["user_facing_error_message"]
+
+
+def test_re_render_binary_deck_source_file_fails_actionably(settings) -> None:
+    """Picking a non-text file (e.g. the pptx deliverable) fails the
+    strict UTF-8 decode with the actionable pick-the-.md message."""
+    blob = b"PK\x03\x04\xff\xfe\x00binary-not-text"
+    files = FakeFilesAPI(
+        {303: md_node(303, blob, "Quarterly-Review.pptx")}, {303: blob}
+    )
+    nc, api = make_fake_nc(files=files)
+    task_worker.process_task(nc, re_render_task({"deck_source_file": 303}), settings)
+    (result,) = api.results
+    assert result["output"] is None
+    assert "not UTF-8 text" in result["user_facing_error_message"]
+
+
+def test_re_render_invalid_deck_source_file_slot_fails_actionably(
+    settings,
+) -> None:
+    """The file slot validates like the images list does: one positive
+    integer file id, anything else is an actionable input failure."""
+    nc, api = make_fake_nc()
+    task_worker.process_task(
+        nc, re_render_task({"deck_source_file": "not-an-id"}), settings
+    )
+    (result,) = api.results
+    assert result["output"] is None
+    assert "must be a single Nextcloud file id" in result["user_facing_error_message"]
+
+
 def test_success_uses_one_llm_call_per_slide(monkeypatch, settings) -> None:
     """The happy path costs exactly 1 + N nested LLM rounds (no whole-deck
     re-authoring anymore)."""
@@ -909,7 +1035,7 @@ def test_slide_failure_before_extraction_logs_no_excerpt(
 def test_log_excerpt_off_suppresses_excerpt_keeps_error_line(
     monkeypatch, settings, caplog
 ) -> None:
-    """F6: MARP_SLIDES_LOG_EXCERPT=false keeps the WARNING error line (what
+    """MARP_SLIDES_LOG_EXCERPT=false keeps the WARNING error line (what
     failed, which task) but drops the 240-char markdown excerpt: deck
     content never reaches docker logs in privacy-sensitive deployments."""
     slides = [SLIDES_OK[0], "# Bad slide\n\n### ###", SLIDES_OK[1], SLIDES_OK[2]]
@@ -1199,7 +1325,7 @@ def test_bad_outline_json_retried_then_corrected(monkeypatch, settings) -> None:
 def test_outline_image_coverage_repaired_deterministically(
     monkeypatch, settings, caplog
 ) -> None:
-    """The live convergence failure (task 1412: 4 images provided, 3
+    """The live convergence failure (observed live: 4 images provided, 3
     slides marked, the corrective retry ALSO returned 3): after the
     outline attempts are exhausted the shortfall is closed
     mechanically - the unmarked slide with the least planned content is
@@ -1585,7 +1711,7 @@ def test_auto_theme_never_constrains_the_pick(monkeypatch, settings) -> None:
 
 
 #: A realistic theming section as it arrives in nc.capabilities (live-shape
-#: values from the nc35 stack; hex color strings, absolute background URL,
+#:  hex color strings, absolute background URL,
 #: cache-buster string).
 NC_THEMING_CAPS = {
     "color": "#0082c9",
@@ -2022,7 +2148,7 @@ def test_final_attempt_slide_is_heurastically_repaired(monkeypatch) -> None:
     """A repairable slide on the LAST attempt (retry_llm off, so the only
     attempt has no retry left) is rescued by the wrap-repair-unwrap round
     instead of failing the whole deck - the wiring gap observed live on
-    task 522, where slide 8's '# Title' + '## Subtitle' died unrepaired."""
+    a slide's '# Title' + '## Subtitle' died unrepaired."""
     outline = json.dumps(
         {
             "title": "T",
@@ -2046,7 +2172,7 @@ def test_done_progress_precedes_reported_result(monkeypatch) -> None:
     """The 100% 'done' progress ping must be the last call BEFORE
     report_result: Nextcloud's setTaskProgress resets a finished task
     back to RUNNING, so a ping after the result resurrects it as a
-    zombie (observed live on task 544: output stored, status RUNNING)."""
+    zombie (observed live live: output stored, status RUNNING)."""
     fake, _calls = deck_scheduler()
     monkeypatch.setattr(task_worker, "schedule_and_wait", fake)
     nc, api = make_fake_nc()
@@ -2072,9 +2198,9 @@ def test_done_progress_precedes_reported_result(monkeypatch) -> None:
 
 def test_stalled_nested_round_is_rescheduled_once(monkeypatch) -> None:
     """A nested round whose inner task stalls into the round timeout (the
-    executor hiccup observed live on task 554: inner task RUNNING at
+    executor hiccup observed live live: inner task RUNNING at
     progress 0 forever) is rescheduled once on a fresh task id instead
-    of failing the deck - task 572 survived exactly this stall live."""
+    of failing the deck - a task survived exactly this stall live."""
     stream, calls = deck_scheduler()
     stalled = {"fired": False}
 
@@ -2244,23 +2370,24 @@ def test_overflowing_slide_retried_with_fit_feedback(monkeypatch, settings) -> N
 def test_overflowing_slide_failing_twice_reports_overflow(
     monkeypatch, settings
 ) -> None:
-    """Both attempts overflow AND the deterministic shrink cannot rescue
-    (every measurement, even of the cut markdown, reports the overflow):
-    the task fails with the measured overflow message surfaced,
-    renumbered to the deck position, exactly like any other per-slide
-    output-quality failure - and no third LLM round was spent."""
+    """Every attempt overflows AND the deterministic rescues cannot save
+    the slide (every measurement, even of the cut or scaled markdown,
+    reports the overflow): the task fails with the measured overflow
+    message surfaced, renumbered to the deck position, exactly like any
+    other per-slide output-quality failure. The double overflow earns
+    the third, prescription round before the deterministic tiers."""
     report = overflow_report()
 
     def fake_measure(md, wd):
         return report if "bullet" in md else None
 
     monkeypatch.setattr(task_worker, "measure_slide_overflow", fake_measure)
-    slides = [SLIDES_OK[0], OVERFLOWING_SLIDE, OVERFLOWING_SLIDE]
+    slides = [SLIDES_OK[0], OVERFLOWING_SLIDE, OVERFLOWING_SLIDE, OVERFLOWING_SLIDE]
     fake, calls = deck_scheduler(slides)
     monkeypatch.setattr(task_worker, "schedule_and_wait", fake)
     nc, api = make_fake_nc()
     task_worker.process_task(nc, TASK, settings)
-    assert len(calls) == 4  # outline + slide 1 + slide 2's two attempts
+    assert len(calls) == 5  # outline + slide 1 + slide 2's three attempts
     (result,) = api.results
     assert result["output"] is None
     assert "too much for the slide" in result["user_facing_error_message"]
@@ -2297,7 +2424,7 @@ def test_deck_overflow_backstop_fails_render_before_any_output(
 
 def test_per_slide_one_line_grace_passes(monkeypatch, settings) -> None:
     """The per-slide fit gate tolerates sub-line overflow (content within
-    one rendered line of fitting is invisible; live: task 1309 died at
+    one rendered line of fitting is invisible; observed live: a deck died at
     1.02x): a measured overflow of less than one line-height does not
     burn the retry, the slide ships verbatim."""
     graceful = replace(overflow_report(slide=1), overflow_y_px=20)  # 20 < 33px line
@@ -2317,7 +2444,7 @@ def test_per_slide_one_line_grace_passes(monkeypatch, settings) -> None:
 
 def test_deck_backstop_one_line_grace_passes(monkeypatch, settings) -> None:
     """The deck backstop applies the SAME one-line grace as the per-slide
-    gate (live: task 1394 died here at 1.04x - 25px over in a 24px-line
+    gate (observed live: a deck died here at 1.04x - 25px over in a 24px-line
     theme - on slides the per-slide gate had already passed): a batch
     report whose overflow stays within one line-height lets the render
     phase proceed to success; more than one line still fails (pinned by
@@ -2337,23 +2464,31 @@ def test_deck_backstop_one_line_grace_passes(monkeypatch, settings) -> None:
 
 
 def test_exhausted_overflow_slide_shrinks_to_fit(monkeypatch, settings, caplog) -> None:
-    """A slide that spends BOTH attempts on a measured overflow is
-    deterministically shrunk instead of failing the deck: the overflow
-    report quantifies the cut (227px over at 33px per line = 7 bullets),
-    the last 7 bullets drop, the cut slide re-passes validation and the
-    fit gate, and the log NAMES what was dropped. No third LLM round."""
+    """A slide that spends every attempt on a measured overflow (the
+    third prescription round included) is deterministically shrunk
+    instead of failing the deck: the overflow report quantifies the cut
+    (227px over at 33px per line = 7 bullets), the last 7 bullets drop,
+    the cut slide re-passes validation and the fit gate, and the log
+    NAMES what was dropped."""
 
     def fake_measure(md, wd):
         return overflow_report(slide=1) if "bullet 30" in md else None
 
     monkeypatch.setattr(task_worker, "measure_slide_overflow", fake_measure)
-    slides = [SLIDES_OK[0], OVERFLOWING_SLIDE, OVERFLOWING_SLIDE, SLIDES_OK[2]]
+    slides = [
+        SLIDES_OK[0],
+        OVERFLOWING_SLIDE,
+        OVERFLOWING_SLIDE,
+        OVERFLOWING_SLIDE,
+        SLIDES_OK[2],
+    ]
     fake, calls = deck_scheduler(slides)
     monkeypatch.setattr(task_worker, "schedule_and_wait", fake)
     nc, api = make_fake_nc()
     with caplog.at_level("INFO", logger="marp_slides.task_worker"):
         task_worker.process_task(nc, TASK, settings)
-    assert len(calls) == 5  # outline + slide 1 + slide 2 twice: no 3rd ask
+    # outline + slide 1 + slide 2's three attempts (prescription round) + slide 3
+    assert len(calls) == 6
     (result,) = api.results
     assert result["output"] == SUCCESS_OUTPUT  # the shrunk deck shipped
     deck_source = api.uploads[1][1][1].decode("utf-8")
@@ -2378,12 +2513,12 @@ def test_exhausted_overflow_slide_without_bullets_fails(monkeypatch, settings) -
         return overflow_report(slide=1) if "Paragraph 11" in md else None
 
     monkeypatch.setattr(task_worker, "measure_slide_overflow", fake_measure)
-    slides = [SLIDES_OK[0], paragraph_slide, paragraph_slide]
+    slides = [SLIDES_OK[0], paragraph_slide, paragraph_slide, paragraph_slide]
     fake, calls = deck_scheduler(slides)
     monkeypatch.setattr(task_worker, "schedule_and_wait", fake)
     nc, api = make_fake_nc()
     task_worker.process_task(nc, TASK, settings)
-    assert len(calls) == 4  # outline + slide 1 + slide 2's two attempts
+    assert len(calls) == 5  # outline + slide 1 + slide 2's three attempts
     (result,) = api.results
     assert result["output"] is None
     assert "too much for the slide" in result["user_facing_error_message"]
@@ -2422,7 +2557,8 @@ def test_fitting_deck_pipeline_output_unchanged(monkeypatch, settings) -> None:
         (5, "Quarterly-Review.md", MARKDOWN_MIME_TYPE),
     ]
     assert len(slide_measures) == 3  # every authored slide was measured
-    assert deck_measures == [ASSEMBLED]  # ONE batch measure of the deck
+    # the render-time fit pass + the render gate each batch-measure once
+    assert deck_measures == [ASSEMBLED, ASSEMBLED]
 
 
 def test_overflow_check_off_skips_both_gates(monkeypatch, settings) -> None:
@@ -2507,9 +2643,12 @@ def test_nextcloud_theme_measurement_gets_theming_values(monkeypatch, settings) 
         assert isinstance(values, ThemingValues)
         assert values.color == "#0082c9"
     assert all("theme: nextcloud" in md for md in slide_markdowns)
-    # the deck backstop measured with branded values too
-    (deck_values,) = [kwargs["theming_values"] for kwargs in deck_kwargs]
-    assert isinstance(deck_values, ThemingValues) and deck_values.color == "#0082c9"
+    # the deck measurements (render-time fit pass + backstop) with branded values
+    deck_values_list = [kwargs["theming_values"] for kwargs in deck_kwargs]
+    assert len(deck_values_list) == 2  # fit pass + render gate
+    for deck_values in deck_values_list:
+        assert isinstance(deck_values, ThemingValues)
+        assert deck_values.color == "#0082c9"
 
     # bundled theme: no theming kwarg rides either measurement
     slide_kwargs.clear()
@@ -2520,7 +2659,7 @@ def test_nextcloud_theme_measurement_gets_theming_values(monkeypatch, settings) 
     task_worker.process_task(nc, TASK, settings)
     assert api.results[0]["output"] == SUCCESS_OUTPUT
     assert slide_kwargs == [{} for _ in range(3)]
-    assert deck_kwargs == [{}]
+    assert deck_kwargs == [{}, {}]  # fit pass + render gate
 
 
 def test_overflow_check_env_round_trip() -> None:
@@ -2540,7 +2679,7 @@ def test_overflow_check_env_round_trip() -> None:
     assert Settings.from_env({"MARP_SLIDES_OVERFLOW_CHECK": ""}).overflow_check is True
 
 
-# --- draft checkpoints: cadence, resume, failure notice (wave draft-resume) ------
+# --- draft checkpoints: cadence, resume, failure notice  ------
 
 
 #: A slide that fails per-slide validation on every attempt (empty
@@ -2777,6 +2916,141 @@ def test_resume_with_invalid_or_unknown_draft_id_reports_store_message(
     assert "Re-run the task without draft_id" in missing["user_facing_error_message"]
 
 
+# --- resume by picking the delivered draft .md (draft_file) --------------------
+
+
+def draft_file_doc(draft_id: str = "abc123def456") -> bytes:
+    """A delivered draft .md: the pinned header comment (exactly the shape
+    draft_delivery's _draft_document writes) over a partial deck body."""
+    comment = (
+        f"<!-- draft id: {draft_id}; re-run generation with "
+        f"draft_id={draft_id} to continue -->"
+    )
+    body = "---\nmarp: true\ntitle: Quarterly Review\n---\n\n# Quarterly Review\n"
+    return f"{comment}\n\n{body}".encode()
+
+
+def test_generation_with_draft_file_resumes_from_header_comment(
+    monkeypatch, settings, fake_draft_store
+) -> None:
+    """The Files-side resume entry: the picked draft .md downloads, its
+    header comment names the checkpoint, and the EXISTING resume path
+    runs (checkpointed outline reused, done slide shipped verbatim, only
+    the missing slides authored)."""
+    fake_draft_store.seed(
+        checkpoint_draft(
+            slides={
+                1: SlideDraft(1, "Quarterly Review", SLIDES_OK[0], SLIDE_DONE, 1),
+            }
+        )
+    )
+    doc = draft_file_doc()
+    files = FakeFilesAPI(
+        {303: md_node(303, doc, "Quarterly-Review.draft.md")}, {303: doc}
+    )
+    # slides 2 and 3 only: the resumed outline round never happens
+    fake, calls = make_llm([SLIDES_OK[1], SLIDES_OK[2]])
+    monkeypatch.setattr(task_worker, "schedule_and_wait", fake)
+    nc, api = make_fake_nc(files=files)
+    task_worker.process_task(
+        nc, dict(TASK, input={"prompt": "x", "draft_file": 303}), settings
+    )
+    (result,) = api.results
+    assert result["output"] == SUCCESS_OUTPUT
+    assert files.downloaded == [303]
+    assert len(calls) == 2  # no outline round: the checkpoint was resumed
+    assert "Write ONLY slide 2 of 3" in calls[0]["input"]
+    assert api.uploads[1][1][1] == ASSEMBLED.encode("utf-8")
+
+
+def test_generation_draft_file_wins_over_draft_id_text(
+    monkeypatch, settings, fake_draft_store
+) -> None:
+    """Both resume inputs riding along resolves to the FILE (the same
+    deliberate-choice rule as the re-render source): the checkpoint named
+    in the header comment is resumed, not the typed draft_id."""
+    fake_draft_store.seed(
+        checkpoint_draft(
+            slides={
+                1: SlideDraft(1, "Quarterly Review", SLIDES_OK[0], SLIDE_DONE, 1),
+            }
+        )
+    )
+    # a second checkpoint with TWO done slides: resuming it would cost
+    # exactly one slide round, so the round count discriminates the paths
+    fake_draft_store.seed(
+        checkpoint_draft(
+            draft_id="999000999000",
+            slides={
+                1: SlideDraft(1, "Quarterly Review", SLIDES_OK[0], SLIDE_DONE, 1),
+                2: SlideDraft(2, "Results", SLIDES_OK[1], SLIDE_DONE, 1),
+            },
+        )
+    )
+    doc = draft_file_doc("abc123def456")  # the FILE names the 1-done draft
+    files = FakeFilesAPI(
+        {303: md_node(303, doc, "Quarterly-Review.draft.md")}, {303: doc}
+    )
+    fake, calls = make_llm([SLIDES_OK[1], SLIDES_OK[2]])
+    monkeypatch.setattr(task_worker, "schedule_and_wait", fake)
+    nc, api = make_fake_nc(files=files)
+    task_worker.process_task(
+        nc,
+        dict(
+            TASK,
+            input={"prompt": "x", "draft_id": "999000999000", "draft_file": 303},
+        ),
+        settings,
+    )
+    (result,) = api.results
+    assert result["output"] == SUCCESS_OUTPUT
+    assert len(calls) == 2  # the file's draft: slides 2 and 3, not 3 alone
+    assert "Write ONLY slide 2 of 3" in calls[0]["input"]
+
+
+def test_generation_draft_file_without_header_comment_fails_actionably(
+    monkeypatch, settings, fake_draft_store
+) -> None:
+    """A plain Markdown file (no draft-id comment) cannot name a
+    checkpoint: an actionable failure BEFORE any LLM round teaches which
+    file to pick instead."""
+    doc = VALID_DECK.encode("utf-8")  # a deck, but not a delivered draft
+    files = FakeFilesAPI({303: md_node(303, doc, "Quarterly-Review.md")}, {303: doc})
+    fake, calls = make_llm(["unused"])
+    monkeypatch.setattr(task_worker, "schedule_and_wait", fake)
+    nc, api = make_fake_nc(files=files)
+    task_worker.process_task(
+        nc, dict(TASK, input={"prompt": "x", "draft_file": 303}), settings
+    )
+    assert calls == []  # rejected before any round
+    (result,) = api.results
+    assert result["output"] is None
+    message = result["user_facing_error_message"]
+    assert "no draft id" in message
+    assert "'draft_id'" in message  # the remedy names the text input too
+
+
+def test_generation_draft_file_pruned_checkpoint_surfaces_store_remedy(
+    monkeypatch, settings, fake_draft_store
+) -> None:
+    """A well-formed id from the header comment whose checkpoint no longer
+    exists (pruned by retention) surfaces the STORE's own remedy verbatim:
+    the file path and the draft_id path share the resume logic."""
+    doc = draft_file_doc("000000000000")  # never seeded: pruned
+    files = FakeFilesAPI(
+        {303: md_node(303, doc, "Quarterly-Review.draft.md")}, {303: doc}
+    )
+    fake, calls = make_llm(["unused"])
+    monkeypatch.setattr(task_worker, "schedule_and_wait", fake)
+    nc, api = make_fake_nc(files=files)
+    task_worker.process_task(
+        nc, dict(TASK, input={"prompt": "x", "draft_file": 303}), settings
+    )
+    assert calls == []
+    (result,) = api.results
+    assert "Re-run the task without draft_id" in result["user_facing_error_message"]
+
+
 def test_failed_task_carries_draft_notice_exactly_once(
     monkeypatch, settings, fake_draft_store
 ) -> None:
@@ -2899,10 +3173,10 @@ def test_resume_task_images_win_over_checkpoint(
     assert files.downloaded == [202]  # the task's image, never the stale one
 
 
-def test_delivery_seam_fail_soft_without_sibling_module(
+def test_delivery_seam_fail_soft_without_delivery_module(
     monkeypatch, settings, fake_draft_store
 ) -> None:
-    """drafts_folder configured but the sibling draft_delivery module does
+    """drafts_folder configured but the draft_delivery module does
     not exist yet (separate branch): the ImportError path is a silent
     no-op and the failed task's report is unaffected."""
     slides = [SLIDES_OK[0], BAD_SLIDE, "# Still bad\n\n### ###"]
@@ -2918,10 +3192,10 @@ def test_delivery_seam_fail_soft_without_sibling_module(
     )
 
 
-def test_delivery_seam_calls_sibling_when_present(
+def test_delivery_seam_calls_delivery_when_present(
     monkeypatch, settings, fake_draft_store
 ) -> None:
-    """With the sibling module merged (simulated via sys.modules), the
+    """With a delivery module injected via sys.modules, the
     seam calls deliver_draft(nc, user_id, draft, deck_stem) exactly once,
     with the deck stem derived from the checkpointed outline title; a
     raising delivery never fails the task report."""
@@ -2965,7 +3239,7 @@ def test_resume_end_to_end_with_real_store(
     monkeypatch.setattr(task_worker, "prune_drafts", store_prune_drafts)
     monkeypatch.setattr(task_worker, "_drafts_base_dir", lambda: tmp_path)
 
-    # task 1: slide 2 fails both attempts; slide 1 is checkpointed done
+    # slide 2 fails both attempts; slide 1 is checkpointed done
     failing, _c1 = deck_scheduler([SLIDES_OK[0], BAD_SLIDE, "# Still bad\n\n### ###"])
     monkeypatch.setattr(task_worker, "schedule_and_wait", failing)
     nc, api = make_fake_nc()
@@ -2985,7 +3259,7 @@ def test_resume_end_to_end_with_real_store(
     assert on_disk.slides[2].status == SLIDE_FAILED
     assert on_disk.outline["title"] == "Quarterly Review"
 
-    # task 2: resume with a REPHRASED prompt; distinct markdown for the
+    # resume with a REPHRASED prompt; distinct markdown for the
     # regenerated slides proves the reused slide 1 came from the checkpoint
     variant2 = "## Results\n\n- Revenue up 99%\n- Churn down 9 points"
     variant3 = "## Next steps\n\n1. Rewrite the onboarding\n2. Hire three"
