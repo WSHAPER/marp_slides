@@ -453,9 +453,22 @@ def _reject_slide_overflow(
         )
         return
     if report is not None:
-        # renumber the measured section to its deck position so the
-        # message names the slide the retry is actually for
-        raise DeckError(overflow_message(replace(report, slide=number)))
+        # One line-height grace: sub-line overflow (content within one
+        # rendered line of fitting) is invisible and rejecting it burns
+        # the retry budget on marginal noise (live: task 1309 died at
+        # 1.02x, 25px over, less than one line). Real clipping (>1 line
+        # over) still rejects.
+        if report.overflow_y_px > report.line_px:
+            # renumber the measured section to its deck position so the
+            # message names the slide the retry is actually for
+            raise DeckError(overflow_message(replace(report, slide=number)))
+        LOGGER.debug(
+            "Task %s: slide %d within one-line grace (%dpx over, line=%dpx)",
+            task_id,
+            number,
+            report.overflow_y_px,
+            report.line_px,
+        )
 
 
 def _reject_deck_overflow(

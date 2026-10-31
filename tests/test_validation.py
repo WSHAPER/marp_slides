@@ -544,3 +544,13 @@ def test_prompt_skeleton_passes_validation() -> None:
     ]
     assert [r.text for r in validated.deck.footer] == ["Optional deck footer"]
     assert [r.text for r in validated.deck.header] == ["Optional deck header"]
+
+
+def test_compact_nonbreaking_hyphen_currency_range_not_math() -> None:
+    """The compact price-range form with U+2011 between the amounts
+    (no spaces, non-breaking hyphen) is prose, not math (live: task 1315)."""
+    deck = (
+        "---\nmarp: true\n---\n\n# Costs\n\n"
+        "- Entry frames: $300\u2011$800 depending on groupset\n"
+    )
+    validate_deck(deck)  # must not raise

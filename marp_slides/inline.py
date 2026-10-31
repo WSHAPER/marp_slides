@@ -82,12 +82,12 @@ _REJECT_SCAN_RE = re.compile(
 #: The interior of a dashed currency range: what the flat scan captures
 #: between the two '$' of '$1,200 – $2,200' — a bare amount (digits,
 #: thousands commas, one optional decimal part) followed by a range dash
-#: (hyphen, en dash or em dash) and optional spaces. That pairing is a
-#: price range, not an equation. Deliberately conservative: the amount
-#: must start right after the opening '$' with no currency code or words,
-#: and anything else between two '$' — '$x – $y', '$5 and $10', '$1-2$' —
-#: still reads as math.
-_CURRENCY_RANGE_RE = re.compile(r"\d[\d,]*(?:\.\d+)?\s*[-–—]\s*")
+#: (hyphen, en dash, em dash or non-breaking hyphen U+2011) and optional
+#: spaces. That pairing is a price range, not an equation. Deliberately
+#: conservative: the amount must start right after the opening '$' with no
+#: currency code or words, and anything else between two '$' — '$x – $y',
+#: '$5 and $10', '$1-2$' — still reads as math.
+_CURRENCY_RANGE_RE = re.compile(r"\d[\d,]*(?:\.\d+)?\s*[-\u2013\u2014\u2011]\s*")
 
 #: Reference-style links inside literal text tokens (markdown-it never sees
 #: a reference without ``env.references``, which we deliberately do not pass:
