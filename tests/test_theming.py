@@ -500,3 +500,138 @@ def test_fetch_background_uri_is_bounded_and_fail_soft(monkeypatch) -> None:
 
     monkeypatch.setattr(urllib.request, "urlopen", big_urlopen)
     assert _fetch_background_uri("https://cloud.example/instance-bg") is None
+
+
+# --- fetch failure observability: retried once, warned once ----------------------
+
+
+class _FakeHTTPResponse:
+    """The response surface _fetch_background_uri consumes: a capped read
+    and Content-Type-carrying headers (email.message, the type urllib's
+    real responses carry)."""
+
+    def __init__(self, data: bytes, content_type: str) -> None:
+        self._data = data
+        self.headers = email.message.Message()
+        self.headers["Content-Type"] = content_type
+
+    def read(self, size: int = -1) -> bytes:
+        return self._data if size < 0 else self._data[:size]
+
+    def __enter__(self) -> _FakeHTTPResponse:
+        return self
+
+    def __exit__(self, *_args: object) -> None:
+        return None
+
+
+def test_write_theme_css_fetch_failure_warns_of_the_flat_fallback(
+    tmp_path, caplog
+) -> None:
+    """The fail-soft seam must be observable: a URL background whose
+    fetch returns None logs exactly one WARNING naming the degradation
+    (``fell back to the flat admin color``, the grep target) and the
+    background's host+path, never the cache-buster query string. A
+    flipped deck leaves a forensic trace instead of rendering silently
+    flat."""
+    caplog.set_level("WARNING", logger="marp_slides.theming")
+    css = write_theme_css(
+        caps(), tmp_path, background_fetch=lambda _url: None
+    ).read_text()
+    assert "background-image" not in css  # the degradation the warning names
+    warnings = [r for r in caplog.records if r.levelname == "WARNING"]
+    assert len(warnings) == 1
+    message = warnings[0].getMessage()
+    assert "fell back to the flat admin color" in message
+    assert (
+        "nextcloud.local:8350/apps/theming/img/background/"
+        "jo-myoung-hee-fluid.webp" in message
+    )
+    assert "1d9e0e2e" not in message  # the cache-buster never rides the log
+
+
+def test_write_theme_css_fetch_success_logs_nothing(tmp_path, caplog) -> None:
+    """The happy path stays silent (not even DEBUG): a task renders 6-20
+    backgrounds, so per-fetch success lines would be pure noise."""
+    caplog.set_level("DEBUG", logger="marp_slides.theming")
+    write_theme_css(caps(), tmp_path, background_fetch=lambda _url: _PNG_DATA_URI)
+    assert caplog.records == []
+
+
+def test_fetch_persistent_failure_retries_once_and_warns_once(
+    monkeypatch, caplog
+) -> None:
+    """A persistently failing fetch tries exactly twice (the attempt plus
+    ONE retry, same URL) and then logs exactly one WARNING carrying the
+    reason and the URL's host+path without the query string."""
+    caplog.set_level("WARNING", logger="marp_slides.theming")
+    attempts: list[str] = []
+
+    def dead_urlopen(url: str, timeout: float = -1) -> object:
+        attempts.append(url)
+        raise OSError("unreachable")
+
+    monkeypatch.setattr(urllib.request, "urlopen", dead_urlopen)
+    result = _fetch_background_uri("https://cloud.example:8443/bg/stock.webp?v=1d9e")
+    assert result is None
+    assert len(attempts) == 2  # the initial attempt plus exactly one retry
+    assert attempts[0] == attempts[1]  # the retry asks for the same URL
+    warnings = [r for r in caplog.records if r.levelname == "WARNING"]
+    assert len(warnings) == 1
+    message = warnings[0].getMessage()
+    assert "cloud.example:8443/bg/stock.webp" in message
+    assert "1d9e" not in message  # the cache-buster query never rides the log
+    assert "OSError" in message and "unreachable" in message  # the reason
+
+
+def test_fetch_first_failure_then_success_recovers_silently(
+    monkeypatch, caplog
+) -> None:
+    """A transient blip on the first attempt recovers through the single
+    retry: the data URI is returned and NOTHING is logged. The retry's
+    success is enough; no warning for a blip that healed."""
+    caplog.set_level("DEBUG", logger="marp_slides.theming")
+    attempts: list[str] = []
+    png = b"\x89PNG\r\n\x1a\npayload"
+
+    def flaky_urlopen(url: str, timeout: float = -1) -> _FakeHTTPResponse:
+        attempts.append(url)
+        if len(attempts) == 1:
+            raise OSError("transient blip")
+        return _FakeHTTPResponse(png, "image/png")
+
+    monkeypatch.setattr(urllib.request, "urlopen", flaky_urlopen)
+    uri = _fetch_background_uri("https://cloud.example/bg/stock.webp?v=9f")
+    assert uri == _background_data_uri(png, "image/png")
+    assert len(attempts) == 2
+    assert caplog.records == []
+
+
+def test_fetch_failure_reason_names_body_defects(monkeypatch, caplog) -> None:
+    """The WARNING carries WHICH bound rejected the body: the raw-byte
+    cap for an oversize image, and the sniffed content type for bytes
+    that are not an image at all (the flipped-deck shapes an admin can
+    actually cause)."""
+    caplog.set_level("WARNING", logger="marp_slides.theming")
+    big = _FakeHTTPResponse(
+        b"\x89PNG\r\n\x1a\n" + b"0" * (BACKGROUND_MAX_BYTES + 5), "image/png"
+    )
+
+    def big_urlopen(url: str, timeout: float = -1) -> _FakeHTTPResponse:
+        return big
+
+    monkeypatch.setattr(urllib.request, "urlopen", big_urlopen)
+    assert _fetch_background_uri("https://cloud.example/bg/stock.webp") is None
+    assert "cap" in caplog.records[-1].getMessage()
+
+    caplog.clear()
+    html = _FakeHTTPResponse(b"<html>sign-in page</html>", "text/html")
+
+    def html_urlopen(url: str, timeout: float = -1) -> _FakeHTTPResponse:
+        return html
+
+    monkeypatch.setattr(urllib.request, "urlopen", html_urlopen)
+    assert _fetch_background_uri("https://cloud.example/bg/stock.webp") is None
+    message = caplog.records[-1].getMessage()
+    assert "not an image" in message
+    assert "text/html" in message

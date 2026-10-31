@@ -35,7 +35,15 @@ CSS-generation time (bounded: raw bytes capped, socket timeout,
 fail-soft) and embeds it under a semi-opaque scrim of the instance
 color on EVERY slide. A failed, oversize or non-image fetch drops the
 background rule entirely: the flat instance color covers every slide
-(a branding image can never fail a render). The scrim alpha is solved
+(a branding image can never fail a render). The degradation is never
+silent either: a first fetch failure is retried exactly once (same
+URL, same socket budget), a retry that also fails logs one WARNING
+with the reason and the URL's host+path (the cache-buster query
+string never rides a log line), and the fallback render itself logs a
+WARNING naming the degradation, so a grep for ``fell back`` finds
+every deck that rendered flat. The success path logs nothing: a task
+renders 6-20 backgrounds and per-fetch happy-path lines would be pure
+noise. The scrim alpha is solved
 from the WCAG contrast between ``background_text`` and the scrim
 blended over both a white and a black image, inside the 0.55-0.75
 design window (see :func:`_scrim_alpha`). A brand color that cannot
@@ -50,12 +58,16 @@ background-image behavior.
 from __future__ import annotations
 
 import base64
+import logging
+import urllib.parse
 import urllib.request
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from functools import lru_cache
 from pathlib import Path
 from typing import Any
+
+LOGGER = logging.getLogger("marp_slides.theming")
 
 #: The Marp theme name this module generates (must match ALLOWED_THEMES).
 THEME_NAME = "nextcloud"
@@ -147,6 +159,13 @@ BACKGROUND_MAX_BYTES = 8 * 1024 * 1024
 #: fetch per render sits on the render's critical path, so it must give
 #: up quickly, not stall the task on a slow or dangling connection.
 _BACKGROUND_FETCH_TIMEOUT_S = 10.0
+
+#: Attempts per background fetch: the initial request plus exactly ONE
+#: retry at the same URL under the same socket budget. The fetch
+#: measures milliseconds against that budget, so the retry is near-free
+#: insurance against a transient blip, while a persistent failure stays
+#: bounded at two attempts before the fail-soft WARNING fires.
+_BACKGROUND_FETCH_ATTEMPTS = 2
 
 #: Magic-byte signatures of the image types an admin background can be
 #: (the NC35 stock background is a webp) and that every render consumer
@@ -327,12 +346,21 @@ def write_theme_css(
     defaults to the bounded, fail-soft :func:`_fetch_background_uri`;
     tests inject fakes so nothing in the unit suite touches the network.
     A failed fetch means no background rule in the CSS: the flat
-    instance color covers every slide, and the render proceeds.
+    instance color covers every slide, and the render proceeds. That
+    degradation is logged, not silent: one WARNING names the fallback
+    (``fell back to the flat admin color``) and the background's
+    host+path, so a grep for ``fell back`` finds every degraded render.
     """
     fetch = _fetch_background_uri if background_fetch is None else background_fetch
     data_uri: str | None = None
     if values.background.startswith(("http://", "https://")):
         data_uri = fetch(_cache_busted_background_url(values))
+        if data_uri is None:
+            LOGGER.warning(
+                "background fell back to the flat admin color; the image "
+                "could not be fetched (%s)",
+                _url_host_path(values.background),
+            )
     css_path = Path(workdir) / f"{THEME_NAME}-theme.css"
     css_path.write_text(
         generate_theme_css(values, background_data_uri=data_uri), encoding="utf-8"
@@ -437,6 +465,15 @@ def _cache_busted_background_url(values: ThemingValues) -> str:
     return f"{values.background}{separator}v={values.cache_buster}"
 
 
+def _url_host_path(url: str) -> str:
+    """The URL reduced to host+path, the form log lines carry: the query
+    string is dropped (it holds the theming cache-buster, pure noise in
+    a forensic grep) and so is the scheme (the fetch seam only ever
+    issues http(s); the host+path identifies the branding asset)."""
+    parts = urllib.parse.urlsplit(url)
+    return f"{parts.netloc}{parts.path}"
+
+
 def _sniff_image_mime(data: bytes) -> str | None:
     """The image MIME type read from the bytes' magic signatures (PNG,
     JPEG, GIF, WebP), or None when the bytes are none of those. Bytes
@@ -466,24 +503,52 @@ def _background_data_uri(data: bytes, content_type: str) -> str | None:
 
 
 def _fetch_background_uri(url: str) -> str | None:
-    """Fetch the admin background image once and return it as a base64
-    data URI, or None on any failure (fail-soft: no background rule, the
+    """Fetch the admin background image and return it as a base64 data
+    URI, or None on any failure (fail-soft: no background rule, the
     flat instance color). The fetch is bounded on every axis: http(s)
-    URLs only, one socket timeout for connect and reads, and a read of
-    at most one byte past the raw-byte cap (a larger body is abandoned
-    mid-stream, never buffered). The scheme gate and the exception net
-    (network errors, HTTP error statuses, bad URLs) both fail soft."""
+    URLs only, one socket timeout for connect and reads per attempt,
+    and a read of at most one byte past the raw-byte cap (a larger body
+    is abandoned mid-stream, never buffered). The scheme gate and the
+    exception net (network errors, HTTP error statuses, bad URLs) both
+    fail soft.
+
+    A first failure is retried exactly ONCE (same URL, same socket
+    budget; the fetch measures milliseconds against it, so the retry is
+    near-free insurance for a transient blip). When the retry fails
+    too, exactly one WARNING is logged with the failure's reason
+    (transport error, oversize body, or bytes that are not an image)
+    and the URL's host+path, never the query string (it carries the
+    cache-buster): a flipped deck must leave a forensic trace. Success
+    is silent; a task renders 6-20 backgrounds and happy-path lines
+    would be noise."""
     if not url.startswith(("http://", "https://")):
         return None
-    try:
-        with urllib.request.urlopen(  # noqa: S310 - scheme-gated http(s), the instance's own theming URL
-            url, timeout=_BACKGROUND_FETCH_TIMEOUT_S
-        ) as response:
-            data = response.read(BACKGROUND_MAX_BYTES + 1)
-            content_type = str(response.headers.get_content_type())
-    except (OSError, ValueError):
-        return None
-    return _background_data_uri(data, content_type)
+    reason = ""
+    for _attempt in range(_BACKGROUND_FETCH_ATTEMPTS):
+        try:
+            with urllib.request.urlopen(  # noqa: S310 - scheme-gated http(s), the instance's own theming URL
+                url, timeout=_BACKGROUND_FETCH_TIMEOUT_S
+            ) as response:
+                data = response.read(BACKGROUND_MAX_BYTES + 1)
+                content_type = str(response.headers.get_content_type())
+        except (OSError, ValueError) as exc:
+            reason = f"{type(exc).__name__}: {exc}"
+            continue
+        data_uri = _background_data_uri(data, content_type)
+        if data_uri is not None:
+            return data_uri
+        reason = (
+            f"body exceeds the {BACKGROUND_MAX_BYTES}-byte cap"
+            if len(data) > BACKGROUND_MAX_BYTES
+            else f"bytes are not an image (content-type {content_type})"
+        )
+    LOGGER.warning(
+        "background image fetch failed after %d attempts: %s (%s)",
+        _BACKGROUND_FETCH_ATTEMPTS,
+        _url_host_path(url),
+        reason,
+    )
+    return None
 
 
 def _rgb(color: str) -> tuple[int, int, int]:
