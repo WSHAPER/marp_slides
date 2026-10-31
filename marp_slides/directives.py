@@ -24,6 +24,17 @@ MARP_DIRECTIVE_COMMENT_RE = re.compile(
     re.IGNORECASE,
 )
 
+#: The machine-managed per-slide fit-scaling block, canonical whole-block
+#: shape. The slide parser consumes exactly this three-line element onto
+#: ``ParsedSlide.fit_font_px`` (slides.py holds the line-level constants),
+#: and the validator's raw-HTML pre-scan exempts exactly this shape (a
+#: near-miss — missing 'scoped', extra properties, another selector —
+#: stays rejected as raw HTML). Keep the px pattern identical here and in
+#: slides._FIT_STYLE_RULE_RE.
+FIT_STYLE_BLOCK_RE = re.compile(
+    r"<style scoped>\nsection \{ font-size: \d{1,3}(?:\.\d+)?px;? \}\n</style>\n?"
+)
+
 #: A footer/header directive comment, e.g. 'footer: Some text'. The optional
 #: leading underscore is Marp's per-slide variant: inside a slide it becomes
 #: that slide's footer/header override (deck-level value otherwise applies).

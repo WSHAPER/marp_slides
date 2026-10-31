@@ -1196,6 +1196,66 @@ def test_bad_outline_json_retried_then_corrected(monkeypatch, settings) -> None:
         assert result["output"] == SUCCESS_OUTPUT
 
 
+def test_outline_image_coverage_repaired_deterministically(
+    monkeypatch, settings, caplog
+) -> None:
+    """The live convergence failure (task 1412: 4 images provided, 3
+    slides marked, the corrective retry ALSO returned 3): after the
+    outline attempts are exhausted the shortfall is closed
+    mechanically - the unmarked slide with the least planned content is
+    marked has_image, its slide prompt forces the missing #file:4, the
+    deck ships complete, and NO third outline round is spent."""
+    under_marked = json.dumps(
+        {
+            "title": "Quarterly Review",
+            "theme": "default",
+            "slides": [
+                {"title": "Quarterly Review", "summary": "Open.", "has_image": True},
+                {"title": "Results", "summary": "Revenue.", "has_image": True},
+                {"title": "Next steps", "summary": "Two actions.", "has_image": True},
+                {
+                    "title": "Outlook",
+                    "summary": "one point",
+                    "has_image": False,
+                },
+            ],
+        },
+        indent=2,
+    )
+    slides = [
+        "# Quarterly Review\n\n![bg right:33%](#file:1)",
+        "## Results\n\n- Revenue up\n\n![bg right:33%](#file:2)",
+        "## Next steps\n\n1. Ship it\n\n![bg right:33%](#file:3)",
+        "## Outlook\n\n- The road ahead\n\n![bg right:33%](#file:4)",
+    ]
+    fake, calls = make_llm([under_marked, under_marked, *slides])
+    monkeypatch.setattr(task_worker, "schedule_and_wait", fake)
+    files = FakeFilesAPI(
+        {fid: fake_node(fid) for fid in (101, 102, 103, 104)},
+        {fid: png_bytes() for fid in (101, 102, 103, 104)},
+    )
+    nc, api = make_fake_nc(files=files)
+    with caplog.at_level("INFO", logger="marp_slides.task_worker"):
+        task_worker.process_task(
+            nc,
+            dict(TASK, input={"prompt": "x", "images": [101, 102, 103, 104]}),
+            settings,
+        )
+    # exactly TWO outline rounds (both under-marked), then 4 slides
+    assert len(calls) == 6
+    assert "failed validation" in calls[1]["input"]  # the corrective retry ran
+    slide4_prompt = calls[5]["input"]
+    assert "MUST show provided image #file:4" in slide4_prompt  # repair marked it
+    (result,) = api.results
+    assert result["output"] == SUCCESS_OUTPUT
+    deck_source = api.uploads[-1][1][1].decode("utf-8")
+    assert "#file:4" in deck_source  # every provided image landed
+    assert any(
+        "outline image coverage repaired deterministically" in r.getMessage()
+        for r in caplog.records
+    )
+
+
 def test_outline_failing_twice_fails_task(monkeypatch, settings, caplog) -> None:
     fake, _c = make_llm(["no json here", "still no json"])
     monkeypatch.setattr(task_worker, "schedule_and_wait", fake)
@@ -1271,26 +1331,41 @@ def test_success_with_images_downloads_and_builds_with_blobs(
     assert api.uploads[0][1][1] == b"PK-with-picture"
 
 
-def test_outline_without_image_marks_fails_before_slides(monkeypatch, settings) -> None:
-    """The plan-level image gate: with an image provided, an outline that
-    marks no slide has_image fails validation on both outline attempts
-    (the fake stream never corrects it), NO slide rounds are wasted, and
-    the user sees the plan-level completeness error."""
-    stream = [OUTLINE_JSON, OUTLINE_JSON]
+def test_outline_without_image_marks_repaired_before_slides(
+    monkeypatch, settings, caplog
+) -> None:
+    """The plan-level image gate, with the deterministic repair: with an
+    image provided, an outline that marks no slide has_image fails both
+    outline attempts (the fake stream never corrects it), the repair
+    then marks the least-content slide mechanically (no third outline
+    round), the marked slide's prompt forces the #file reference, and
+    the deck ships complete. The outline-stage hard failure is gone:
+    counting is exactly what the corrective retry did not converge on
+    live."""
+    with_image = "## Next steps\n\n1. Ship it\n\n![bg right:33%](#file:1)"
+    stream = [OUTLINE_JSON, OUTLINE_JSON, SLIDES_OK[0], SLIDES_OK[1], with_image]
     fake, calls = make_llm(stream)
     monkeypatch.setattr(task_worker, "schedule_and_wait", fake)
     files = FakeFilesAPI({101: fake_node(101)}, {101: png_bytes()})
     nc, api = make_fake_nc(files=files)
-    task_worker.process_task(
-        nc, dict(TASK, input={"prompt": "x", "images": [101]}), settings
+    with caplog.at_level("INFO", logger="marp_slides.task_worker"):
+        task_worker.process_task(
+            nc, dict(TASK, input={"prompt": "x", "images": [101]}), settings
+        )
+    assert len(calls) == 5  # two outline attempts + three slides, no third ask
+    # the retry outline round carried the validation error as feedback
+    assert "Your previous outline failed validation" in calls[1]["input"]
+    # the repair marked the shortest-summary slide (slide 3) and its
+    # prompt forced the image the deck must reference
+    assert "MUST show provided image #file:1" in calls[4]["input"]
+    assert any(
+        "outline image coverage repaired deterministically" in r.getMessage()
+        for r in caplog.records
     )
     (result,) = api.results
-    assert result["output"] is None
-    assert 'marked "has_image": true' in result["user_facing_error_message"]
-    assert len(calls) == 2  # outline attempts only, no slide rounds
-    # the retry outline round carries the validation error as feedback
-    assert "Your previous outline failed validation" in calls[1]["input"]
-    assert files.downloaded == []
+    assert result["output"] == SUCCESS_OUTPUT
+    assert "#file:1" in api.uploads[-1][1][1].decode("utf-8")
+    assert files.downloaded == [101]
 
 
 def test_deck_ignoring_planned_image_fails_after_re_authoring(
@@ -2169,13 +2244,15 @@ def test_overflowing_slide_retried_with_fit_feedback(monkeypatch, settings) -> N
 def test_overflowing_slide_failing_twice_reports_overflow(
     monkeypatch, settings
 ) -> None:
-    """Both attempts overflow: the task fails with the measured overflow
-    message surfaced, renumbered to the deck position, exactly like any
-    other per-slide output-quality failure."""
+    """Both attempts overflow AND the deterministic shrink cannot rescue
+    (every measurement, even of the cut markdown, reports the overflow):
+    the task fails with the measured overflow message surfaced,
+    renumbered to the deck position, exactly like any other per-slide
+    output-quality failure - and no third LLM round was spent."""
     report = overflow_report()
 
     def fake_measure(md, wd):
-        return report if "bullet 30" in md else None
+        return report if "bullet" in md else None
 
     monkeypatch.setattr(task_worker, "measure_slide_overflow", fake_measure)
     slides = [SLIDES_OK[0], OVERFLOWING_SLIDE, OVERFLOWING_SLIDE]
@@ -2216,6 +2293,100 @@ def test_deck_overflow_backstop_fails_render_before_any_output(
     assert "does not fit its slide boxes" in result["user_facing_error_message"]
     assert "slide 2" in result["user_facing_error_message"]
     assert api.uploads == []  # no deliverable and no source upload
+
+
+def test_per_slide_one_line_grace_passes(monkeypatch, settings) -> None:
+    """The per-slide fit gate tolerates sub-line overflow (content within
+    one rendered line of fitting is invisible; live: task 1309 died at
+    1.02x): a measured overflow of less than one line-height does not
+    burn the retry, the slide ships verbatim."""
+    graceful = replace(overflow_report(slide=1), overflow_y_px=20)  # 20 < 33px line
+
+    def fake_measure(md, wd):
+        return graceful
+
+    monkeypatch.setattr(task_worker, "measure_slide_overflow", fake_measure)
+    fake, calls = deck_scheduler()
+    monkeypatch.setattr(task_worker, "schedule_and_wait", fake)
+    nc, api = make_fake_nc()
+    task_worker.process_task(nc, TASK, settings)
+    assert len(calls) == 4  # outline + 3 slides: no retry was spent
+    assert api.results[0]["output"] == SUCCESS_OUTPUT
+    assert api.uploads[1][1][1] == ASSEMBLED.encode("utf-8")  # verbatim slides
+
+
+def test_deck_backstop_one_line_grace_passes(monkeypatch, settings) -> None:
+    """The deck backstop applies the SAME one-line grace as the per-slide
+    gate (live: task 1394 died here at 1.04x - 25px over in a 24px-line
+    theme - on slides the per-slide gate had already passed): a batch
+    report whose overflow stays within one line-height lets the render
+    phase proceed to success; more than one line still fails (pinned by
+    the test above)."""
+    graceful = (replace(overflow_report(), overflow_y_px=25),)  # 25 < 33px line
+
+    def graceful_deck(md, wd):
+        return graceful
+
+    monkeypatch.setattr(task_worker, "measure_deck_overflow", graceful_deck)
+    fake, _calls = deck_scheduler()
+    monkeypatch.setattr(task_worker, "schedule_and_wait", fake)
+    nc, api = make_fake_nc()
+    task_worker.process_task(nc, TASK, settings)
+    assert api.results[0]["output"] == SUCCESS_OUTPUT
+    assert api.uploads  # the deliverable and source both shipped
+
+
+def test_exhausted_overflow_slide_shrinks_to_fit(monkeypatch, settings, caplog) -> None:
+    """A slide that spends BOTH attempts on a measured overflow is
+    deterministically shrunk instead of failing the deck: the overflow
+    report quantifies the cut (227px over at 33px per line = 7 bullets),
+    the last 7 bullets drop, the cut slide re-passes validation and the
+    fit gate, and the log NAMES what was dropped. No third LLM round."""
+
+    def fake_measure(md, wd):
+        return overflow_report(slide=1) if "bullet 30" in md else None
+
+    monkeypatch.setattr(task_worker, "measure_slide_overflow", fake_measure)
+    slides = [SLIDES_OK[0], OVERFLOWING_SLIDE, OVERFLOWING_SLIDE, SLIDES_OK[2]]
+    fake, calls = deck_scheduler(slides)
+    monkeypatch.setattr(task_worker, "schedule_and_wait", fake)
+    nc, api = make_fake_nc()
+    with caplog.at_level("INFO", logger="marp_slides.task_worker"):
+        task_worker.process_task(nc, TASK, settings)
+    assert len(calls) == 5  # outline + slide 1 + slide 2 twice: no 3rd ask
+    (result,) = api.results
+    assert result["output"] == SUCCESS_OUTPUT  # the shrunk deck shipped
+    deck_source = api.uploads[1][1][1].decode("utf-8")
+    assert "bullet 23" in deck_source  # the kept prefix survives...
+    assert "bullet 24" not in deck_source  # ...the last 7 bullets dropped
+    infos = [r.getMessage() for r in caplog.records]
+    shrink_line = next(m for m in infos if "shrinking to fit" in m)
+    assert "dropping 7 bullet" in shrink_line
+    assert "bullet 30 with plenty of words" in shrink_line  # names the drops
+    assert any("fits after the deterministic shrink" in m for m in infos)
+
+
+def test_exhausted_overflow_slide_without_bullets_fails(monkeypatch, settings) -> None:
+    """The shrink only ever cuts trailing BULLETS: a slide whose tail is
+    paragraphs has nothing to cut, so the exhaustion path surfaces the
+    measured overflow failure exactly as before (no extra LLM round)."""
+    paragraph_slide = "## Dense\n\n" + "\n\n".join(
+        f"Paragraph {i} with a lot of words that wrap." for i in range(1, 12)
+    )
+
+    def fake_measure(md, wd):
+        return overflow_report(slide=1) if "Paragraph 11" in md else None
+
+    monkeypatch.setattr(task_worker, "measure_slide_overflow", fake_measure)
+    slides = [SLIDES_OK[0], paragraph_slide, paragraph_slide]
+    fake, calls = deck_scheduler(slides)
+    monkeypatch.setattr(task_worker, "schedule_and_wait", fake)
+    nc, api = make_fake_nc()
+    task_worker.process_task(nc, TASK, settings)
+    assert len(calls) == 4  # outline + slide 1 + slide 2's two attempts
+    (result,) = api.results
+    assert result["output"] is None
+    assert "too much for the slide" in result["user_facing_error_message"]
 
 
 def test_fitting_deck_pipeline_output_unchanged(monkeypatch, settings) -> None:

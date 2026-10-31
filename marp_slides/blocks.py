@@ -154,6 +154,16 @@ class ParsedSlide:
     #: '<!-- _header: ... -->' inside the slide); None = use the deck value.
     footer_override: tuple[Run, ...] | None = None
     header_override: tuple[Run, ...] | None = None
+    #: Per-slide fit scaling from a machine-managed scoped style block
+    #: ('<style scoped>section { font-size: 26px; }</style>' on its own
+    #: three lines inside the slide): the section font-size in px. None =
+    #: no scaling. Marp honors the block natively, so the HTML/PDF
+    #: deliverables, the overflow measurement and every re-render derive
+    #: the scale from the deck source itself; the native PPTX build
+    #: mirrors it as an explicit per-run size factor (px divided by the
+    #: theme's base section font) — the marp-side scale and the PPTX-side
+    #: scale share this one source of truth.
+    fit_font_px: float | None = None
 
     @property
     def needs_flow_layout(self) -> bool:

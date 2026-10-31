@@ -26,7 +26,8 @@ from .constructs import (
     validate_background_image_reference,
     validate_hex_color,
 )
-from .directives import normalize_preamble_separators
+from .directives import FIT_STYLE_BLOCK_RE, normalize_preamble_separators
+from .layout import SlideOverflow
 from .parser import parse_deck, split_slides
 from .slide_blocks import FENCE_OPEN_RE
 
@@ -36,6 +37,20 @@ _FRONTMATTER_DELIM = "---"
 class DeckError(ValueError):
     """User-actionable pipeline error; the message is safe to surface to the
     end user (and to an upstream agent so it can self-correct)."""
+
+
+class SlideOverflowError(DeckError):
+    """A MEASURED slide-fit failure (the slide's rendered content exceeds
+    its theme box). The message is the shared
+    :func:`marp_slides.layout.overflow_message` text, safe to surface
+    unchanged; the type itself is the signal that the slide authoring
+    loop keys its corrective feedback off (overflow retries need
+    structural prescription, not the generic nudge). ``report`` carries
+    the measured :class:`marp_slides.layout.SlideOverflow` (renumbered
+    to the deck position) so the no-LLM scaling tier can size its
+    candidates from real metrics; None when constructed without one."""
+
+    report: SlideOverflow | None = None
 
 
 @dataclass(frozen=True)
@@ -151,6 +166,10 @@ def _reject_html(markdown: str) -> None:
     code fences and code spans are literal text and exempt via _scan_text).
     The on*/javascript: checks only pick more specific messages."""
     text = _scan_text(markdown)
+    # the machine-managed fit-scaling block is parsed onto
+    # ParsedSlide.fit_font_px, not raw HTML; exactly this shape is exempt
+    # (near-misses keep the raw-HTML rejection below)
+    text = FIT_STYLE_BLOCK_RE.sub(" ", text)
     if _SCRIPT_TAG_RE.search(text):
         raise DeckError(
             "Invalid deck: <script> tags are not allowed. Remove all script tags; "

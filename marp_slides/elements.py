@@ -62,18 +62,24 @@ def append_runs(
             r.hyperlink.address = run.link  # native text-run hyperlink
 
 
-def write_runs(para: _Paragraph, runs: Iterable[Run]) -> None:
+def write_runs(
+    para: _Paragraph, runs: Iterable[Run], base_pt: float | None = None
+) -> None:
+    """Write rich runs into a paragraph. ``base_pt`` (the per-slide fit
+    mirror) writes an explicit font size on every run; None keeps the
+    inherited master size (today's behavior)."""
     para.clear()  # type: ignore[no-untyped-call]
-    append_runs(para, runs)
+    append_runs(para, runs, font_pt=base_pt)
 
 
-def style_subheading(para: _Paragraph, level: int) -> None:
+def style_subheading(para: _Paragraph, level: int, scale: float = 1.0) -> None:
     """Subheadings render as bold text larger than body, smaller than the
-    slide title (stepped by heading level, clamped at the body size)."""
+    slide title (stepped by heading level, clamped at the body size).
+    ``scale`` is the slide's fit-mirror factor (1.0 = today's sizes)."""
     para.space_before = Pt(8)
     for r in para.runs:
         r.font.bold = True
-        r.font.size = SUBHEAD_SIZES[min(max(level, 3), 6) - 3]
+        r.font.size = Pt(round(SUBHEAD_SIZES[min(max(level, 3), 6) - 3].pt * scale))
 
 
 def apply_list_para(
@@ -157,7 +163,13 @@ def add_code_box(
     box.line.width = Pt(0.75)
 
 
-def add_table(slide: Slide, y: int, height: int, block: TableBlock) -> None:
+def add_table(
+    slide: Slide,
+    y: int,
+    height: int,
+    block: TableBlock,
+    base_pt: float | None = None,
+) -> None:
     rows = len(block.rows)
     cols = len(block.rows[0]) if block.rows else 1
     graphic = slide.shapes.add_table(
@@ -170,17 +182,22 @@ def add_table(slide: Slide, y: int, height: int, block: TableBlock) -> None:
         for col_idx, cell_runs in enumerate(row):
             cell = table.cell(row_idx, col_idx)
             para = cell.text_frame.paragraphs[0]
-            append_runs(para, cell_runs)  # rich inline runs, not flattened
+            append_runs(para, cell_runs, font_pt=base_pt)  # rich inline runs
             if row_idx == 0:  # header row stays bold
                 for run in para.runs:
                     run.font.bold = True
 
 
 def add_text_block(
-    slide: Slide, y: int, height: int, paragraphs: Iterable[Iterable[Run]]
+    slide: Slide,
+    y: int,
+    height: int,
+    paragraphs: Iterable[Iterable[Run]],
+    base_pt: float | None = None,
 ) -> list[_Paragraph]:
     """Add a plain textbox with one paragraph per run-list; returns the
-    paragraph objects (so callers can apply list formatting)."""
+    paragraph objects (so callers can apply list formatting). ``base_pt``
+    is the per-slide fit mirror (None = inherited sizes)."""
     box = slide.shapes.add_textbox(CONTENT_LEFT, Emu(y), CONTENT_WIDTH, Emu(height))
     tf = box.text_frame
     tf.word_wrap = True
@@ -188,7 +205,7 @@ def add_text_block(
     for idx, runs in enumerate(paragraphs):
         para = tf.paragraphs[0] if idx == 0 else tf.add_paragraph()
         created.append(para)
-        append_runs(para, runs)
+        append_runs(para, runs, font_pt=base_pt)
     return created
 
 

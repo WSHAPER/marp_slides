@@ -34,13 +34,19 @@ from .marp_cli import render_deck_pdf as marp_render_pdf
 from .outline import _deck_themes_section, _load_prompt, _supported_constructs_section
 from .settings import OUTPUT_FORMAT_VALUES
 from .theming import ThemingValues
-from .validator import DeckError, ValidatedDeck, count_slides, validate_deck
+from .validator import (
+    DeckError,
+    ValidatedDeck,
+    count_slides,
+    validate_deck,
+)
 
 __all__ = [
     "DECK_SKELETON",
     "DECK_SYSTEM_PROMPT",
     "MARPRC_CONTENT",
     "DeckError",
+    "SlideOverflowError",
     "ValidatedDeck",
     "_OverflowMeasurementError",
     "build_deck_filename",
@@ -59,6 +65,17 @@ __all__ = [
     "validate_theme",
     "validate_theme_override",
 ]
+
+
+class SlideOverflowError(DeckError):
+    """A MEASURED per-slide overflow, raised by the worker's slide-fit
+    gate (:func:`marp_slides.task_worker._reject_slide_overflow`). A
+    distinct class so the per-slide exhaustion path can tell a measured
+    overflow (deterministically shrinkable: cut the computed number of
+    trailing bullets) from any other output-quality failure (not
+    shrinkable; the corrective retry is the only remedy). Carries the
+    same actionable message the retry feedback uses."""
+
 
 #: Canonical deck skeleton embedded verbatim in the deck-authoring system
 #: prompt (a fixed example; the generated constructs list stays the single

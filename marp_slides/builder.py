@@ -17,7 +17,7 @@ from pptx import Presentation
 from pptx.dml.color import RGBColor
 from pptx.slide import Slide, SlideLayout
 from pptx.text.text import TextFrame, _Paragraph
-from pptx.util import Emu, Inches
+from pptx.util import Emu, Inches, Pt
 
 from .blocks import (
     Block,
@@ -50,6 +50,7 @@ from .elements import (
 )
 from .geometry import (
     BLOCK_GAP,
+    BODY_LEVEL_PT,
     CHROME_RESERVE,
     COLUMN_GAP,
     COLUMN_WIDTH,
@@ -68,12 +69,18 @@ from .geometry import (
     SLIDE_WIDTH_EMU,
     SUBHEAD_HEIGHT,
     TABLE_ROW_HEIGHT,
+    TITLE_BASE_PT,
     fit_code,
+    fit_scale_factor,
 )
 
 
 def build_pptx(
-    deck: ParsedDeck, presentation_title: str, images: Mapping[int, bytes] | None = None
+    deck: ParsedDeck,
+    presentation_title: str,
+    images: Mapping[int, bytes] | None = None,
+    *,
+    theme: str = "default",
 ) -> bytes:
     """Build the native, editable PPTX (16:9) from a parsed deck.
 
@@ -84,7 +91,13 @@ def build_pptx(
     (the deck-wide ``backgroundImage`` frontmatter key, per-slide
     ``![bg](#file:N)`` lines) are html/pdf-only constructs: the parser files
     them as deck/slide chrome, never blocks, so this build ignores them by
-    construction even though ``images`` may carry their blobs."""
+    construction even though ``images`` may carry their blobs.
+
+    ``theme`` selects the base section font a slide's fit block scales
+    against (geometry.THEME_BASE_FONT_PX): a slide carrying
+    ``<style scoped>section { font-size: 26px; }</style>`` gets every run
+    size and flow height multiplied by px/base — the PPTX mirror of what
+    marp does with the scoped style in the HTML/PDF surfaces."""
     prs = Presentation()
     prs.slide_width = Emu(SLIDE_WIDTH_EMU)
     prs.slide_height = Emu(SLIDE_HEIGHT_EMU)
@@ -94,7 +107,10 @@ def build_pptx(
     content_layout = _layout_by_name(prs, "Title and Content", 1)
 
     for slide in deck.slides:
-        _build_slide(prs, slide, deck, title_layout, content_layout, images or {})
+        scale = fit_scale_factor(slide.fit_font_px, theme)
+        _build_slide(
+            prs, slide, deck, title_layout, content_layout, images or {}, scale
+        )
 
     buf = io.BytesIO()
     prs.save(buf)
@@ -108,12 +124,15 @@ def _build_slide(
     title_layout: SlideLayout,
     content_layout: SlideLayout,
     images: Mapping[int, bytes],
+    scale: float = 1.0,
 ) -> None:
     is_title_slide = not slide.blocks
     layout = title_layout if is_title_slide else content_layout
     s = prs.slides.add_slide(layout)
     write_runs(
-        s.placeholders[0].text_frame.paragraphs[0], slide.title_runs
+        s.placeholders[0].text_frame.paragraphs[0],
+        slide.title_runs,
+        base_pt=round(TITLE_BASE_PT * scale) if scale != 1.0 else None,
     )  # rich runs in the title placeholder (bold/links/code)
 
     background = slide.background or deck.background
@@ -131,7 +150,7 @@ def _build_slide(
         slide.header_override if slide.header_override is not None else deck.header
     )
 
-    _fill_slide_body(s, slide, is_title_slide, footer_runs, images)
+    _fill_slide_body(s, slide, is_title_slide, footer_runs, images, scale)
 
     if footer_runs:
         add_chrome_box(s, footer_runs, FOOTER_TOP, "Deck Footer")
@@ -149,25 +168,35 @@ def _fill_slide_body(
     is_title_slide: bool,
     footer_runs: tuple[Run, ...] | None,
     images: Mapping[int, bytes],
+    scale: float = 1.0,
 ) -> None:
     """Pick the slide's content layout branch: placeholder body, two
-    columns, sequential flow shapes, or nothing (title slide)."""
+    columns, sequential flow shapes, or nothing (title slide). ``scale``
+    is the slide's fit-mirror factor, threaded to every sizing decision
+    below (1.0 = today's sizes and heights)."""
+    base_pt = round(BODY_LEVEL_PT[0] * scale) if scale != 1.0 else None
     if is_title_slide:
         _drop_placeholder(s, 1)  # unused subtitle
         return
     bottom = FLOW_BOTTOM - CHROME_RESERVE if footer_runs else FLOW_BOTTOM
     if slide.columns is not None:
         _drop_placeholder(s, 1)  # content renders as two column boxes
-        _add_columns(s, slide, bottom)
+        _add_columns(s, slide, bottom, base_pt, scale)
         return
     if slide.needs_flow_layout:
         _drop_placeholder(s, 1)  # blocks render as sequential shapes
-        flow_blocks(s, slide.blocks, bottom, images)
+        flow_blocks(s, slide.blocks, bottom, images, scale)
         return
-    _fill_body(s.placeholders[1].text_frame, slide.blocks)
+    _fill_body(s.placeholders[1].text_frame, slide.blocks, base_pt=base_pt, scale=scale)
 
 
-def _add_columns(slide_shape: Slide, slide: ParsedSlide, bottom: int) -> None:
+def _add_columns(
+    slide_shape: Slide,
+    slide: ParsedSlide,
+    bottom: int,
+    base_pt: float | None = None,
+    scale: float = 1.0,
+) -> None:
     """Two-column layout: two side-by-side native text boxes. Content blocks
     before the ColumnBreak render in the left box, blocks after it in the
     right one; without a break everything stays in the left column."""
@@ -189,7 +218,14 @@ def _add_columns(slide_shape: Slide, slide: ParsedSlide, bottom: int) -> None:
         tf = box.text_frame
         tf.word_wrap = True
         if blocks:
-            _fill_body(tf, blocks, width_pt=COLUMN_WIDTH_PT, avail_in=height / 914400)
+            _fill_body(
+                tf,
+                blocks,
+                width_pt=COLUMN_WIDTH_PT,
+                avail_in=height / 914400,
+                base_pt=base_pt,
+                scale=scale,
+            )
 
 
 def _layout_by_name(
@@ -211,9 +247,12 @@ def _fill_body(
     blocks: Iterable[Block],
     width_pt: float = CONTENT_WIDTH_PT,
     avail_in: float = 5.6,
+    base_pt: float | None = None,
+    scale: float = 1.0,
 ) -> None:
     """Write blocks into a text frame (body placeholder or column box),
-    one native paragraph per block item."""
+    one native paragraph per block item. ``base_pt``/``scale`` carry the
+    slide's fit mirror (None/1.0 = inherited sizes, today's build)."""
     first = True
 
     def next_para() -> _Paragraph:
@@ -224,24 +263,26 @@ def _fill_body(
 
     for block in blocks:
         if isinstance(block, Paragraph):
-            write_runs(next_para(), block.runs)
+            write_runs(next_para(), block.runs, base_pt=base_pt)
         elif isinstance(block, Subheading):
             para = next_para()
-            write_runs(para, block.runs)
-            style_subheading(para, block.level)
+            write_runs(para, block.runs, base_pt=base_pt)
+            style_subheading(para, block.level, scale)
         elif isinstance(block, CodeBlock):
             _fill_body_code(next_para, block, width_pt, avail_in)
         elif isinstance(block, ListBlock):
             paras = []
             for item in block.items:
                 para = next_para()
+                # no base_pt: _apply_list_paras owns list run sizes,
+                # per nesting level, when the slide is scaled
                 write_runs(para, item.runs)
                 paras.append(para)
-            _apply_list_paras(paras, block)
+            _apply_list_paras(paras, block, scale)
         elif isinstance(block, BlockQuote):
             for quoted in block.paragraphs:
                 para = next_para()
-                write_runs(para, quote_runs(quoted))
+                write_runs(para, quote_runs(quoted), base_pt=base_pt)
                 apply_quote_para(para)
 
 
@@ -259,31 +300,42 @@ def _fill_body_code(
         append_runs(next_para(), (Run(line or " ", code=True),), font_pt)
 
 
-def _apply_list_paras(paras: Iterable[_Paragraph], block: ListBlock) -> None:
-    # startAt only on the first item (apply_list_para documents why)
+def _apply_list_paras(
+    paras: Iterable[_Paragraph], block: ListBlock, scale: float = 1.0
+) -> None:
+    # startAt only on the first item (apply_list_para documents why).
+    # When the slide carries a fit scale, list runs get explicit
+    # per-LEVEL sizes (the master's level ladder x scale) so nested
+    # items keep their visual hierarchy; unscaled slides inherit.
     for idx, (para, item) in enumerate(zip(paras, block.items, strict=False)):
         apply_list_para(
             para, block.ordered, item.level, start=block.start if idx == 0 else None
         )
+        if scale != 1.0:
+            size = round(BODY_LEVEL_PT[min(item.level, len(BODY_LEVEL_PT) - 1)] * scale)
+            for run in para.runs:
+                run.font.size = Pt(size)
 
 
-def estimate_height(block: Block, images: Mapping[int, bytes]) -> int:
+def estimate_height(
+    block: Block, images: Mapping[int, bytes], scale: float = 1.0
+) -> int:
     if isinstance(block, Paragraph):
-        return int(PARA_HEIGHT)
+        return int(PARA_HEIGHT * scale)
     if isinstance(block, Subheading):
-        return int(SUBHEAD_HEIGHT)
+        return int(SUBHEAD_HEIGHT * scale)
     if isinstance(block, CodeBlock):
         _font, height = fit_code(block.text, CONTENT_WIDTH_PT, FLOW_BAND_IN)
-        return int(Inches(height))
+        return int(Inches(height))  # code self-fits; the ladder IS its scale
     if isinstance(block, ListBlock):
-        return int(LIST_HEIGHT) * len(block.items)
+        return int(LIST_HEIGHT * scale) * len(block.items)
     if isinstance(block, BlockQuote):
-        return int(QUOTE_HEIGHT) * max(1, len(block.paragraphs))
+        return int(QUOTE_HEIGHT * scale) * max(1, len(block.paragraphs))
     if isinstance(block, TableBlock):
-        return int(TABLE_ROW_HEIGHT) * len(block.rows) + int(Inches(0.15))
+        return int(TABLE_ROW_HEIGHT * scale) * len(block.rows) + int(Inches(0.15))
     if isinstance(block, ImageBlock):
-        return picture_geometry(images[block.index])[1]
-    return int(PARA_HEIGHT)
+        return picture_geometry(images[block.index])[1]  # pictures keep native fit
+    return int(PARA_HEIGHT * scale)
 
 
 def flow_blocks(
@@ -291,10 +343,14 @@ def flow_blocks(
     blocks: Iterable[Block],
     bottom: int = FLOW_BOTTOM,
     images: Mapping[int, bytes] | None = None,
+    scale: float = 1.0,
 ) -> None:
     """Render blocks as sequential native shapes down the content band,
-    each fitted into the space actually left."""
+    each fitted into the space actually left. ``scale`` is the slide's
+    fit-mirror factor: flow heights and gaps shrink with it (code boxes
+    keep their self-fitted ladder sizes)."""
     images = images or {}
+    base_pt = round(BODY_LEVEL_PT[0] * scale) if scale != 1.0 else None
     y = int(FLOW_TOP)
     for block in blocks:
         avail_in = max(0.3, (int(bottom) - y) / 914400)
@@ -305,29 +361,41 @@ def flow_blocks(
             height = min(int(Inches(height_in)), int(bottom) - y) or int(Inches(0.3))
             add_code_box(slide, y, height, block, font_pt)
         else:
-            height = _flow_non_code(slide, block, y, int(bottom), images)
-        y += height + int(BLOCK_GAP)
+            height = _flow_non_code(
+                slide, block, y, int(bottom), images, scale, base_pt
+            )
+        y += height + int(BLOCK_GAP * scale)
 
 
 def _flow_non_code(
-    slide: Slide, block: Block, y: int, bottom: int, images: Mapping[int, bytes]
+    slide: Slide,
+    block: Block,
+    y: int,
+    bottom: int,
+    images: Mapping[int, bytes],
+    scale: float = 1.0,
+    base_pt: float | None = None,
 ) -> int:
-    height = min(estimate_height(block, images), bottom - y) if y < bottom else 0
+    height = min(estimate_height(block, images, scale), bottom - y) if y < bottom else 0
     if height <= 0:
         height = int(Inches(0.3))  # overflow: keep a minimal, clamped shape
     if isinstance(block, TableBlock):
-        add_table(slide, y, height, block)
+        add_table(slide, y, height, block, base_pt)
     elif isinstance(block, ImageBlock):
         add_picture(slide, y, block, images[block.index])
     elif isinstance(block, Paragraph):
-        add_text_block(slide, y, height, [block.runs])
+        add_text_block(slide, y, height, [block.runs], base_pt)
     elif isinstance(block, Subheading):
-        paras = add_text_block(slide, y, height, [block.runs])
-        style_subheading(paras[0], block.level)
+        paras = add_text_block(slide, y, height, [block.runs], base_pt)
+        style_subheading(paras[0], block.level, scale)
     elif isinstance(block, BlockQuote):
-        add_text_block(slide, y, height, [quote_runs(p) for p in block.paragraphs])
+        add_text_block(
+            slide, y, height, [quote_runs(p) for p in block.paragraphs], base_pt
+        )
     elif isinstance(block, ListBlock):
         _apply_list_paras(
-            add_text_block(slide, y, height, [item.runs for item in block.items]), block
+            add_text_block(slide, y, height, [item.runs for item in block.items]),
+            block,
+            scale,
         )
     return height

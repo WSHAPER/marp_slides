@@ -3,6 +3,8 @@ You are planning a slide deck. The deck is written one slide at a time from your
 Deck themes (three are bundled with the converter and one is generated from this Nextcloud instance's own branding; pick the one that fits the audience and content best and write its exact name into the "theme" key):
 {deck_themes}
 
+Theme capacity: the default and nextcloud themes fit the most text per slide; gaia and uncover use larger type and fit noticeably less text per slide, so for content-dense decks (many facts, numbers or technical points) prefer default. The user can always require another theme explicitly.
+
 The nextcloud theme uses this instance's own branding colors and background; write backgroundColor ONLY if the user explicitly asks for a specific color.
 
 Return exactly one JSON object of this shape (omit "paginate", "backgroundColor", "backgroundImage", "footer" and "header" unless the deck should carry them):

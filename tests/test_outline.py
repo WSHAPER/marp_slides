@@ -11,6 +11,7 @@ import pytest
 from marp_slides.outline import (
     OUTLINE_SYSTEM_PROMPT,
     SLIDE_SYSTEM_PROMPT,
+    THEME_DENSITY,
     DeckOutline,
     SlideOutline,
     assemble_deck,
@@ -18,6 +19,7 @@ from marp_slides.outline import (
     build_slide_prompt,
     extract_slide_markdown,
     parse_outline,
+    repair_outline_image_count,
     validate_outline_theme,
     validate_slide_markdown,
 )
@@ -513,3 +515,162 @@ def test_assembled_deck_passes_whole_deck_validation(
 def test_assemble_deck_mismatched_slide_count() -> None:
     with pytest.raises(ValueError, match="slide markdowns"):
         assemble_deck(TWO_SLIDE_OUTLINE, ["# Only one"])
+
+
+# --- deterministic image-coverage repair ------------------------------------------
+
+
+def _slides_json(*slides: dict) -> str:
+    return json.dumps(
+        {"title": "Repair Deck", "theme": "default", "slides": list(slides)}
+    )
+
+
+def test_repair_marks_shortest_unmarked_summary_first() -> None:
+    """The live convergence failure (4 images, 3 marked, the corrective
+    retry also returned 3): the repair closes the shortfall mechanically
+    by marking the UNMARKED slide with the least planned content (the
+    shortest summary, the least likely to overflow once the image
+    directive joins it), leaving every other field untouched."""
+    raw = _slides_json(
+        {"title": "A", "summary": "marked and long", "has_image": True},
+        {
+            "title": "B",
+            "summary": "the longest unmarked summary of all",
+            "has_image": False,
+        },
+        {"title": "C", "summary": "marked too", "has_image": True},
+        {"title": "D", "summary": "short one", "has_image": True},
+    )
+    repaired = repair_outline_image_count(raw, max_slides=8, image_count=4)
+    marked = [slide for slide in repaired.slides if slide.has_image]
+    assert len(marked) == 4
+    assert repaired.slides[1].title == "B" and repaired.slides[1].has_image
+    assert repaired.slides[1].summary == "the longest unmarked summary of all"
+    # 3 images against 3 marked of 3 slides: nothing to repair
+    three = repair_outline_image_count(raw, max_slides=8, image_count=3)
+    assert [s.has_image for s in three.slides] == [True, False, True, True]
+
+
+def test_repair_spreads_across_shortest_when_two_needed() -> None:
+    """A shortfall of 2 marks the two shortest unmarked summaries (deck
+    order breaking ties), not the first two slides."""
+    raw = _slides_json(
+        {
+            "title": "First",
+            "summary": "very long summary with many many words",
+            "has_image": False,
+        },
+        {"title": "Second", "summary": "mid length words", "has_image": True},
+        {"title": "Third", "summary": "tiny", "has_image": False},
+        {"title": "Fourth", "summary": "smaller", "has_image": False},
+    )
+    repaired = repair_outline_image_count(raw, max_slides=8, image_count=3)
+    assert [s.has_image for s in repaired.slides] == [False, True, True, True]
+
+
+def test_repair_appends_dedicated_image_slides_when_images_exceed_slides() -> None:
+    """More images than slides: every slide is already marked, so the
+    remaining images get dedicated image slides (short title, no summary:
+    the slide prompt places one split-background image each) within the
+    max_slides bound."""
+    raw = _slides_json(
+        {"title": "A", "has_image": True},
+        {"title": "B", "has_image": True},
+        {"title": "C", "has_image": True},
+    )
+    repaired = repair_outline_image_count(raw, max_slides=8, image_count=5)
+    assert [slide.title for slide in repaired.slides] == [
+        "A",
+        "B",
+        "C",
+        "Visuals 1",
+        "Visuals 2",
+    ]
+    assert all(slide.has_image for slide in repaired.slides)
+    # the appended slides author like any other: the plan builds prompts
+    prompt = build_slide_prompt(repaired, 4, image_count=5)
+    assert "MUST show provided image #file:4" in prompt
+
+
+def test_repair_refuses_when_no_room_for_dedicated_slides() -> None:
+    """Images beyond slides with no max_slides headroom is the one
+    unrepairable shape: a DeckError that says so (the task fails with
+    the actionable message, no third LLM ask)."""
+    raw = _slides_json(
+        {"title": "A", "has_image": True},
+        {"title": "B", "has_image": True},
+        {"title": "C", "has_image": True},
+    )
+    with pytest.raises(DeckError, match="no room for the 2 additional dedicated"):
+        repair_outline_image_count(raw, max_slides=3, image_count=5)
+
+
+def test_repair_passes_other_gate_failures_through_unchanged() -> None:
+    """The repair only ever rescues the coverage shortfall: a response
+    failing a DIFFERENT strict gate (bad theme, malformed slide, bad
+    JSON) re-raises that gate's own error, so the model-correctable
+    failure surfaces instead of a bogus repair."""
+    bad_theme = json.dumps(
+        {"title": "T", "theme": "neon", "slides": [{"title": "S", "has_image": False}]}
+    )
+    with pytest.raises(DeckError, match='"theme" must be one of the bundled'):
+        repair_outline_image_count(bad_theme, max_slides=8, image_count=2)
+    with pytest.raises(DeckError, match="not valid JSON"):
+        repair_outline_image_count("<html>not json</html>", max_slides=8, image_count=2)
+    marked_without_images = _slides_json({"title": "S", "has_image": True})
+    with pytest.raises(DeckError, match="task provides no images"):
+        repair_outline_image_count(marked_without_images, max_slides=8, image_count=0)
+
+
+def test_repair_noop_when_coverage_already_satisfied() -> None:
+    raw = _slides_json(
+        {"title": "A", "has_image": True}, {"title": "B", "has_image": True}
+    )
+    assert repair_outline_image_count(raw, 8, 2) == parse_outline(raw, 8, 2)
+
+
+# --- per-theme slide-density teaching ---------------------------------------------
+
+
+def test_slide_prompt_density_is_per_theme() -> None:
+    """The density rule teaches the safe area, line height and character
+    budget of the CONCRETE theme (the metrics of the pinned marp-cli
+    4.5.1 themes: default/nextcloud 563px + 44px + 70 chars, gaia 580px +
+    47px + 60 chars, uncover 660px + 56px + 50 chars) - one
+    default-calibrated clause under-teaches the larger-type themes and
+    their slides then fail the overflow gate."""
+    cases = {
+        "default": ("563 px", "44 px per line", "70 characters"),
+        "nextcloud": ("563 px", "44 px per line", "70 characters"),
+        "gaia": ("580 px", "47 px per line", "60 characters"),
+        "uncover": ("660 px", "56 px per line", "50 characters"),
+    }
+    for theme, fragments in cases.items():
+        outline = parse_outline(outline_json(theme=theme))
+        prompt = build_slide_prompt(outline, 1)
+        for fragment in fragments:
+            assert fragment in prompt, f"{theme} slide prompt lost: {fragment}"
+        assert "{density_clause}" not in prompt
+
+
+def test_slide_prompt_density_covers_every_theme() -> None:
+    """Every theme the validator allows has a density clause, so no
+    concrete theme can leak an unfilled placeholder into a slide
+    prompt."""
+    from marp_slides.constructs import ALLOWED_THEMES
+
+    for theme in ALLOWED_THEMES:
+        assert theme in THEME_DENSITY, f"no density teaching for {theme}"
+    outline = parse_outline(outline_json(theme="gaia"))
+    assert "type is larger" in build_slide_prompt(outline, 1)
+
+
+def test_outline_prompt_teaches_theme_capacity() -> None:
+    """The auto-pick rule names the capacity difference: content-dense
+    decks are steered toward default (the theme that fits the most
+    text), so an auto theme stops pairing dense content with the
+    larger-type themes it overflows."""
+    prompt = build_outline_prompt("a dense deck")
+    assert "fit the most text per slide" in prompt
+    assert "for content-dense decks" in prompt and "prefer default" in prompt

@@ -29,6 +29,45 @@ BLOCK_GAP = Inches(0.12)
 LIST_MARL = "342900"  # 0.375 in per level, hanging bullet
 MONO_FONT = "Consolas"
 
+# --- per-slide fit scaling (the PPTX mirror) ------------------------------------
+#
+# A slide carrying '<style scoped>section { font-size: 26px; }</style>' is
+# scaled in every HTML/PDF surface BY MARP ITSELF (the scoped element rides
+# the deck source), and mirrored here in the native build: every run gets
+# an explicit size (base x scale) and the flow-layout heights scale with
+# it, so the PPTX keeps matching the measured HTML within the documented
+# +/-8% proxy. Unscaled slides (no fit block) inherit the master's sizes
+# exactly as before — byte-identical builds.
+
+#: Section base font px per theme, MEASURED through the marp render
+#: (probe 2026-10-31: default 29 / gaia 35 / uncover 40; nextcloud
+#: inherits default metrics — theming.py never overrides sizes). The
+#: mirror divides the fit block's px by the theme base; unknown themes
+#: fall back to the default base.
+THEME_BASE_FONT_PX: dict[str, float] = {
+    "default": 29.0,
+    "gaia": 35.0,
+    "uncover": 40.0,
+    "nextcloud": 29.0,
+}
+
+#: Run-size bases of python-pptx's default template master txStyles
+#: (titleStyle lvl1 sz=4400; bodyStyle lvl1-6 sz=3200/2800/2400/2000 x3),
+#: verified against the shipped template: what a run inherits today when
+#: no explicit size is written.
+TITLE_BASE_PT = 44.0
+BODY_LEVEL_PT: tuple[float, ...] = (32.0, 28.0, 24.0, 20.0, 20.0, 20.0)
+
+
+def fit_scale_factor(fit_font_px: float | None, theme: str) -> float:
+    """The scale factor one slide's PPTX build mirrors: the fit block's
+    px over the theme's base section font (1.0 when the slide carries no
+    fit block, so unscaled slides keep today's inherited sizes)."""
+    if fit_font_px is None:
+        return 1.0
+    return fit_font_px / THEME_BASE_FONT_PX.get(theme, THEME_BASE_FONT_PX["default"])
+
+
 # --- code fence geometry (render-audit-driven) ---------------------------------
 #
 # Evidence (Collabora/LO headless render of built decks):

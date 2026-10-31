@@ -29,8 +29,14 @@ measured against its theme box (best-effort render measurement,
 the instance-branded theme values): an overflowing slide fails right
 there with the quantified overflow message, so the same
 repair-then-retry machinery gets a chance to slim it before assembly; a
-deck-level batch measurement backs the render phase as a non-retryable
-last gate. A
+slide that exhausts its attempts on a measured overflow is
+deterministically shrunk to fit (trailing bullets cut by the measured
+line count) instead of failing the deck; a deck-level batch measurement
+backs the render phase as a non-retryable last gate, applying the same
+one-line grace as the per-slide gate. An outline whose image-coverage
+check the corrective retry cannot fix is repaired deterministically
+(slides are marked ``has_image`` mechanically) instead of a third model
+ask. A
 measurement outage (Chromium missing, render crash) never blocks deck
 delivery: it logs and skips the check. Gate/image-fetch/build/prompt
 failures are never retried. Deck images arrive as
@@ -95,6 +101,7 @@ import threading
 from collections.abc import Mapping
 from contextlib import suppress
 from dataclasses import replace
+from math import ceil
 from pathlib import Path
 from threading import Event
 from time import monotonic, sleep
@@ -109,6 +116,7 @@ from .capability_guards import sweep_capability_guards
 from .constructs import THEME_AUTO
 from .deck_pipeline import (
     DeckError,
+    SlideOverflowError,
     ValidatedDeck,
     _OverflowMeasurementError,
     build_deck_filename,
@@ -141,7 +149,7 @@ from .images import (
     validate_image_references,
     validate_images_slot,
 )
-from .layout import deck_overflow_message, overflow_message
+from .layout import SlideOverflow, deck_overflow_message, overflow_message
 from .ocs_tasks import NestedTaskError, schedule_and_wait
 from .outline import (
     DeckOutline,
@@ -150,10 +158,11 @@ from .outline import (
     build_slide_prompt,
     extract_slide_markdown,
     parse_outline,
+    repair_outline_image_count,
     validate_outline_theme,
     validate_slide_markdown,
 )
-from .repair import repair_deck_markdown
+from .repair import drop_trailing_bullets, repair_deck_markdown
 from .settings import (
     APP_ID,
     HTML_MIME_TYPE,
@@ -338,12 +347,17 @@ def _generate_outline(  # noqa: PLR0913 (internal dispatch; params mirror the pi
     it should never fail validation). A non-auto theme input is enforced
     against the plan here. Output-quality failures (bad JSON, bad plan)
     retry ONCE with the validation error as corrective feedback (unless
-    ``settings.retry_llm`` is off); scheduling failures propagate.
-    ``feedback`` is deck-attempt context from :func:`_author_validated_deck`
-    (a whole-deck failure, appended on top of the prompt so the re-planned
-    attempt corrects it); it is None on the first authoring attempt."""
+    ``settings.retry_llm`` is off); scheduling failures propagate. After
+    the attempts are exhausted, a DETERMINISTIC repair closes an
+    image-coverage shortfall mechanically (see
+    :func:`marp_slides.outline.repair_outline_image_count`) instead of a
+    third model ask. ``feedback`` is deck-attempt context from
+    :func:`_author_validated_deck` (a whole-deck failure, appended on top
+    of the prompt so the re-planned attempt corrects it); it is None on
+    the first authoring attempt."""
     attempts = 2 if settings.retry_llm else 1
     last_error = DeckError("outline generation failed")
+    last_output: str | None = None
     for attempt in range(1, attempts + 1):
         llm_input = build_outline_prompt(
             prompt, theme, image_count, max_slides=max_slides
@@ -351,6 +365,10 @@ def _generate_outline(  # noqa: PLR0913 (internal dispatch; params mirror the pi
         if feedback is not None:
             llm_input = f"{llm_input}\n\n{feedback}"
         if attempt > 1:
+            # The corrective feedback quotes the VALIDATION ERROR only:
+            # the failed outline itself is never resurfaced (each nested
+            # round is a fresh task with a fresh context, so the model
+            # cannot anchor on and reproduce its previous output).
             llm_input = (
                 f"{llm_input}\n\n"
                 f"Your previous outline failed validation: {last_error}. "
@@ -361,6 +379,7 @@ def _generate_outline(  # noqa: PLR0913 (internal dispatch; params mirror the pi
         )
         _report_progress(nc, task_id, 5.0, "Generating outline")
         output = _schedule_llm_round(nc, llm_input, deadline, settings)
+        last_output = output
         try:
             outline = parse_outline(output, settings.max_slides, image_count)
             validate_outline_theme(outline, theme)
@@ -374,6 +393,31 @@ def _generate_outline(  # noqa: PLR0913 (internal dispatch; params mirror the pi
                 exc,
                 log_excerpt=settings.log_excerpt,
             )
+    # Deterministic convergence backstop for the image-coverage failure:
+    # the corrective retry demonstrably does not converge on the count
+    # (live: 4 images provided, 3 slides marked, the retry carrying the
+    # counting rule also returned 3), so mark additional slides
+    # mechanically instead of asking the model a third time. The repair
+    # re-runs every OTHER strict gate on the same text, so it only ever
+    # rescues the coverage shortfall it can close by construction; any
+    # other failure re-raises the model-correctable error unchanged.
+    if last_output is not None:
+        try:
+            outline = repair_outline_image_count(
+                last_output, settings.max_slides, image_count
+            )
+            validate_outline_theme(outline, theme)
+        except DeckError:
+            raise last_error from None
+        LOGGER.info(
+            "Task %s: outline image coverage repaired deterministically (%d of "
+            "%d slides marked for %d image(s))",
+            task_id,
+            sum(1 for slide in outline.slides if slide.has_image),
+            len(outline.slides),
+            image_count,
+        )
+        return outline
     raise last_error
 
 
@@ -397,39 +441,30 @@ def _strip_repair_wrapper(markdown: str) -> str:
     return markdown
 
 
-def _reject_slide_overflow(
+def _measure_slide_fit(
     nc: NextcloudApp,
     slide_markdown: str,
     theme: str,
     number: int,
     task_id: int,
-    settings: Settings,
-) -> None:
-    """Early slide-fit gate for ONE authored slide: measure the candidate
-    (wrapped in a minimal frontmatter carrying the deck's theme, so the
-    metrics match the deck the slide will ship in) inside a fresh
-    throwaway workdir and raise the measured overflow message as a normal
-    DeckError, so the EXISTING repair-then-retry machinery carries it
-    with zero loop of its own. For the generated ``nextcloud`` theme the
-    resolved instance theming values ride the call: the theme exists only
-    as CSS written from them, so without the values the driver cannot
-    render the slide at all (it then fails closed to its measurement
-    error and the fail-open handling below skips the check, the correct
-    degraded behavior). Best-effort by contract: a measurement
-    infrastructure failure logs a warning and lets the slide through;
-    only a MEASURED overflow fails the slide, because a measurement
-    outage must never block deck delivery. This is not an LLM round: it
-    never touches the shared LLM time budget. No-op when
-    ``settings.overflow_check`` is False."""
-    if not settings.overflow_check:
-        return
+) -> SlideOverflow | None:
+    """One best-effort fit measurement of a slide candidate (wrapped in a
+    minimal frontmatter carrying the deck's theme, so the metrics match
+    the deck the slide will ship in) inside a fresh throwaway workdir.
+    Returns the measured report, or None when the measurement
+    infrastructure is unavailable (the caller decides whether that is
+    fail-open or a missing input for a deterministic step). For the
+    generated ``nextcloud`` theme the resolved instance theming values
+    ride the call: the theme exists only as CSS written from them (see
+    :func:`_reject_slide_overflow`). This is not an LLM round: it never
+    touches the shared LLM time budget."""
     markdown = f"---\nmarp: true\ntheme: {theme}\n---\n\n{slide_markdown}"
     measure_kwargs: dict[str, ThemingValues] = {}
     if theme == THEME_NAME:
         # _resolve_theming_values is designed never to raise (it falls
         # back to the stock branding), but if a future resolution failure
         # ever escapes, measure WITHOUT the values and let the driver's
-        # fail-closed error hit the fail-open handler below
+        # fail-closed error hit the fail-open handling below
         try:
             measure_kwargs = {"theming_values": _resolve_theming_values(nc, task_id)}
         except Exception as exc:  # noqa: BLE001 - defensive only, see above
@@ -442,7 +477,7 @@ def _reject_slide_overflow(
             )
     try:
         with tempfile.TemporaryDirectory(prefix="marp_slides-fit-") as workdir:
-            report = measure_slide_overflow(markdown, Path(workdir), **measure_kwargs)
+            return measure_slide_overflow(markdown, Path(workdir), **measure_kwargs)
     except _OverflowMeasurementError as exc:
         LOGGER.warning(
             "Task %s: slide %d overflow measurement unavailable (%s); "
@@ -451,24 +486,98 @@ def _reject_slide_overflow(
             number,
             exc,
         )
+        return None
+
+
+def _reject_slide_overflow(
+    nc: NextcloudApp,
+    slide_markdown: str,
+    theme: str,
+    number: int,
+    task_id: int,
+    settings: Settings,
+) -> None:
+    """Early slide-fit gate for ONE authored slide: measure the candidate
+    (via :func:`_measure_slide_fit`, same theme and branding the deck will
+    render with) and raise the measured overflow message as a
+    :class:`SlideOverflowError`, so the EXISTING repair-then-retry
+    machinery carries it with zero loop of its own and the per-slide
+    exhaustion path can tell a measured overflow from any other failure.
+    Best-effort by contract: a measurement infrastructure failure logs a
+    warning and lets the slide through; only a MEASURED overflow fails
+    the slide, because a measurement outage must never block deck
+    delivery. No-op when ``settings.overflow_check`` is False."""
+    if not settings.overflow_check:
         return
-    if report is not None:
-        # One line-height grace: sub-line overflow (content within one
-        # rendered line of fitting) is invisible and rejecting it burns
-        # the retry budget on marginal noise (live: task 1309 died at
-        # 1.02x, 25px over, less than one line). Real clipping (>1 line
-        # over) still rejects.
-        if report.overflow_y_px > report.line_px:
-            # renumber the measured section to its deck position so the
-            # message names the slide the retry is actually for
-            raise DeckError(overflow_message(replace(report, slide=number)))
-        LOGGER.debug(
-            "Task %s: slide %d within one-line grace (%dpx over, line=%dpx)",
+    report = _measure_slide_fit(nc, slide_markdown, theme, number, task_id)
+    if report is None:
+        return
+    # One line-height grace: sub-line overflow (content within one
+    # rendered line of fitting) is invisible and rejecting it burns
+    # the retry budget on marginal noise (live: task 1309 died at
+    # 1.02x, 25px over, less than one line). Real clipping (>1 line
+    # over) still rejects.
+    if report.overflow_y_px > report.line_px:
+        # renumber the measured section to its deck position so the
+        # message names the slide the retry is actually for
+        raise SlideOverflowError(overflow_message(replace(report, slide=number)))
+    LOGGER.debug(
+        "Task %s: slide %d within one-line grace (%dpx over, line=%dpx)",
+        task_id,
+        number,
+        report.overflow_y_px,
+        report.line_px,
+    )
+
+
+def _shrink_slide_to_fit(
+    nc: NextcloudApp,
+    slide_markdown: str,
+    theme: str,
+    number: int,
+    task_id: int,
+    settings: Settings,
+) -> str | None:
+    """Deterministic shrink-to-fit for a slide that exhausted its
+    per-slide retries on a MEASURED overflow - the PowerPoint-autofit
+    equivalent: cut content instead of failing the whole deck (live: a
+    gaia slide at 1.27x killed the task after two identical overflowing
+    attempts). Re-measures the failed candidate, converts the overflow
+    into whole LINES to cut, and drops exactly that many trailing bullet
+    lines (each source bullet renders as one line or more, so the cut
+    removes at least the measured excess). What was dropped is logged by
+    name. Returns the cut markdown for the caller to re-validate, or
+    None when there is nothing to cut (no trailing bullets), no overflow
+    to measure, or the measurement is unavailable - in all those cases
+    the original overflow failure stands."""
+    if not settings.overflow_check:
+        return None
+    report = _measure_slide_fit(nc, slide_markdown, theme, number, task_id)
+    if report is None or report.overflow_y_px <= 0:
+        return None
+    lines_to_cut = ceil(report.overflow_y_px / max(1, report.line_px))
+    shrunk, dropped = drop_trailing_bullets(slide_markdown, lines_to_cut)
+    if shrunk is None:
+        LOGGER.info(
+            "Task %s: slide %d overflows by %d px (about %d lines) and has no "
+            "trailing bullets to cut; failing the slide",
             task_id,
             number,
             report.overflow_y_px,
-            report.line_px,
+            lines_to_cut,
         )
+        return None
+    LOGGER.info(
+        "Task %s: slide %d overflows by %d px (about %d lines); shrinking to "
+        "fit by dropping %d bullet line(s): %s",
+        task_id,
+        number,
+        report.overflow_y_px,
+        lines_to_cut,
+        len(dropped),
+        "; ".join(dropped),
+    )
+    return shrunk
 
 
 def _reject_deck_overflow(
@@ -478,14 +587,17 @@ def _reject_deck_overflow(
     settings: Settings,
 ) -> None:
     """The render-time deck backstop: ONE batch measurement of the
-    assembled deck; any overflowing slide fails the render phase with the
-    deck-level overflow message, non-retryable like the other render
-    gates (the authoring phase already had its retryable per-slide
-    chances). ``theming_values`` is the instance theming the caller
-    resolved for a ``nextcloud``-themed deck (None for bundled themes,
-    which need none). Best-effort like the per-slide gate: a measurement
-    infrastructure failure logs a warning and the render proceeds without
-    the check. No-op when ``settings.overflow_check`` is False."""
+    assembled deck; any slide overflowing by MORE THAN ONE rendered line
+    fails the render phase with the deck-level overflow message,
+    non-retryable like the other render gates (the authoring phase
+    already had its retryable per-slide chances, and the same one-line
+    grace the per-slide gate applies keeps sub-line marginal overflow
+    from failing here too). ``theming_values`` is the instance theming
+    the caller resolved for a ``nextcloud``-themed deck (None for
+    bundled themes, which need none). Best-effort like the per-slide
+    gate: a measurement infrastructure failure logs a warning and the
+    render proceeds without the check. No-op when
+    ``settings.overflow_check`` is False."""
     if not settings.overflow_check:
         return
     # the branded-theme kwarg rides only when the caller resolved values
@@ -506,7 +618,23 @@ def _reject_deck_overflow(
         )
         return
     if reports:
-        raise DeckError(deck_overflow_message(reports))
+        # The SAME one-line grace the per-slide gate applies (live: task
+        # 1394 died here at 1.04x - 25px over in a theme with 24px lines -
+        # after the per-slide gate had already passed the very slides at
+        # the same marginal overflow): a sub-line overflow is invisible,
+        # so it must not fail the non-retryable render gate the per-slide
+        # gate would have tolerated. Real clipping (more than one line
+        # over) still fails the render.
+        blocking = tuple(
+            report for report in reports if report.overflow_y_px > report.line_px
+        )
+        if blocking:
+            raise DeckError(deck_overflow_message(blocking))
+        LOGGER.debug(
+            "Task %s: %d slide(s) within the one-line deck backstop grace",
+            task_id,
+            len(reports),
+        )
 
 
 def _generate_slide(
@@ -527,13 +655,17 @@ def _generate_slide(
     deck. Returns the slide's validated Markdown together with the number
     of LLM attempts it took (1 or 2: the draft checkpoint records it).
     Scheduling failures propagate; the LAST attempt's DeckError is raised
-    when every attempt fails."""
+    when every attempt fails - except when that failure is a MEASURED
+    overflow: then a deterministic shrink-to-fit (:func:`_shrink_slide_to_fit`)
+    cuts the computed number of trailing bullets and the cut slide ships
+    when it re-passes the same validation and fit gates."""
     total = len(outline.slides)
     attempts = 2 if settings.retry_llm else 1
     _report_progress(
         nc, task_id, 10.0 + (number / total) * 80.0, f"Slide {number} of {total}"
     )
     last_error = DeckError(f"slide {number} authoring failed")
+    last_slide_markdown: str | None = None
     for attempt in range(1, attempts + 1):
         llm_input = build_slide_prompt(outline, number, len(image_file_ids))
         if attempt > 1:
@@ -581,6 +713,7 @@ def _generate_slide(
             # including the last: with no retry left, the deterministic
             # fix is the only rescue the slide has.
             if slide_markdown is not None:
+                last_slide_markdown = slide_markdown
                 wrapped = f"---\nmarp: true\n---\n\n{slide_markdown}"
                 repaired_wrapped, repairs = repair_deck_markdown(wrapped)
                 if repairs:
@@ -615,6 +748,40 @@ def _generate_slide(
                 exc,
                 log_excerpt=settings.log_excerpt,
             )
+    # Deterministic shrink-to-fit on exhaustion: a slide that spent every
+    # attempt on a MEASURED overflow (the typed SlideOverflowError) gets
+    # its trailing bullets cut by the measured line count instead of
+    # failing the whole deck - the PowerPoint-autofit equivalent, and no
+    # LLM round (a third identical re-ask would not converge either).
+    # The cut markdown re-runs the SAME validation and fit gates, so an
+    # insufficient or invalidating cut still surfaces the original
+    # overflow failure.
+    if last_slide_markdown is not None and isinstance(last_error, SlideOverflowError):
+        shrunk = _shrink_slide_to_fit(
+            nc, last_slide_markdown, outline.theme, number, task_id, settings
+        )
+        if shrunk is not None:
+            try:
+                validated = validate_slide_markdown(
+                    shrunk, settings.max_deck_bytes, total
+                )
+                validate_image_references(validated.deck, image_file_ids)
+                _reject_slide_overflow(
+                    nc, shrunk, outline.theme, number, task_id, settings
+                )
+                LOGGER.info(
+                    "Task %s: slide %d fits after the deterministic shrink; proceeding",
+                    task_id,
+                    number,
+                )
+                return shrunk.strip(), attempts
+            except DeckError:
+                LOGGER.info(
+                    "Task %s: slide %d still does not fit after the "
+                    "deterministic shrink; failing the slide",
+                    task_id,
+                    number,
+                )
     raise last_error
 
 

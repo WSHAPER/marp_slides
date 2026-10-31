@@ -107,6 +107,7 @@ class SlideState:
         self.background_image_spec: BackgroundImageSpec | None = None
         self.columns: int | None = None
         self.slide_directives: Directives = {}
+        self.fit_font_px: float | None = None
 
 
 def parse_slide(
@@ -204,6 +205,8 @@ def _consume_token(state: SlideState, lines: list[str], tok: Token) -> int:
             return _consume_fence(state, lines, begin, fence)
     elif tok.type == "html_block" and stripped.startswith("<!--"):
         return _consume_comment_block(state, lines, begin)
+    elif tok.type == "html_block" and stripped == _FIT_STYLE_OPEN:
+        return _consume_fit_style_block(state, lines, begin)
     elif tok.type == "blockquote_open" and QUOTE_RE.match(stripped):
         return consume_quote(state, lines, begin)
     elif tok.type in ("bullet_list_open", "ordered_list_open") and (
@@ -234,6 +237,8 @@ def _consume_line(  # noqa: PLR0911 - a flat one-return-per-construct dispatch
         return skipped
     if stripped.startswith("<!--"):
         return _consume_comment_block(state, lines, i)
+    if stripped == _FIT_STYLE_OPEN:
+        return _consume_fit_style_block(state, lines, i)
     heading = HEADING_RE.match(stripped)
     if heading:
         return _consume_heading(state, heading, i)
@@ -314,7 +319,59 @@ def _finish_slide(state: SlideState) -> ParsedSlide:
         columns=state.columns,
         footer_override=state.slide_directives.get("footer"),
         header_override=state.slide_directives.get("header"),
+        fit_font_px=state.fit_font_px,
     )
+
+
+#: The machine-managed per-slide fit-scaling block, exact three-line shape:
+#: '<style scoped>' / 'section { font-size: 26px; }' / '</style>', each on
+#: its own line at column 0. Marp honors '<style scoped>' natively (it
+#: scopes to the slide it sits in), which is why the carrier is an element,
+#: not a comment: the HTML/PDF deliverables, the overflow measurement and
+#: every re-render derive the scale from the deck source itself. The parser
+#: reads the px onto ParsedSlide.fit_font_px; the exact shape is the whole
+#: allow-list — any other raw-HTML shape keeps today's rejection.
+_FIT_STYLE_OPEN = "<style scoped>"
+_FIT_STYLE_RULE_RE = re.compile(
+    r"^section \{ font-size: (?P<px>\d{1,3}(?:\.\d+)?)px;? \}$"
+)
+_FIT_STYLE_CLOSE = "</style>"
+#: Sanity bounds for the px value (the rescue tier only ever writes
+#: round(base * k) for k in [0.80, 0.95] over a ~29 px base; humans editing
+#: the source deserve feedback on nonsense values, not silent acceptance).
+_FIT_PX_MIN, _FIT_PX_MAX = 8.0, 60.0
+
+
+def _consume_fit_style_block(state: SlideState, lines: list[str], i: int) -> int:
+    """Consume the exact fit-scaling style block and record its px on the
+    slide state; returns the next index. One block per slide; malformed
+    variants reject with the exact syntax so an author can fix it."""
+    if state.fit_font_px is not None:
+        raise UnsupportedConstructError(
+            f"Unsupported construct on {state.where}: a slide carries at most "
+            "one fit-scaling style block. Remove the duplicate "
+            "'<style scoped>' block."
+        )
+    rule = _FIT_STYLE_RULE_RE.match(lines[i + 1]) if i + 1 < len(lines) else None
+    closed = i + 2 < len(lines) and lines[i + 2] == _FIT_STYLE_CLOSE
+    if rule is None or not closed:
+        raise UnsupportedConstructError(
+            f"Unsupported construct on {state.where}: the fit-scaling style "
+            "block must be exactly three lines: '<style scoped>', "
+            "'section { font-size: 26px; }' and '</style>' — one "
+            "font-size declaration, no other properties. Raw HTML and any "
+            "other style block stay unsupported."
+        )
+    px = float(rule.group("px"))
+    if not _FIT_PX_MIN <= px <= _FIT_PX_MAX:
+        raise UnsupportedConstructError(
+            f"Unsupported construct on {state.where}: the fit-scaling "
+            f"font-size {px}px is outside the sane range "
+            f"{_FIT_PX_MIN:.0f}-{_FIT_PX_MAX:.0f}px. Keep it within the "
+            "theme's body size (about 29px) or slightly below."
+        )
+    state.fit_font_px = px
+    return i + 3
 
 
 def _reject_link_def_prefix(state: SlideState, stripped: str) -> None:

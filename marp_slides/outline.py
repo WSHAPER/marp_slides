@@ -34,7 +34,7 @@ from __future__ import annotations
 import json
 import re
 from collections.abc import Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any
 
@@ -60,6 +60,7 @@ from .validator import (
 __all__ = [
     "OUTLINE_SYSTEM_PROMPT",
     "SLIDE_SYSTEM_PROMPT",
+    "THEME_DENSITY",
     "DeckOutline",
     "SlideOutline",
     "assemble_deck",
@@ -67,6 +68,7 @@ __all__ = [
     "build_slide_prompt",
     "extract_slide_markdown",
     "parse_outline",
+    "repair_outline_image_count",
     "validate_outline_theme",
     "validate_slide_markdown",
 ]
@@ -108,11 +110,88 @@ OUTLINE_THEME_OVERRIDE_PROMPT = _load_prompt("outline_theme_override.md")
 
 #: The Phase 2 system prompt: the deck-authoring rules scoped to ONE slide.
 #: The constructs section is generated from SUPPORTED_CONSTRUCTS, the same
-#: single source of truth the validator enforces.
+#: single source of truth the validator enforces. The density rule carries
+#: a ``{density_clause}`` placeholder filled PER THEME by
+#: :func:`build_slide_prompt` (the outline names the concrete theme, and
+#: the themes differ in how much content fits: see :data:`THEME_DENSITY`).
 SLIDE_SYSTEM_PROMPT = _fill(
     _load_prompt("slide_system_prompt.md"),
     supported_constructs=_supported_constructs_section(),
 )
+
+#: Per-theme slide-density teaching, the numbers the "keep the whole slide
+#: within its box" rule teaches. Derived from the compiled theme CSS of
+#: the pinned marpteam/marp-cli v4.5.1 base image (marp-core 4.4.0):
+#: default is 29px body type with 78.5px padding (a 563px safe area,
+#: about 44px per line) - the metrics every earlier revision of the
+#: teaching was calibrated against; the generated nextcloud theme
+#: ``@import``s default and overrides branding only, so it shares the
+#: exact numbers (marp_slides/theming.py documents that contract); gaia
+#: sets 35px type with 70px padding and 1.35 line-height (a 580px safe
+#: area but about 47px per line and larger headings, so fewer and
+#: shorter lines fit: about 60 characters per line against default's 70);
+#: uncover sets 40px type with 30px/70px padding and 1.4 line-height
+#: (a 660px safe area but about 56px per line and much larger headings:
+#: about 50 characters per line, the least content of all themes). A
+#: single default-calibrated clause (the pre-theme-era prompt) taught
+#: 70-character bullets into every theme, which the overflow gate then
+#: rejected on the larger-type themes (live: a gaia deck at 1.27x).
+THEME_DENSITY: dict[str, str] = {
+    "default": (
+        "the title plus at most about 9 single lines of text fill a slide "
+        "completely (a safe area of about 563 px at about 44 px per line). "
+        "Count every line a bullet WRAPS to, not the bullet count, and count "
+        "a subheading ('###') as a line too: aim for 4 to 6 bullets, each "
+        "short enough to fit on ONE line of about 70 characters; a bullet "
+        "that wraps to two lines costs two. Subheadings are expensive: at "
+        "most TWO per slide, and each one reduces the remaining bullet "
+        "budget by two lines (a slide with two subheadings fits only 3 or 4 "
+        "bullets total)."
+    ),
+    "nextcloud": (
+        "the title plus at most about 9 single lines of text fill a slide "
+        "completely (a safe area of about 563 px at about 44 px per line). "
+        "Count every line a bullet WRAPS to, not the bullet count, and count "
+        "a subheading ('###') as a line too: aim for 4 to 6 bullets, each "
+        "short enough to fit on ONE line of about 70 characters; a bullet "
+        "that wraps to two lines costs two. Subheadings are expensive: at "
+        "most TWO per slide, and each one reduces the remaining bullet "
+        "budget by two lines (a slide with two subheadings fits only 3 or 4 "
+        "bullets total)."
+    ),
+    "gaia": (
+        "this theme's type is larger, so less fits: the title plus at most "
+        "about 8 single lines of text fill a slide completely (a safe area "
+        "of about 580 px at about 47 px per line). Count every line a bullet "
+        "WRAPS to, not the bullet count, and count a subheading ('###') as "
+        "a line too: aim for 4 to 5 bullets, each short enough to fit on "
+        "ONE line of about 60 characters; a bullet that wraps to two lines "
+        "costs two. Subheadings are expensive: at most TWO per slide, and "
+        "each one reduces the remaining bullet budget by two lines (a slide "
+        "with two subheadings fits only 3 or 4 bullets total)."
+    ),
+    "uncover": (
+        "this theme's type is the largest, so the least fits: the title "
+        "plus at most about 8 single lines of text fill a slide completely "
+        "(a safe area of about 660 px, but at about 56 px per line and with "
+        "much larger headings). Count every line a bullet WRAPS to, not the "
+        "bullet count, and count a subheading ('###') as a line too: aim "
+        "for 3 to 5 bullets, each short enough to fit on ONE line of about "
+        "50 characters; a bullet that wraps to two lines costs two. "
+        "Subheadings are expensive: at most TWO per slide, and each one "
+        "reduces the remaining bullet budget by two lines (a slide with two "
+        "subheadings fits only 2 or 3 bullets total)."
+    ),
+}
+
+
+def _density_clause(theme: str) -> str:
+    """The density rule body for one concrete theme (the outline's theme
+    key: ``parse_outline`` guarantees a bundled theme name)."""
+    clause = THEME_DENSITY.get(theme)
+    if clause is None:  # pragma: no cover - parse_outline gates the names
+        clause = THEME_DENSITY["default"]
+    return clause
 
 
 # --- the outline data model ----------------------------------------------------
@@ -324,15 +403,9 @@ def _parse_slide(entry: object, image_count: int) -> SlideOutline:
     return SlideOutline(title=title, summary=summary.strip(), has_image=has_image)
 
 
-def parse_outline(
-    llm_output: object, max_slides: int = 60, image_count: int = 0
-) -> DeckOutline:
-    """Parse and strictly validate the Phase 1 outline JSON. Unknown JSON
-    keys are ignored (forward compatibility); the known keys must have the
-    right shape, the theme must be a bundled theme, the slide count must
-    fit ``max_slides`` and every image statement must be in bounds for
-    ``image_count``. Raises :class:`DeckError` with a model-correctable
-    message otherwise."""
+def _load_outline_data(llm_output: object) -> dict[str, Any]:
+    """The gates every outline parse shares before the slide-level
+    parsing: non-empty text, parseable JSON, one JSON object."""
     if not isinstance(llm_output, str) or not llm_output.strip():
         raise DeckError(
             "The language model returned no outline text, so no deck could be "
@@ -344,6 +417,17 @@ def parse_outline(
             'Invalid outline: the JSON must be one object with the "title", '
             f'"theme" and "slides" keys, got {type(data).__name__}.'
         )
+    return data
+
+
+def _outline_from_data(
+    data: dict[str, Any], max_slides: int, image_count: int
+) -> DeckOutline:
+    """Build the :class:`DeckOutline` from raw JSON data under every
+    strict gate EXCEPT the image-coverage check (which
+    :func:`parse_outline` adds, and :func:`repair_outline_image_count`
+    deliberately skips so it can close a coverage shortfall
+    mechanically)."""
     slides_data = data.get("slides")
     if not isinstance(slides_data, list) or not slides_data:
         raise DeckError(
@@ -356,21 +440,6 @@ def parse_outline(
             f"is {max_slides}). Plan fewer slides."
         )
     slides = tuple(_parse_slide(entry, image_count) for entry in slides_data)
-    if image_count > 0:
-        # Image completeness is enforced at deck assembly; catching the
-        # shortfall HERE means the outline retry fixes the plan before
-        # every slide is generated. The slide builder assigns #file:N to
-        # image slides in order, so the plan must mark at least as many
-        # slides "has_image" as there are provided images.
-        marked = sum(1 for slide in slides if slide.has_image)
-        if marked < image_count:
-            raise DeckError(
-                f"Invalid outline: the task provides {image_count} image(s) but "
-                f'only {marked} slide(s) are marked "has_image": true. Every '
-                "provided image must appear in the deck, so mark at least one "
-                'slide "has_image": true per provided image (a dedicated slide '
-                "per image is fine)."
-            )
     return DeckOutline(
         title=_required_text(data, "title"),
         theme=_parse_theme(data),
@@ -381,6 +450,92 @@ def parse_outline(
         footer=_parse_chrome_text(data, "footer"),
         header=_parse_chrome_text(data, "header"),
     )
+
+
+def _reject_image_shortfall(slides: tuple[SlideOutline, ...], image_count: int) -> None:
+    """The image-coverage gate: at least as many slides must be marked
+    ``has_image`` as there are provided images (the slide builder assigns
+    ``#file:N`` to image slides in order, so the plan's count is what
+    makes every provided image land in the deck)."""
+    if image_count <= 0:
+        return
+    marked = sum(1 for slide in slides if slide.has_image)
+    if marked < image_count:
+        raise DeckError(
+            f"Invalid outline: the task provides {image_count} image(s) but "
+            f'only {marked} slide(s) are marked "has_image": true. Every '
+            "provided image must appear in the deck, so mark at least one "
+            'slide "has_image": true per provided image (a dedicated slide '
+            "per image is fine)."
+        )
+
+
+def parse_outline(
+    llm_output: object, max_slides: int = 60, image_count: int = 0
+) -> DeckOutline:
+    """Parse and strictly validate the Phase 1 outline JSON. Unknown JSON
+    keys are ignored (forward compatibility); the known keys must have the
+    right shape, the theme must be a bundled theme, the slide count must
+    fit ``max_slides`` and every image statement must be in bounds for
+    ``image_count``. Raises :class:`DeckError` with a model-correctable
+    message otherwise."""
+    data = _load_outline_data(llm_output)
+    outline = _outline_from_data(data, max_slides, image_count)
+    _reject_image_shortfall(outline.slides, image_count)
+    return outline
+
+
+def repair_outline_image_count(
+    llm_output: object, max_slides: int = 60, image_count: int = 0
+) -> DeckOutline:
+    """Deterministic repair of the one outline failure class the
+    corrective LLM retry demonstrably does not converge on (live: 4
+    images provided, 3 slides marked ``has_image``, the retry with the
+    counting rule as feedback also returned 3): re-parse the last
+    outline under every strict gate EXCEPT image coverage, then mark
+    additional slides ``has_image`` mechanically - no LLM round.
+
+    Which slides get marked: the unmarked ones with the SHORTEST
+    summaries first (the least planned content, so the least likely to
+    overflow once the image directive joins the slide), deck order
+    breaking ties. When images outnumber slides and every slide is
+    already marked, dedicated image slides (a short title, no summary:
+    the slide prompt then places one split-background image) are
+    appended, up to the ``max_slides`` bound - beyond it the plan is
+    unrepairable and the DeckError says so. A response whose failure is
+    any OTHER gate (bad JSON, bad theme, malformed slides) re-raises
+    that gate's error unchanged: the repair only ever rescues the
+    coverage shortfall it can close by construction."""
+    data = _load_outline_data(llm_output)
+    outline = _outline_from_data(data, max_slides, image_count)
+    marked = sum(1 for slide in outline.slides if slide.has_image)
+    shortfall = image_count - marked
+    if shortfall <= 0:
+        return outline  # already covered; nothing to repair
+    unmarked = sorted(
+        (idx for idx, slide in enumerate(outline.slides) if not slide.has_image),
+        key=lambda idx: (len(outline.slides[idx].summary), idx),
+    )
+    new_slides = list(outline.slides)
+    for idx in unmarked[:shortfall]:
+        new_slides[idx] = replace(new_slides[idx], has_image=True)
+    still_short = shortfall - min(shortfall, len(unmarked))
+    if still_short > 0:
+        if len(new_slides) + still_short > max_slides:
+            raise DeckError(
+                f"Invalid outline: the task provides {image_count} image(s) "
+                f"but the plan has only {len(new_slides)} slide(s) and there "
+                f"is no room for the {still_short} additional dedicated "
+                f"image slide(s) the coverage rule needs (maximum is "
+                f"{max_slides} slides)."
+            )
+        new_slides.extend(
+            SlideOutline(title=f"Visuals {k + 1}", has_image=True)
+            for k in range(still_short)
+        )
+    repaired = replace(outline, slides=tuple(new_slides))
+    _reject_image_shortfall(repaired.slides, image_count)
+    return repaired
 
 
 def validate_outline_theme(outline: DeckOutline, theme: str) -> None:
@@ -412,8 +567,15 @@ def build_slide_prompt(outline: DeckOutline, number: int, image_count: int = 0) 
         f"{n}. {planned.title}" + (f": {planned.summary}" if planned.summary else "")
         for n, planned in enumerate(outline.slides, start=1)
     )
+    # the density rule is theme-specific: the plan's concrete theme names
+    # the safe area, line height and per-line character budget the slide
+    # must fit (a default-calibrated clause under-teaches the larger-type
+    # themes, whose slides then fail the overflow gate)
+    system_prompt = _fill(
+        SLIDE_SYSTEM_PROMPT, density_clause=_density_clause(outline.theme)
+    )
     prompt = (
-        f"{SLIDE_SYSTEM_PROMPT.rstrip()}\n\n"
+        f"{system_prompt.rstrip()}\n\n"
         "The deck plan (for context only; never write the other slides):\n"
         f"Deck title: {outline.title}\n"
         f"{plan}\n\n"

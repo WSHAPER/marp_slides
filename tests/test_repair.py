@@ -16,7 +16,7 @@ import pytest
 
 from marp_slides import task_worker
 from marp_slides.deck_pipeline import DeckError, validate_deck
-from marp_slides.repair import repair_deck_markdown
+from marp_slides.repair import drop_trailing_bullets, repair_deck_markdown
 from tests.conftest import VALID_DECK
 
 COLON_TITLE_DECK = (
@@ -320,3 +320,48 @@ def test_span_tags_inside_code_fences_are_not_stripped() -> None:
     repaired, repairs = repair_deck_markdown(markdown)
     assert "<span>" in repaired
     assert repairs == []
+
+
+# --- deterministic shrink-to-fit: trailing bullet drops ---------------------------
+
+
+def test_drop_trailing_bullets_cuts_the_last_n() -> None:
+    """The shrink-to-fit cut: exactly the last N bullet lines drop, the
+    title and the bullets above them survive, and the dropped texts come
+    back for the caller's log line."""
+    markdown = "## Results\n\n- first\n- second\n- third\n- fourth"
+    shrunk, dropped = drop_trailing_bullets(markdown, 2)
+    assert shrunk == "## Results\n\n- first\n- second"
+    assert dropped == ["- third", "- fourth"]
+
+
+def test_drop_trailing_bullets_keeps_speaker_notes_and_nested_items() -> None:
+    """A speaker note after the bullet block survives (it renders outside
+    the text flow); nested bullets cut like top-level ones; blanks
+    between bullets are skipped over, not treated as the block's end."""
+    markdown = (
+        "## Plan\n\n- keep me\n  - drop inner\n- drop outer\n\n"
+        "<!-- speaker note stays -->"
+    )
+    shrunk, dropped = drop_trailing_bullets(markdown, 2)
+    assert shrunk == "## Plan\n\n- keep me\n\n<!-- speaker note stays -->"
+    assert dropped == ["- drop inner", "- drop outer"]
+
+
+def test_drop_trailing_bullets_stops_at_non_bullet_content() -> None:
+    """The cut only ever takes a TRAILING bullet block: a paragraph or
+    code fence under the bullets ends it, and a slide without any
+    trailing bullet cannot be shrunk at all (None, no drops)."""
+    paragraph_slide = "## T\n\nA paragraph of prose.\n\nMore prose."
+    assert drop_trailing_bullets(paragraph_slide, 3) == (None, [])
+    fenced = "## T\n\n- bullet\n\n```python\n- looks like a bullet\n```"
+    shrunk, dropped = drop_trailing_bullets(fenced, 1)
+    assert shrunk is None and dropped == []  # the fence tail blocks the cut
+    headed = "## T\n\nProse intro.\n\n- one\n- two"
+    shrunk2, dropped2 = drop_trailing_bullets(headed, 5)
+    assert shrunk2 == "## T\n\nProse intro."
+    assert dropped2 == ["- one", "- two"]  # over-large asks drop what exists
+
+
+def test_drop_trailing_bullets_rejects_non_positive_counts() -> None:
+    assert drop_trailing_bullets("- a\n- b", 0) == (None, [])

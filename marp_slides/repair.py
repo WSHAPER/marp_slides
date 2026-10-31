@@ -14,6 +14,14 @@ pattern stays for the retry. Every repair is line-level and gate-checked
 upstream: the repaired markdown is only kept when it passes full
 validation again, so a wrong-headed edit can never ship. Code-fence
 interiors are never touched (they are code, not constructs).
+
+Beside the pattern repairs, :func:`drop_trailing_bullets` is the
+deterministic shrink-to-fit the worker applies to a slide that exhausted
+its per-slide retries on a MEASURED overflow: it cuts the computed
+number of trailing bullet lines (the overflow report quantifies how many
+line units to remove), the PowerPoint-autofit equivalent of shrinking to
+fit rather than failing. It is NOT part of the automatic repair chain:
+the worker calls it only on that specific exhaustion path.
 """
 
 from __future__ import annotations
@@ -39,6 +47,57 @@ _SPAN_OPEN_RE = re.compile(r"<span[^>]*>")
 _SPAN_CLOSE_RE = re.compile(r"</span>")
 
 _FRONTMATTER_DELIM = "---"
+
+
+#: A top-level or nested bullet line: unordered ('-', '*' or '+') or
+#: ordered ('1.'; the first item's number only sets where numbering
+#: starts), any indentation, requiring whitespace after the marker (so a
+#: '---' separator or '-' alone is not a bullet).
+_BULLET_LINE_RE = re.compile(r"^\s*(?:[-*+]|\d+\.)\s+\S")
+
+
+def drop_trailing_bullets(markdown: str, count: int) -> tuple[str | None, list[str]]:
+    """Deterministic shrink-to-fit helper: drop the LAST ``count`` bullet
+    lines from a slide's Markdown and return ``(shrunk_markdown,
+    dropped_texts)`` - the texts power the caller's log line naming what
+    was cut. Only a TRAILING bullet block is cut (scanning from the end,
+    blank lines and whole-line speaker-note comments between bullets are
+    skipped over and kept): content above the bullets - the title, the
+    paragraphs, the code fences - is never touched, and bullets inside a
+    code fence are code, not bullets. Each dropped SOURCE bullet renders
+    as one line or more, so dropping ``count`` bullets removes at least
+    ``count`` rendered lines (the caller computes ``count`` from a
+    measured overflow in line units). When the request exceeds the
+    available trailing bullets, every available bullet is dropped and the
+    caller's re-measurement decides whether the partial cut was enough.
+    ``(None, [])`` means there is no trailing bullet to drop.
+    """
+    if count < 1:
+        return None, []
+    lines = markdown.splitlines()
+    states = list(_iter_fence_states(lines, 0))
+    drop: list[int] = []
+    idx = len(lines) - 1
+    while idx >= 0:
+        line, state = states[idx][1], states[idx][2]
+        stripped = line.strip()
+        if state != "text":
+            break  # a code fence or its body: never cut into code
+        if not stripped or stripped.startswith("<!--"):
+            idx -= 1  # blank or speaker note between/after bullets: keep
+            continue
+        if _BULLET_LINE_RE.match(line) is None:
+            break  # title, paragraph, table, ...: the bullet block ends
+        drop.append(idx)
+        if len(drop) >= count:
+            break
+        idx -= 1
+    if not drop:
+        return None, []
+    dropped = [lines[i].strip() for i in sorted(drop)]
+    skip = set(drop)
+    shrunk = "\n".join(line for idx, line in enumerate(lines) if idx not in skip)
+    return shrunk.rstrip("\n"), dropped
 
 
 def repair_deck_markdown(markdown: str) -> tuple[str, list[str]]:

@@ -516,8 +516,9 @@ def test_lone_dollar_signs_stay_literal_text() -> None:
 
 def test_dashed_currency_price_ranges_stay_literal_text() -> None:
     # regression: '$1,200 – $2,200' (en-dash price range) pairs two '$'
-    # and was rejected as math; a span that is a bare amount plus a range
-    # dash is currency, not an equation, so it validates as literal text
+    # and was rejected as math; the closing '$' has a space to its left,
+    # so the Pandoc flanking rule reads the pair as currency, not an
+    # equation, and it validates as literal text
     validated = validate_deck(
         "---\nmarp: true\ntitle: t\n---\n\n# T\n\nCosts run $1,200 – $2,200\n"
     )
@@ -548,9 +549,30 @@ def test_prompt_skeleton_passes_validation() -> None:
 
 def test_compact_nonbreaking_hyphen_currency_range_not_math() -> None:
     """The compact price-range form with U+2011 between the amounts
-    (no spaces, non-breaking hyphen) is prose, not math (live: task 1315)."""
+    (no spaces, non-breaking hyphen) is prose, not math (live: task 1315):
+    tight flanks, but a digit chases the closing '$'."""
     deck = (
         "---\nmarp: true\n---\n\n# Costs\n\n"
         "- Entry frames: $300\u2011$800 depending on groupset\n"
     )
     validate_deck(deck)  # must not raise
+
+
+def test_pandoc_flanking_rule_separates_math_from_currency() -> None:
+    """The Pandoc tex_math_dollars flanking rule decides '$...$' pairs,
+    replacing currency-shape regexes: real math (non-space tight against
+    both delimiters, no digit chasing the closer) still rejects, while
+    every currency pairing dies on a clause — space after the opener,
+    space before the closer, or digit after the closer."""
+    header = "---\nmarp: true\ntitle: t\n---\n\n# T\n\n"
+    # real math rejects: the flanks are tight and nothing digital follows
+    for body in ("$E = mc^2$", "$\\frac{a}{b}$", "$x + y$ solves it"):
+        with pytest.raises(DeckError, match="math equations are not supported"):
+            validate_deck(f"{header}{body}\n")
+    # currency by each clause, shape-agnostic — no format is enumerated
+    for body in (
+        "US$ 500 and US$ 600",  # space after the opener
+        "$200k\u2013$500k range",  # digit after the closer
+        "it is $\u2248$200 total",  # degenerate span, digit after
+    ):
+        validate_deck(f"{header}{body}\n")  # must not raise

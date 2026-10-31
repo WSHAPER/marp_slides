@@ -478,6 +478,33 @@ def test_golden_subheading_styled_runs_in_body() -> None:
     assert body.paragraphs[0].runs[0].font.size is None
 
 
+def test_fit_scaled_slide_mirrors_the_scale_into_explicit_sizes() -> None:
+    """The PPTX mirror of a fit-scaling block: every run on the scaled
+    slide gets an explicit size (base x 26/29), list levels keep their
+    hierarchy (32->29, 28->25), and the unscaled sibling slide keeps
+    byte-identical inherited sizes."""
+    deck = (
+        "---\nmarp: true\ntitle: t\n---\n\n# Plain\n\n- bullet one\n"
+        "  - nested point\n\n---\n\n# Scaled\n\n"
+        "<style scoped>\nsection { font-size: 26px; }\n</style>\n\n"
+        "- bullet one\n  - nested point\n\n### Subhead\n\nClosing paragraph.\n"
+    )
+    prs = build(deck)
+    plain, scaled = prs.slides
+    # the unscaled sibling: inherited sizes, exactly as before
+    body = plain.placeholders[1].text_frame
+    assert body.paragraphs[0].runs[0].font.size is None
+    # the scaled slide: 26/29 = 0.897 on every explicit base
+    title = scaled.shapes.title.text_frame.paragraphs[0]
+    assert title.runs[0].font.size == Pt(39)  # 44 x 0.897
+    sbody = scaled.placeholders[1].text_frame
+    sizes = [r.font.size for p in sbody.paragraphs for r in p.runs]
+    assert Pt(29) in sizes  # 32 x 0.897 — body-level bullets
+    assert Pt(25) in sizes  # 28 x 0.897 — nested level keeps hierarchy
+    assert Pt(29) in sizes  # subheading 32 x 0.897 steps below the title
+    assert all(s is not None for s in sizes)  # nothing left inherited
+
+
 def test_golden_subheading_styled_in_flow_slide() -> None:
     prs = build(ELEMENTS_DECK)
     slide = prs.slides[2]  # code fence + table -> flow layout
@@ -1112,19 +1139,24 @@ def test_math_with_lt_gt_reports_math_not_raw_html() -> None:
     )
 
 
-def test_two_dollar_signs_on_a_line_read_as_math_and_reject() -> None:
-    # the '$...$' span detector is unchanged from the equation era: two '$'
-    # on one line read as math syntax unless the span between them is a
-    # dashed currency range (the tests below) — word-separated amounts
-    # still need rewriting, e.g. 'USD 5 and USD 10'
-    _rejected("# T\n\ncosts $5 and $10 total\n", "math equations are not supported")
+def test_word_separated_dollar_amounts_stay_literal_text() -> None:
+    # the Pandoc flanking rule replaces currency-shape regexes: a closing
+    # '$' with a space to its left ('... and $10') is not a math closer,
+    # so word-separated amounts ('$5 and $10', Pandoc's own '$20,000 and
+    # $30,000' example) validate as literal text — no more rewriting to
+    # 'USD 5 and USD 10'
+    deck = "---\nmarp: true\ntitle: t\n---\n\n# T\n\ncosts $5 and $10 total\n"
+    validated = validate_deck(deck)
+    (paragraph,) = validated.deck.slides[0].blocks
+    assert paragraph.runs == (Run("costs $5 and $10 total"),)
 
 
 def test_dashed_currency_price_ranges_stay_literal_text() -> None:
     # regression (two live failures): '$1,200 – $2,200' pairs two '$' on
-    # one line, and the span between them is a bare amount plus an en
-    # dash — a price range, not an equation. Both reported shapes (slide
-    # body paragraph and list item) validate, keeping every '$' literal.
+    # one line, but the closing '$' has a space to its left — the Pandoc
+    # flanking rule reads the pair as a price range, not an equation. Both
+    # reported shapes (slide body paragraph and list item) validate,
+    # keeping every '$' literal.
     deck = (
         "---\nmarp: true\ntitle: t\n---\n\n# T\n\n"
         "Salary band: $1,200 – $2,200 per month\n\n"
@@ -1137,8 +1169,10 @@ def test_dashed_currency_price_ranges_stay_literal_text() -> None:
 
 
 def test_currency_range_dash_variants_and_table_cells_stay_literal() -> None:
-    # the exemption is the dash family (hyphen, en dash, em dash), and a
-    # table cell carries the same literal '$' as paragraph text
+    # the flanking clauses cover the dash family shape-agnostically:
+    # '$5-$10' is tight but a digit chases the closer; '$5 — $10' has a
+    # space before the closer — and a table cell carries the same literal
+    # '$' as paragraph text
     deck = (
         "---\nmarp: true\ntitle: t\n---\n\n# T\n\n"
         "| Narrow | Wide |\n| --- | --- |\n| $5-$10 | $5 — $10 |\n"
@@ -1152,17 +1186,52 @@ def test_currency_range_dash_variants_and_table_cells_stay_literal() -> None:
 @pytest.mark.parametrize(
     "body",
     [
-        "$x – $y",  # letters after the '$': not an amount
-        "$1-2$",  # value range INSIDE one '$...$' pair
+        "$x – $y",  # letters after the '$': closer has a space to its left
         "$5 average of $10",  # words between the amounts
         "$1,200 USD – $2,200",  # currency code after the amount
         "$1 200 – $2 200",  # space-grouped digits
     ],
 )
-def test_non_currency_dollar_pairs_still_reject_as_math(body: str) -> None:
-    # the carve-out is currency-shaped only — everything else that pairs
-    # two '$' on one line keeps the equation-era rejection
+def test_dollar_pairs_failing_pandoc_flanking_stay_literal(body: str) -> None:
+    # the rule is shape-agnostic: any pair whose closing '$' has a space
+    # to its left is currency prose, whatever sits between the '$'
+    validated = validate_deck(f"---\nmarp: true\ntitle: t\n---\n\n# T\n\n{body}\n")
+    assert validated.deck.slides[0].blocks  # parsed, not rejected
+
+
+@pytest.mark.parametrize(
+    "body",
+    [
+        "$1-2$",  # value range INSIDE one tight '$...$' pair
+        "$x+y$",  # tight operands on both flanks
+        "budget $900$total",  # tight pair chased by a letter, not a digit
+    ],
+)
+def test_dollar_pairs_passing_pandoc_flanking_still_reject_as_math(body: str) -> None:
+    # only the flanking clauses save a pair from the equation-era
+    # rejection; a tight '$...$' not chased by a digit is still math
     _rejected(f"# T\n\n{body}\n", "math equations are not supported")
+
+
+@pytest.mark.parametrize(
+    "body",
+    [
+        # every live math failure from the cycling-economy E2E battery,
+        # pinned with its task id — the '$...$' span each reported
+        # (occ taskprocessing:task:get, 2026-10-31)
+        "$300\u2011$800 frames",  # task 1315: U+2011, digit after the closer
+        "$200k\u2013$500k",  # task 1325: tight en dash, digit after the closer
+        "$20 M \u2013 $500k",  # task 1335: space before the closer
+        "$1.2 k, mid\u2011range \u2248 $500k",  # task 1344: words + ≈ between
+        "it is $\u2248$200 total",  # task 1373: degenerate '≈' span, digit after
+        "$1\u20115k, professional contracts $2,000",  # task 1382: words between
+        "$1,200 for entry-level to $22,000",  # task 1309: the prompt's own pair
+    ],
+)
+def test_live_currency_failures_stay_literal_via_flanking(body: str) -> None:
+    deck = f"---\nmarp: true\ntitle: t\n---\n\n# T\n\n{body}\n"
+    validated = validate_deck(deck)
+    assert validated.deck.slides[0].blocks  # parsed, not rejected
 
 
 def test_dollar_signs_inside_code_fences_stay_verbatim_code() -> None:
@@ -1175,7 +1244,11 @@ def test_dollar_signs_inside_code_fences_stay_verbatim_code() -> None:
         'echo $PATH and $HOME\n```\n\n```python\ns = "$x$ % 2"\n```\n'
     )
     validate_deck(deck)  # verbatim code: fine
-    _rejected("# T\n\necho $PATH and $HOME\n", "math equations are not supported")
+    # outside the fence, the same two '$' stay literal as well now: the
+    # closing '$' (of '$HOME') has a space to its left — but a tight
+    # '$...$' outside a fence still rejects
+    validate_deck("---\nmarp: true\ntitle: t\n---\n\n# T\n\necho $PATH and $HOME\n")
+    _rejected("# T\n\necho $PATH$HOME\n", "math equations are not supported")
 
 
 def test_dollar_signs_inside_inline_code_spans_stay_code() -> None:
