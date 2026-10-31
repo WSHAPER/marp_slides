@@ -514,6 +514,16 @@ def test_lone_dollar_signs_stay_literal_text() -> None:
     validate_deck("---\nmarp: true\ntitle: costs $5\n---\n\n# T\n\nx\n")
 
 
+def test_dashed_currency_price_ranges_stay_literal_text() -> None:
+    # regression: '$1,200 – $2,200' (en-dash price range) pairs two '$'
+    # and was rejected as math; a span that is a bare amount plus a range
+    # dash is currency, not an equation, so it validates as literal text
+    validated = validate_deck(
+        "---\nmarp: true\ntitle: t\n---\n\n# T\n\nCosts run $1,200 – $2,200\n"
+    )
+    assert validated.deck.slides[0].blocks  # parsed, not rejected
+
+
 def test_long_math_span_is_truncated_in_the_message() -> None:
     huge = "\\sum_{i=1}^{n} i + " * 20
     with pytest.raises(DeckError) as excinfo:

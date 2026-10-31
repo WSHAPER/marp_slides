@@ -9,7 +9,9 @@ interiors and link labels included; code-span contents and autolink URLs
 excluded; images re-injected raw) rejects everything outside the allow-list
 wherever it sits: images beyond the file-id contract, footnotes, math,
 strikethrough, raw HTML, undefined reference links, and link/autolink syntax
-markdown-it itself refused. The run-building walk then maps tokens to runs —
+markdown-it itself refused — with one carve-out: a dashed currency range
+('$1,200 – $2,200') pairs two '$' but is a price range, not math, and stays
+literal text. The run-building walk then maps tokens to runs —
 emphasis finally NESTS (links and code spans inside **bold** / *italic* keep
 their styling, labels may carry emphasis), reference links resolve against
 the deck-wide definitions, and URL validation happens here, at parse time,
@@ -76,6 +78,16 @@ _REJECT_SCAN_RE = re.compile(
     """,
     re.VERBOSE,
 )
+
+#: The interior of a dashed currency range: what the flat scan captures
+#: between the two '$' of '$1,200 – $2,200' — a bare amount (digits,
+#: thousands commas, one optional decimal part) followed by a range dash
+#: (hyphen, en dash or em dash) and optional spaces. That pairing is a
+#: price range, not an equation. Deliberately conservative: the amount
+#: must start right after the opening '$' with no currency code or words,
+#: and anything else between two '$' — '$x – $y', '$5 and $10', '$1-2$' —
+#: still reads as math.
+_CURRENCY_RANGE_RE = re.compile(r"\d[\d,]*(?:\.\d+)?\s*[-–—]\s*")
 
 #: Reference-style links inside literal text tokens (markdown-it never sees
 #: a reference without ``env.references``, which we deliberately do not pass:
@@ -177,9 +189,10 @@ def _reject_math(context: str, found: str) -> None:
     at parse time, with slide context, for '$...$' tokens and any '$$'
     text — exactly the surfaces the equation era's math handling covered —
     so every other '$' (code fences, inline code, speaker notes, link
-    URLs, table cells with a lone '$', frontmatter titles) keeps its
-    literal meaning — except a literal '$$' in a text line, which the
-    guard below rejects as it always has."""
+    URLs, table cells with a lone '$', frontmatter titles, dashed currency
+    ranges like '$1,200 – $2,200', which :func:`_reject_match` exempts
+    before calling) keeps its literal meaning — except a literal '$$' in
+    a text line, which the guard below rejects as it always has."""
     raise UnsupportedConstructError(
         f"Unsupported construct on {context}: math equations are not supported; "
         f"write the formula as plain text instead (found {found})."
@@ -238,8 +251,10 @@ def _reject_match(
     """Act on one phase-one match: image/link/autolink/ref handlers validate
     (and claim) the span — residual syntax markdown-it refused rejects with
     the same bytes the token route would — math rejects (it is outside the
-    construct set, so it always raises), and the literal constructs —
-    strikethrough, footnotes, raw HTML — reject with the actionable fix."""
+    construct set, so it always raises — unless the span is a dashed
+    currency range, which claims its span as literal text), and the literal
+    constructs — strikethrough, footnotes, raw HTML — reject with the
+    actionable fix."""
     if match.group("image_url") is not None:
         reject_image(match.group("image_url"), context)
     elif match.group("autolink") is not None:
@@ -255,7 +270,14 @@ def _reject_match(
         # label shielded from the math alternative (leftmost-first order).
         _resolve_ref(match.group("ref_label"), match.group("ref_id"), context, refs)
     elif match.group("math") is not None:
-        _reject_math(context, f"'${match.group('math')}$'")
+        span = match.group("math")
+        if _CURRENCY_RANGE_RE.fullmatch(span) is not None:
+            # '$1,200 – $2,200': the two '$' pair, but the span between
+            # them is a bare amount plus a range dash — a price range, not
+            # an equation. Claim the span; the scan continues past it, so
+            # a later real '$...$' on the line still rejects in flat order.
+            return
+        _reject_math(context, f"'${span}$'")
     elif match.group("strike") is not None:
         raise UnsupportedConstructError(
             f"Unsupported construct on {context}: strikethrough (~~...~~) is not supported. "

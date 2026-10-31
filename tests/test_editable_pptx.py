@@ -11,6 +11,7 @@ from pptx import Presentation
 from pptx.dml.color import RGBColor
 from pptx.util import Emu, Pt
 
+from marp_slides.blocks import Run
 from marp_slides.deck_pipeline import DeckError, validate_deck
 from marp_slides.editable_pptx import (
     _CONTENT_WIDTH_PT,
@@ -1113,9 +1114,55 @@ def test_math_with_lt_gt_reports_math_not_raw_html() -> None:
 
 def test_two_dollar_signs_on_a_line_read_as_math_and_reject() -> None:
     # the '$...$' span detector is unchanged from the equation era: two '$'
-    # on one line always read as math syntax (currency amounts need
-    # rewriting, e.g. 'USD 5 and USD 10')
+    # on one line read as math syntax unless the span between them is a
+    # dashed currency range (the tests below) — word-separated amounts
+    # still need rewriting, e.g. 'USD 5 and USD 10'
     _rejected("# T\n\ncosts $5 and $10 total\n", "math equations are not supported")
+
+
+def test_dashed_currency_price_ranges_stay_literal_text() -> None:
+    # regression (two live failures): '$1,200 – $2,200' pairs two '$' on
+    # one line, and the span between them is a bare amount plus an en
+    # dash — a price range, not an equation. Both reported shapes (slide
+    # body paragraph and list item) validate, keeping every '$' literal.
+    deck = (
+        "---\nmarp: true\ntitle: t\n---\n\n# T\n\n"
+        "Salary band: $1,200 – $2,200 per month\n\n"
+        "- moving costs: $1,200 – $2,200\n"
+    )
+    validated = validate_deck(deck)
+    paragraph, list_block = validated.deck.slides[0].blocks
+    assert paragraph.runs == (Run("Salary band: $1,200 – $2,200 per month"),)
+    assert list_block.items[0].runs == (Run("moving costs: $1,200 – $2,200"),)
+
+
+def test_currency_range_dash_variants_and_table_cells_stay_literal() -> None:
+    # the exemption is the dash family (hyphen, en dash, em dash), and a
+    # table cell carries the same literal '$' as paragraph text
+    deck = (
+        "---\nmarp: true\ntitle: t\n---\n\n# T\n\n"
+        "| Narrow | Wide |\n| --- | --- |\n| $5-$10 | $5 — $10 |\n"
+    )
+    validated = validate_deck(deck)
+    (table,) = validated.deck.slides[0].blocks
+    assert table.rows[1][0] == (Run("$5-$10"),)
+    assert table.rows[1][1] == (Run("$5 — $10"),)
+
+
+@pytest.mark.parametrize(
+    "body",
+    [
+        "$x – $y",  # letters after the '$': not an amount
+        "$1-2$",  # value range INSIDE one '$...$' pair
+        "$5 average of $10",  # words between the amounts
+        "$1,200 USD – $2,200",  # currency code after the amount
+        "$1 200 – $2 200",  # space-grouped digits
+    ],
+)
+def test_non_currency_dollar_pairs_still_reject_as_math(body: str) -> None:
+    # the carve-out is currency-shaped only — everything else that pairs
+    # two '$' on one line keeps the equation-era rejection
+    _rejected(f"# T\n\n{body}\n", "math equations are not supported")
 
 
 def test_dollar_signs_inside_code_fences_stay_verbatim_code() -> None:

@@ -54,6 +54,11 @@ ignore = [
     "TRY300",
     "TRY400",
 ]
+# The en dash is slide CONTENT, not a confusable hyphen: dashed currency
+# ranges ('$1,200 – $2,200') are literal price text the inline scanner
+# must match byte-exactly (see _CURRENCY_RANGE_RE), so it stays allowed
+# in strings, comments and docstrings alike.
+allowed-confusables = ["–"]
 # Deliberately NOT selected (each after measuring findings on this codebase):
 #   EM101/EM102  - forces exception messages out of context; the long
 #                  actionable messages are the product (same reason as TRY003)
