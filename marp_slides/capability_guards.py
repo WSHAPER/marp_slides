@@ -1,3 +1,5 @@
+# SPDX-FileCopyrightText: 2026 WSHAPER <42714629+WSHAPER@users.noreply.github.com>
+# SPDX-License-Identifier: AGPL-3.0-or-later
 """Defensive capability guards: notice instance gaps, warn once, never block.
 
 The app DELIVERS artifacts and flows that rely on instance capabilities

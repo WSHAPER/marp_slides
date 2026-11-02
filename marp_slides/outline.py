@@ -1,3 +1,5 @@
+# SPDX-FileCopyrightText: 2026 WSHAPER <42714629+WSHAPER@users.noreply.github.com>
+# SPDX-License-Identifier: AGPL-3.0-or-later
 """Two-phase deck authoring: a JSON outline first, then one call per slide.
 
 The monolithic single-LLM-call deck authoring asked the model for the whole

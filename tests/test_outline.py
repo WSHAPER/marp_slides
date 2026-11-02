@@ -1,3 +1,5 @@
+# SPDX-FileCopyrightText: 2026 WSHAPER <42714629+WSHAPER@users.noreply.github.com>
+# SPDX-License-Identifier: AGPL-3.0-or-later
 """The two-phase authoring pieces in marp_slides.outline: outline parsing,
 the phase prompts, per-slide extraction/validation and deck assembly (pure,
 no Nextcloud I/O)."""

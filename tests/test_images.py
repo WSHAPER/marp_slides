@@ -1,3 +1,5 @@
+# SPDX-FileCopyrightText: 2026 WSHAPER <42714629+WSHAPER@users.noreply.github.com>
+# SPDX-License-Identifier: AGPL-3.0-or-later
 """Image input handling: slot validation, reference bounds checks, content
 sniffing and capped downloads through a fake nc_py_api files client."""
 

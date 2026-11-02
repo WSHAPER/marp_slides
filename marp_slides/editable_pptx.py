@@ -1,3 +1,5 @@
+# SPDX-FileCopyrightText: 2026 WSHAPER <42714629+WSHAPER@users.noreply.github.com>
+# SPDX-License-Identifier: AGPL-3.0-or-later
 """The deck engine's public surface: parse, validate and build.
 
 The implementation lives in focused modules (constructs, blocks, inline

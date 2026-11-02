@@ -1,3 +1,5 @@
+# SPDX-FileCopyrightText: 2026 WSHAPER <42714629+WSHAPER@users.noreply.github.com>
+# SPDX-License-Identifier: AGPL-3.0-or-later
 """Strict deck pre-validation: frontmatter, marp:true, size, slide cap, security,
 native-only construct rejections."""
 

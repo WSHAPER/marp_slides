@@ -1,3 +1,5 @@
+# SPDX-FileCopyrightText: 2026 WSHAPER <42714629+WSHAPER@users.noreply.github.com>
+# SPDX-License-Identifier: AGPL-3.0-or-later
 """FastAPI application: lifecycle, auth middleware and TaskProcessing registration."""
 
 from __future__ import annotations
@@ -37,7 +39,7 @@ def enabled_handler(enabled: bool, nc: NextcloudApp) -> str:
             )
             APP_ENABLED.set()
             if THREAD_STOP_EVENT.is_set():
-                # If the threads were previously stopped, we start them again,
+                # If the threads were previously stopped, they are started again,
                 # otherwise the lifecycle handler has already started them.
                 start_bg_thread(Settings.from_env())
         else:

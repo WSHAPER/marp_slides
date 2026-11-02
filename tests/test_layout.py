@@ -1,3 +1,5 @@
+# SPDX-FileCopyrightText: 2026 WSHAPER <42714629+WSHAPER@users.noreply.github.com>
+# SPDX-License-Identifier: AGPL-3.0-or-later
 """Tests for the slide-fit contract: the SlideOverflow report, its
 user-actionable messages, and the driver boundary that turns a dumped
 measurement DOM back into reports (the pure parse side of the marp +

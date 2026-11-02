@@ -1,3 +1,5 @@
+# SPDX-FileCopyrightText: 2026 WSHAPER <42714629+WSHAPER@users.noreply.github.com>
+# SPDX-License-Identifier: AGPL-3.0-or-later
 """The construct contract: what a deck may contain.
 
 ``SUPPORTED_CONSTRUCTS`` is the single source of truth for the supported

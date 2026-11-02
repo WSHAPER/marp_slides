@@ -1,3 +1,5 @@
+# SPDX-FileCopyrightText: 2026 WSHAPER <42714629+WSHAPER@users.noreply.github.com>
+# SPDX-License-Identifier: AGPL-3.0-or-later
 """Parser-level checks for the extended Marp image alt keywords: bg
 directions (left/right/vertical), sized splits (left:33%), scale
 percentages, w:/h: length options and the keyword/human-alt separation,

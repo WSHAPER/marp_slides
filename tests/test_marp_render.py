@@ -1,3 +1,5 @@
+# SPDX-FileCopyrightText: 2026 WSHAPER <42714629+WSHAPER@users.noreply.github.com>
+# SPDX-License-Identifier: AGPL-3.0-or-later
 """marp-cli HTML gate + HTML/PDF renders: argv construction, safety, error
 surfacing, and the render-side image materialization."""
 

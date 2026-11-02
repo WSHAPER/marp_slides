@@ -25,3 +25,13 @@ All contributions generated or assisted by this agent must fully comply with:
 - Generate or submit security reports without independent human verification.
 - Embed prompt text as inline Python strings. Prompts live in `marp_slides/prompts/`.
 - Introduce math equation rendering. Removed for v0.1.0 due to Collabora's ODF-only formula round trip.
+
+## History hygiene
+
+- Commit messages must not reference counts that go stale (test totals,
+  LOC deltas, pass rates). Say "the full test suite" or name the exact
+  test file, never a number that changes with the next PR.
+- Commit messages must not cite untracked artifacts (reports, harnesses,
+  scratch files, session IDs). A fresh cloner cannot resolve them.
+- Every commit carries `Signed-off-by` (DCO) and, when AI-assisted,
+  an `Assisted-by:` trailer matching the repo's AI policy.

@@ -1,3 +1,5 @@
+# SPDX-FileCopyrightText: 2026 WSHAPER <42714629+WSHAPER@users.noreply.github.com>
+# SPDX-License-Identifier: AGPL-3.0-or-later
 """marp_slides: a Nextcloud ExApp that turns a prompt into a PPTX slide deck.
 
 An inner ``core:text2text`` TaskProcessing task (scheduled via OCS on whatever

@@ -1,3 +1,5 @@
+# SPDX-FileCopyrightText: 2026 WSHAPER <42714629+WSHAPER@users.noreply.github.com>
+# SPDX-License-Identifier: AGPL-3.0-or-later
 """Theme input: validation, the hard-override check against the deck, and
 the authoring prompt's theme instructions (single source:
 constructs.MARP_THEMES feeds the validator, the prompt and the ENUM)."""

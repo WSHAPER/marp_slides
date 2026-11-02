@@ -1,3 +1,5 @@
+# SPDX-FileCopyrightText: 2026 WSHAPER <42714629+WSHAPER@users.noreply.github.com>
+# SPDX-License-Identifier: AGPL-3.0-or-later
 """Task result plumbing with a fake NextcloudApp (no network, no docker).
 
 The inner LLM is faked as a stream of ``core:text2text`` outputs: the FIRST
@@ -2172,7 +2174,7 @@ def test_done_progress_precedes_reported_result(monkeypatch) -> None:
     """The 100% 'done' progress ping must be the last call BEFORE
     report_result: Nextcloud's setTaskProgress resets a finished task
     back to RUNNING, so a ping after the result resurrects it as a
-    zombie (observed live live: output stored, status RUNNING)."""
+    zombie (observed live: output stored, status RUNNING)."""
     fake, _calls = deck_scheduler()
     monkeypatch.setattr(task_worker, "schedule_and_wait", fake)
     nc, api = make_fake_nc()
@@ -2198,7 +2200,7 @@ def test_done_progress_precedes_reported_result(monkeypatch) -> None:
 
 def test_stalled_nested_round_is_rescheduled_once(monkeypatch) -> None:
     """A nested round whose inner task stalls into the round timeout (the
-    executor hiccup observed live live: inner task RUNNING at
+    executor hiccup observed live: inner task RUNNING at
     progress 0 forever) is rescheduled once on a fresh task id instead
     of failing the deck - a task survived exactly this stall live."""
     stream, calls = deck_scheduler()
@@ -2222,7 +2224,7 @@ def test_stalled_nested_round_is_rescheduled_once(monkeypatch) -> None:
 
 def test_double_stalled_nested_round_survives(monkeypatch) -> None:
     """Two consecutive stalls of the same inner round (observed live on a
-    hosted OpenRouter-class provider: 3 of 8 benign decks died exactly
+    hosted shared-quota provider: 3 of 8 benign decks died exactly
     here, after the single reschedule also stalled) still get fresh task
     ids; the failure surfaces only after the third consecutive stall."""
     stream, calls = deck_scheduler()

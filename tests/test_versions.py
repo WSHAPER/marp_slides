@@ -1,3 +1,5 @@
+# SPDX-FileCopyrightText: 2026 WSHAPER <42714629+WSHAPER@users.noreply.github.com>
+# SPDX-License-Identifier: AGPL-3.0-or-later
 """Version consistency: settings constant, appinfo/info.xml version and the
 docker image-tag must agree (deployments pull the image tag the manifest
 advertises, so a drifted tag deploys the wrong image)."""

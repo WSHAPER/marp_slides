@@ -1,3 +1,5 @@
+# SPDX-FileCopyrightText: 2026 WSHAPER <42714629+WSHAPER@users.noreply.github.com>
+# SPDX-License-Identifier: AGPL-3.0-or-later
 """Task type and provider definitions for the marp_slides ExApp.
 
 Pure data, as module-level constants in the shape nc_py_api expects: the

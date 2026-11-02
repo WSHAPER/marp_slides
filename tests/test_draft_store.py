@@ -1,3 +1,5 @@
+# SPDX-FileCopyrightText: 2026 WSHAPER <42714629+WSHAPER@users.noreply.github.com>
+# SPDX-License-Identifier: AGPL-3.0-or-later
 """Tests for the draft checkpoint store: the frozen quartet (round-trip,
 atomicity, defaults/prune policy, shipped-literal pins) plus corruption
 and orphan handling. The store is pure disk + JSON: no Nextcloud, no

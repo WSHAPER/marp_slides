@@ -1,3 +1,5 @@
+# SPDX-FileCopyrightText: 2026 WSHAPER <42714629+WSHAPER@users.noreply.github.com>
+# SPDX-License-Identifier: AGPL-3.0-or-later
 """Native editable PPTX builder: golden structure per supported construct,
 rejection of every unsupported construct, and read-back integrity."""
 

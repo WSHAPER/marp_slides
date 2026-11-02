@@ -1,4 +1,6 @@
 #!/usr/bin/env python3
+# SPDX-FileCopyrightText: 2026 WSHAPER <42714629+WSHAPER@users.noreply.github.com>
+# SPDX-License-Identifier: AGPL-3.0-or-later
 """LibreOffice-headless render check for built PPTX decks.
 
 The true-render proxy: convert a built PPTX to PDF with the Collabora CODE

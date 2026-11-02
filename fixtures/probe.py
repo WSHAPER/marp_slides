@@ -1,3 +1,5 @@
+# SPDX-FileCopyrightText: 2026 WSHAPER <42714629+WSHAPER@users.noreply.github.com>
+# SPDX-License-Identifier: AGPL-3.0-or-later
 """In-container real-code probe for the full element set + file-id
 images (source retention is worker plumbing; its uploads are pinned
 by tests/test_task_plumbing.py).

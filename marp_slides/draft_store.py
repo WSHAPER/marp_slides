@@ -1,3 +1,5 @@
+# SPDX-FileCopyrightText: 2026 WSHAPER <42714629+WSHAPER@users.noreply.github.com>
+# SPDX-License-Identifier: AGPL-3.0-or-later
 """Deck draft checkpoints: crash-failure retention and resume support.
 
 The deck-generation pipeline authors a deck as one outline plus N
@@ -8,7 +10,7 @@ slide lands in: a JSON document per draft, atomic-written on the ExApp's
 persistent volume, so a follow-up task carrying ``draft_id`` resumes
 from the checkpoint instead of starting from zero.
 
-Sizing/atomicity contract (the pattern ppt-agent validated): each write
+Sizing/atomicity contract: each write
 goes to ``<draft_id>.json.tmp`` first, is parsed back as JSON to prove
 it is complete, and only then replaces the target via rename. A crash
 mid-write leaves at most an orphan ``.tmp`` (never read, discarded on

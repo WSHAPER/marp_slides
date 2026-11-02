@@ -1,3 +1,5 @@
+# SPDX-FileCopyrightText: 2026 WSHAPER <42714629+WSHAPER@users.noreply.github.com>
+# SPDX-License-Identifier: AGPL-3.0-or-later
 """Inline Markdown parsing into styled runs.
 
 A shared ``MarkdownIt("commonmark")`` instance tokenizes each line — three
@@ -84,7 +86,7 @@ _REJECT_SCAN_RE = re.compile(
 )
 
 #: Reference-style links inside literal text tokens (markdown-it never sees
-#: a reference without ``env.references``, which we deliberately do not pass:
+#: a reference without ``env.references``, which are deliberately not passed:
 #: resolution keeps today's semantics via the deck-collected ``refs`` dict).
 _REF_RE = re.compile(r"\[(?P<ref_label>[^\]\n]+)\]\[(?P<ref_id>[^\]\n]*)\]")
 

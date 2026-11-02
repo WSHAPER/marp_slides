@@ -1,3 +1,5 @@
+# SPDX-FileCopyrightText: 2026 WSHAPER <42714629+WSHAPER@users.noreply.github.com>
+# SPDX-License-Identifier: AGPL-3.0-or-later
 """Registration contract: task type, provider, multi-value ENUM output_format
 and theme slots, LIST_OF_FILES images slot, optional slide_deck_source output."""
 

@@ -1,3 +1,5 @@
+# SPDX-FileCopyrightText: 2026 WSHAPER <42714629+WSHAPER@users.noreply.github.com>
+# SPDX-License-Identifier: AGPL-3.0-or-later
 """Slide-fit measurement contract: the overflow report and its message.
 
 The measurement itself (render one slide's Marp Markdown through marp,

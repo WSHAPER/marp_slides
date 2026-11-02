@@ -117,7 +117,7 @@ max-branches = 9
 # Strict on the application surface. nc_py_api ships no py.typed marker
 # (checked: 0.30.3), so its imports resolve to Any behind an override.
 # PyYAML gets real typeshed stubs via types-PyYAML (dev).
-# tests/ are covered by the ruff gate + 401 tests, not by strict
+# tests/ are covered by the ruff gate + the full test suite, not by strict
 # typing: backfilling annotations across thousands of lines of fakes was
 # measured and rejected as churn without defect classes.
 python_version = "3.11"

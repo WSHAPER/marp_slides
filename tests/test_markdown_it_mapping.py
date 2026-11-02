@@ -1,3 +1,5 @@
+# SPDX-FileCopyrightText: 2026 WSHAPER <42714629+WSHAPER@users.noreply.github.com>
+# SPDX-License-Identifier: AGPL-3.0-or-later
 """markdown-it token mapping: nesting goldens (links/code inside emphasis,
 emphasis inside link labels), rejections firing inside emphasis, and the
 migration's own hazard spots (reference links under emphasis, control-char
@@ -58,16 +60,16 @@ def _slide(body: str) -> ParsedSlide:
 def test_golden_link_nested_in_bold_runs_render() -> None:
     deck = (
         "---\nmarp: true\n---\n\n## V\n\n"
-        "**[Velodrome de Vincennes](https://en.wikipedia.org/wiki/Velodrome_de_Vincennes)**\n"
+        "**[Reference Architecture](https://en.wikipedia.org/wiki/Reference_architecture)**\n"
     )
     prs = _build(deck)
     para = prs.slides[0].placeholders[1].text_frame.paragraphs[0]
     # one run carrying bold AND the native hyperlink
     assert [(r.text, r.font.bold, r.hyperlink.address) for r in para.runs] == [
         (
-            "Velodrome de Vincennes",
+            "Reference Architecture",
             True,
-            "https://en.wikipedia.org/wiki/Velodrome_de_Vincennes",
+            "https://en.wikipedia.org/wiki/Reference_architecture",
         )
     ]
 

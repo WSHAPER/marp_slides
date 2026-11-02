@@ -1,3 +1,5 @@
+# SPDX-FileCopyrightText: 2026 WSHAPER <42714629+WSHAPER@users.noreply.github.com>
+# SPDX-License-Identifier: AGPL-3.0-or-later
 """Pure, unit-testable deck pipeline.
 
 Everything in here is free of Nextcloud I/O: the deck-authoring system

@@ -1,3 +1,5 @@
+# SPDX-FileCopyrightText: 2026 WSHAPER <42714629+WSHAPER@users.noreply.github.com>
+# SPDX-License-Identifier: AGPL-3.0-or-later
 """Background task worker: claim marp_slides tasks, author + build the deck,
 report the result.
 
@@ -213,7 +215,7 @@ _WORKER_THREAD: threading.Thread | None = None
 
 
 def trigger_handler(provider_id: str) -> None:
-    """Called by AppAPI when a task is queued for our provider: wake the poll loop."""
+    """Called by AppAPI when a task is queued for this provider: wake the poll loop."""
     LOGGER.debug("Task processing trigger received (provider %s)", provider_id)
     TP_TRIGGER.set()
 
@@ -267,7 +269,7 @@ def _log_deck_failure(
 #: How many times a stalled inner round (claimed by the executor but
 #: never progressing until the round timeout) is rescheduled on a fresh
 #: task id before the failure surfaces. Measured on a hosted
-#: OpenRouter-class provider: single stalls are frequent transient
+#: shared-quota provider: single stalls are frequent transient
 #: executor state, and surfacing the failure after the SECOND consecutive
 #: stall killed 3 of 8 benign decks whose other rounds were healthy.
 _STALL_RESCHEDULE_LIMIT = 2
@@ -837,7 +839,7 @@ _FIT_BLOCK_RE = re.compile(
 
 def _fence_spans(lines: list[str]) -> list[tuple[int, int]] | None:
     """The (open, close) line-index spans of every code fence, or None
-    when a fence never closes (refuse to split a deck we cannot see
+    when a fence never closes (refusing to split a deck that cannot be seen
     whole)."""
     spans: list[tuple[int, int]] = []
     open_idx: int | None = None

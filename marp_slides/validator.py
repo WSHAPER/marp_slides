@@ -1,3 +1,5 @@
+# SPDX-FileCopyrightText: 2026 WSHAPER <42714629+WSHAPER@users.noreply.github.com>
+# SPDX-License-Identifier: AGPL-3.0-or-later
 """Deck validation: the authoritative gate before any render or build.
 
 Marpit never fails on malformed frontmatter; it silently drops directives.

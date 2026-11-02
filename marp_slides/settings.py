@@ -1,3 +1,5 @@
+# SPDX-FileCopyrightText: 2026 WSHAPER <42714629+WSHAPER@users.noreply.github.com>
+# SPDX-License-Identifier: AGPL-3.0-or-later
 """Environment-driven settings and immutable contract constants for the marp_slides ExApp."""
 
 from __future__ import annotations
@@ -62,7 +64,7 @@ DEFAULT_LLM_TIMEOUT_S = 300
 #: Total cap across every inner-LLM round of the two-phase pipeline
 #: (the outline plus each slide, first attempts and retries alike).
 #: Measured on a local qwen3.8-9b: ~70 s for the outline plus 40-70 s
-#: per slide. A hosted research/shared-quota provider (OpenRouter-class)
+#: per slide. A hosted research/shared-quota provider (shared-quota)
 #: runs 2-6x slower per round with occasional multi-minute stalls, and
 #: the 900 s cap calibrated on the local model killed benign 6-8 slide
 #: decks mid-authoring (measured live: 6 of 8 benign decks); 1800 s

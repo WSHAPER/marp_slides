@@ -1,3 +1,5 @@
+# SPDX-FileCopyrightText: 2026 WSHAPER <42714629+WSHAPER@users.noreply.github.com>
+# SPDX-License-Identifier: AGPL-3.0-or-later
 """The marp-cli wrapper: strict conversions through one code path.
 
 Every marp conversion (the browserless syntax gate, the standalone-HTML
@@ -331,8 +333,8 @@ def _marp_convert(  # noqa: PLR0913 - the single conversion path: 7 fixed
     against ``marp --help``). ONLY the html/pdf render conversions ever set
     it, and only when the deck's ``#file:N`` images were materialized into
     ``workdir`` first. The containment argument: the workdir is a throwaway
-    TemporaryDirectory whose only content is files we ourselves wrote (the
-    validated deck Markdown, the strict ``.marprc``, our own downloaded,
+    TemporaryDirectory whose only content is files written by this app (the
+    validated deck Markdown, the strict ``.marprc``, the app's own downloaded,
     type-sniffed, size-capped image blobs, and the generated theme CSS), so
     the path-traversal class the flag guards against has no attack surface
     here. The browserless syntax gate never sets it and keeps running
@@ -555,7 +557,7 @@ def _run_chrome_dump(
     dump wait for the page's pending loads (fonts, images) before
     serializing, so the injected script's marker node is present.
     ``--no-sandbox`` matches how the base image's puppeteer launches
-    Chromium inside the container; the page is our own validated deck
+    Chromium inside the container; the page is the app's own validated deck
     render, not third-party HTML. ``--window-size`` keeps any
     viewport-width media queries evaluating at slide width."""
     argv = [
@@ -665,7 +667,7 @@ def _numbered_metrics(
     renumber from one. Layered renders never reach the error: their
     extra sections collapse into slide groups first (see
     :func:`_grouped_content_metrics`). Any other count disagreement
-    means the render is not the deck we were handed."""
+    means the render is not the deck that was handed in."""
     slides = count_slides(markdown)
     content = _grouped_content_metrics(metrics)
     if len(content) == slides:

@@ -1,3 +1,5 @@
+# SPDX-FileCopyrightText: 2026 WSHAPER <42714629+WSHAPER@users.noreply.github.com>
+# SPDX-License-Identifier: AGPL-3.0-or-later
 """Slide-body parsing: a markdown-it block-token walk over the slide lines.
 
 The shared ``MarkdownIt`` instance (owned by :mod:`marp_slides.inline`)

@@ -1,3 +1,5 @@
+# SPDX-FileCopyrightText: 2026 WSHAPER <42714629+WSHAPER@users.noreply.github.com>
+# SPDX-License-Identifier: AGPL-3.0-or-later
 """Deliver deck artifacts into the scheduling user's Files.
 
 Two delivery surfaces share one write path (app-context DAV

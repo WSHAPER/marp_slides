@@ -13,7 +13,7 @@
  * measurement page KEEPS the script blocks marp-cli itself inlined. The
  * strict conversion (html: false plus --no-html) renders any script tag
  * authored in the deck markdown as escaped text, so every script element
- * in the render comes from our own marp invocation, and two of them are
+ * in the render comes from this app's own marp invocation, and two of them are
  * load-bearing for measurement: the marp-core browser bundle upgrades the
  * customized built-in elements (pre is="marp-pre", h1 is="marp-h1", ...)
  * whose auto-scaling shrinks wide code blocks and fit headings. Stripping

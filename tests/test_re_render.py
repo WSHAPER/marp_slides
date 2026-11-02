@@ -1,3 +1,5 @@
+# SPDX-FileCopyrightText: 2026 WSHAPER <42714629+WSHAPER@users.noreply.github.com>
+# SPDX-License-Identifier: AGPL-3.0-or-later
 """The deterministic re-render task type: registration shape, validation
 passthrough (the SAME validator, same rules, same error messages as the
 authoring pipeline), rendering for each output format, and the
