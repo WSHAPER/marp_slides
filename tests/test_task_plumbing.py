@@ -23,7 +23,11 @@ import pytest
 from PIL import Image
 
 from marp_slides import task_worker
-from marp_slides.deck_pipeline import DeckError, _OverflowMeasurementError
+from marp_slides.deck_pipeline import (
+    DeckError,
+    _OverflowMeasurementError,
+    validate_deck,
+)
 from marp_slides.draft_store import (
     SLIDE_DONE,
     SLIDE_FAILED,
@@ -139,13 +143,29 @@ class FakeTaskProcessingAPI:
 
 
 class FakeFilesAPI:
-    def __init__(self, nodes: dict[int, object], blobs: dict[int, bytes]) -> None:
-        self._nodes = nodes
-        self._blobs = blobs
+    def __init__(
+        self,
+        nodes: dict[int, object] | None = None,
+        blobs: dict[int, bytes] | None = None,
+        by_path_nodes: dict[str, object] | None = None,
+    ) -> None:
+        self._nodes = nodes or {}
+        self._blobs = blobs or {}
+        # by_path answers for every node that carries a user_path (the
+        # path-verified original lookup the delivery rewrite runs), with
+        # explicit entries winning
+        self._by_path: dict[str, object] = dict(by_path_nodes or {})
+        for node in self._nodes.values():
+            path = getattr(node, "user_path", None)
+            if path and path not in self._by_path:
+                self._by_path[path] = node
         self.downloaded: list[int] = []
 
     def by_id(self, file_id: int):
         return self._nodes.get(file_id)
+
+    def by_path(self, path: str):
+        return self._by_path.get(path)
 
     def download(self, node) -> bytes:
         self.downloaded.append(node.file_id)
@@ -158,12 +178,20 @@ def fake_node(
     mimetype: str = "image/png",
     size: int | None = None,
     name: str | None = None,
+    path: str | None = None,
+    no_path: bool = False,
 ):
+    """A files node; by default it sits at a VERIFIABLE user path
+    ('Photos/<id>.<ext>', answered by FakeFilesAPI.by_path), so delivery
+    references the original file. ``no_path=True`` strips the path (the
+    unverifiable-original case)."""
     blob = png_bytes()
+    extension = mimetype.rsplit("/", 1)[-1]
     return SimpleNamespace(
         file_id=file_id,
         name=name or f"{file_id}.png",
         is_dir=False,
+        user_path=None if no_path else (path or f"Photos/{file_id}.{extension}"),
         info=SimpleNamespace(
             mimetype=mimetype, content_length=len(blob) if size is None else size
         ),
@@ -176,15 +204,17 @@ def make_fake_nc(
 ) -> tuple[SimpleNamespace, FakeTaskProcessingAPI]:
     """The fake app client: task-processing + files APIs and the session
     capabilities dict (defaulting to empty; ``capabilities["theming"]`` is
-    what the branded-theme fetch reads)."""
+    what the branded-theme fetch reads). ``nc.impersonated`` records every
+    set_user call (the DAV impersonation the delivery and the path
+    resolution ride)."""
     api = FakeTaskProcessingAPI()
+    impersonated: list[str] = []
     nc = SimpleNamespace(
         providers=SimpleNamespace(task_processing=api),
         files=files,
         capabilities=capabilities if capabilities is not None else {},
-        set_user=lambda user_id: (
-            None
-        ),  # impersonation: recorded implicitly, DAV auth models it
+        impersonated=impersonated,
+        set_user=impersonated.append,
     )
     return nc, api
 
@@ -1457,6 +1487,65 @@ def test_success_with_images_downloads_and_builds_with_blobs(
     assert built["images"] == {1: blob}  # 1-based position -> downloaded bytes
     assert files.downloaded == [101]  # only the referenced file was fetched
     assert api.uploads[0][1][1] == b"PK-with-picture"
+
+
+def test_delivered_source_references_verified_originals(settings) -> None:
+    """The delivery-side rewrite: the .md written to the owner's Files
+    references the user's ORIGINAL image by its deck-folder-relative path
+    (percent-encoded), no copy is written, and nothing is re-downloaded —
+    the render fetch was already enough. '#file:N' survives only in the
+    appdata task output, never in the delivered source."""
+    blob = png_bytes()
+    node = fake_node(101, path="Photos/my cat.png")
+    files = FakeFilesAPI({101: node}, {101: blob})
+    nc, _api = make_fake_nc(files=files)
+    markdown = "---\nmarp: true\ntitle: t\n---\n\n# T\n\n![The diagram](#file:1)\n"
+    deck = validate_deck(markdown).deck
+    delivered, copies = task_worker._delivered_source_and_copies(
+        nc, "alice", settings, 5, markdown, [101], deck, "Quarterly-Review"
+    )
+    assert copies == []
+    assert "![The diagram](../../Photos/my%20cat.png)" in delivered
+    assert "#file:" not in delivered
+    assert files.downloaded == []  # the original is referenced, not copied
+    assert nc.impersonated == ["alice"]
+
+
+def test_delivered_source_falls_back_to_copies(settings) -> None:
+    """An image whose original cannot be verified for the owner (a share
+    whose path lives elsewhere) ships self-contained: the blob is copied
+    beside the deck as '<stem>-img-<N>.<ext>' and the delivered source
+    references the copy's bare name."""
+    blob = png_bytes()
+    node = fake_node(101, no_path=True)
+    files = FakeFilesAPI({101: node}, {101: blob})
+    nc, _api = make_fake_nc(files=files)
+    markdown = "---\nmarp: true\ntitle: t\n---\n\n# T\n\n![The diagram](#file:1)\n"
+    deck = validate_deck(markdown).deck
+    delivered, copies = task_worker._delivered_source_and_copies(
+        nc, "alice", settings, 5, markdown, [101], deck, "Quarterly-Review"
+    )
+    assert copies == [("Quarterly-Review-img-1.png", blob, "image/png")]
+    assert "![The diagram](Quarterly-Review-img-1.png)" in delivered
+    assert files.downloaded == [101]  # the copy's bytes were fetched
+
+
+def test_delivered_source_keeps_file_refs_when_resolution_fails(
+    settings, caplog
+) -> None:
+    """Fail-soft like every delivery step: with the files API unable to
+    answer at all, the delivered source keeps '#file:N' verbatim (the
+    re-render degrade path still catches it) and nothing rides along."""
+    caplog.set_level("WARNING", logger="marp_slides.task_worker")
+    nc, _api = make_fake_nc(files=None)
+    markdown = "---\nmarp: true\ntitle: t\n---\n\n# T\n\n![The diagram](#file:1)\n"
+    deck = validate_deck(markdown).deck
+    delivered, copies = task_worker._delivered_source_and_copies(
+        nc, "alice", settings, 5, markdown, [101], deck, "Quarterly-Review"
+    )
+    assert delivered is markdown
+    assert copies == []
+    assert "keeps '#file:N'" in caplog.text
 
 
 def test_outline_without_image_marks_repaired_before_slides(

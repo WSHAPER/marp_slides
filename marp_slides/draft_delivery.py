@@ -28,7 +28,11 @@ system tag applied best-effort, fail-soft on every problem):
   unchanged) and multiple decks never pool into one flat folder. The
   names are the appdata file names themselves
   (``<stem>.pptx``/``<stem>.html``/``<stem>.pdf`` and ``<stem>.md``),
-  overwritten in place on every re-run of the same deck.
+  overwritten in place on every re-run of the same deck. The .md arrives
+  with its ``#file:N`` image references ALREADY rewritten to real Files
+  paths by the task worker (the mapping lives beside the ``#file:N``
+  grammar in :mod:`marp_slides.images`, which sits above this module in
+  the import layers); this module only writes bytes.
 
 The write rides the app-context DAV impersonation the image downloads
 already use (``nc.set_user`` stamps every request with the

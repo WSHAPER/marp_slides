@@ -246,7 +246,8 @@ RE_RENDER_PROVIDER = TaskProcessingProvider(
                 "Pick the deck's Markdown source from your Files (the .md "
                 "delivered alongside the deck, or any Marp Markdown file). "
                 "Its content is rendered as-is: no AI generation, every "
-                "slide renders exactly as written."
+                "slide renders exactly as written. Images it references "
+                "by their Files path resolve from your Files."
             ),
             shape_type=ShapeType.FILE,
         ),
@@ -258,9 +259,11 @@ RE_RENDER_PROVIDER = TaskProcessingProvider(
         ShapeDescriptor(
             name="file_references",
             description=(
-                "Optional Nextcloud files the markdown references as images "
-                "with '#file:N' (PNG or JPEG, max 5 MB each; SVG is not "
-                "supported)."
+                "Optional override images for the markdown's '#file:N' "
+                "references (PNG or JPEG, max 5 MB each; SVG is not "
+                "supported). Images referenced by their Files path resolve "
+                "automatically; a '#file:N' reference with no provided "
+                "image is dropped and the deck renders without it."
             ),
             shape_type=ShapeType.LIST_OF_FILES,
         ),

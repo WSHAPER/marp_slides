@@ -83,11 +83,18 @@ worker enforces exactly-one-of before any render work, and when both ride
 along the FILE wins (picking a concrete artifact is the more deliberate
 choice). The file content downloads through the same app-context
 by_id/download path the images use, decodes as UTF-8 text and then flows
-through the identical validate -> render path. Its ``#file:N``
-image references resolve against the optional ``file_references`` input
-(LIST_OF_FILES, the same shape and the same rules as the authoring task's
-``images`` slot), so a re-render can reference Files images that were not
-part of the original task.
+through the identical validate -> render path. Its image references
+arrive in two forms: real Files paths (the delivered .md's form) resolve
+through the owner's Files into the pipeline-internal ``#file:N`` before
+validation, and plain ``#file:N`` references index the optional
+``file_references`` input (LIST_OF_FILES, the same shape and the same
+rules as the authoring task's ``images`` slot). A reference with no
+resolvable image never fails the re-render: it strips with a logged
+warning and the deck renders without that image — the owner is never
+locked out of their own deck. The .md DELIVERED into Files references
+images by their real paths (the original file when it verifiably
+resolves for the owner, a copy beside the deck otherwise), so it is
+usable in a text editor and meaningful outside the pipeline.
 
 Draft checkpoints make the authoring pipeline resumable: with drafts
 enabled (``MARP_SLIDES_DRAFTS_ENABLED=false`` turns it off), every
@@ -112,10 +119,11 @@ from __future__ import annotations
 
 import json
 import logging
+import posixpath
 import re
 import tempfile
 import threading
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from contextlib import suppress
 from dataclasses import replace
 from math import ceil
@@ -161,8 +169,12 @@ from .draft_store import (
 )
 from .editable_pptx import ParsedDeck, build_pptx
 from .images import (
+    convert_path_references,
     fetch_image_blobs,
     referenced_image_indices,
+    resolve_delivered_image_paths,
+    rewrite_source_to_paths,
+    strip_image_references,
     validate_image_references,
     validate_images_slot,
 )
@@ -1524,7 +1536,9 @@ def _resume_input_with_draft_file(
     if raw is None:
         return task_input
     file_id = _file_input_id(raw, "draft_file")
-    name, text = _download_text_file(nc, file_id, "draft_file", settings.max_deck_bytes)
+    name, text, _parent_dir = _download_text_file(
+        nc, file_id, "draft_file", settings.max_deck_bytes
+    )
     match = _DRAFT_FILE_ID_RE.search(text)
     if match is None:
         raise DeckError(
@@ -1730,7 +1744,10 @@ def _author_validated_deck(
 
 
 def _fetch_deck_images(
-    nc: NextcloudApp, task_id: int, deck: ParsedDeck, image_file_ids: list[int]
+    nc: NextcloudApp,
+    task_id: int,
+    deck: ParsedDeck,
+    image_file_ids: Sequence[int | str],
 ) -> dict[int, bytes]:
     """Download every image the deck references (shared by all three output
     formats: the native PPTX build inserts the blobs as pictures, the
@@ -1763,12 +1780,15 @@ def _file_input_id(raw: object, slot: str) -> int:
 
 def _download_text_file(
     nc: NextcloudApp, file_id: int, slot: str, max_bytes: int
-) -> tuple[str, str]:
+) -> tuple[str, str, str]:
     """Download one picked file's content as UTF-8 text through the same
     app-context ``nc.files.by_id`` + ``nc.files.download`` mechanism
     :func:`marp_slides.images.fetch_image_blobs` uses (the id was already
     access-checked server-side at schedule time; the worker only
-    downloads). Returns ``(name, text)``; every failure raises DeckError
+    downloads). Returns ``(name, text, parent_dir)`` — the parent dir is
+    the picked file's folder in the owner's Files (``FsNode.user_path``
+    minus the basename, empty when unknown), the base relative image
+    paths in the source resolve against. Every failure raises DeckError
     with an actionable message (an input-data failure, never retried).
     The server's mimetype is deliberately NOT enforced: Files stores .md
     as text/markdown, but a renamed or extensionless Markdown source is
@@ -1787,6 +1807,9 @@ def _download_text_file(
             "not a Markdown file. Pick a file instead."
         )
     name = str(getattr(node, "name", file_id))
+    parent_dir = posixpath.dirname(
+        str(getattr(node, "user_path", "") or "").strip().strip("/")
+    )
     reported_size = node.info.content_length
     if reported_size > max_bytes:
         raise DeckError(
@@ -1808,7 +1831,7 @@ def _download_text_file(
             "it cannot be read as Markdown. Pick the matching .md file "
             "from your Files."
         ) from exc
-    return name, text
+    return name, text, parent_dir
 
 
 def _input_deck_markdown(value: object) -> str:
@@ -1832,7 +1855,7 @@ def _re_render_source_markdown(
     task_input: Mapping[str, Any],
     settings: Settings,
     task_id: int,
-) -> str:
+) -> tuple[str, str]:
     """Resolve the re-render deck source: exactly one of the optional
     ``markdown`` text input and the optional ``deck_source_file`` file
     input, BEFORE any render work. Both empty fails with the actionable
@@ -1840,11 +1863,13 @@ def _re_render_source_markdown(
     concrete artifact from Files is the more deliberate choice). The file
     content decodes as UTF-8 text and passes the same non-empty gate as
     the text input, so what flows onward is byte-identical regardless of
-    which input carried it."""
+    which input carried it. Returns ``(markdown, source_dir)`` — the
+    picked file's folder ('' for the text input or when unknown), the
+    base relative image paths in the source resolve against."""
     raw_file = task_input.get("deck_source_file")
     if raw_file is not None:
         file_id = _file_input_id(raw_file, "deck_source_file")
-        name, text = _download_text_file(
+        name, text, parent_dir = _download_text_file(
             nc, file_id, "deck_source_file", settings.max_deck_bytes
         )
         if not text.strip():
@@ -1859,8 +1884,8 @@ def _re_render_source_markdown(
             name,
             file_id,
         )
-        return text.strip()
-    return _input_deck_markdown(task_input.get("markdown"))
+        return text.strip(), parent_dir
+    return _input_deck_markdown(task_input.get("markdown")), ""
 
 
 def _re_render_file_ids(task_input: Mapping[str, Any]) -> list[int]:
@@ -1887,10 +1912,18 @@ def _re_render_deck(
     validation (same rules, same error messages) and the SAME render phase
     as the authoring pipeline, minus the LLM call. The source is the
     ``markdown`` text or the ``deck_source_file`` file input (exactly one;
-    see :func:`_re_render_source_markdown`). One deliberate
-    difference from the authoring gate: image completeness is NOT required
-    here (the markdown is user-authored and may deliberately show only
-    some of the provided files); the bounds check still runs. No
+    see :func:`_re_render_source_markdown`). Image references arrive in
+    two forms and normalize to one before validation: path-form references
+    (the delivered .md's real Files paths) resolve through the task
+    owner's Files into ``#file:N`` (:func:`convert_path_references`), and
+    plain ``#file:N`` references index the ``file_references`` list. One
+    deliberate difference from the authoring gate: image completeness is
+    NOT required here (the markdown is user-authored and may deliberately
+    show only some of the provided files); the bounds check still runs,
+    and a reference with NO resolvable image at all degrades — the
+    reference is stripped with a logged warning and the deck renders
+    without that image — because failing the whole re-render over one
+    missing image would lock the owner out of their own deck. No
     authoring, no retry loop, no outline generation: a deck that fails
     validation fails the task with the validator's actionable message for
     the caller (human or chat LLM) to fix in the source. Returns the
@@ -1898,17 +1931,49 @@ def _re_render_deck(
     ``user_id`` (the task owner, threaded from process_task) gates the
     fail-soft Files delivery of the rendered files."""
     output_format = validate_output_format(task_input.get("output_format"))
-    image_file_ids = _re_render_file_ids(task_input)
-    markdown = _re_render_source_markdown(nc, task_input, settings, task_id)
+    file_reference_ids = _re_render_file_ids(task_input)
+    markdown, source_dir = _re_render_source_markdown(nc, task_input, settings, task_id)
 
     LOGGER.info(
         "Task %s: re-rendering submitted markdown source as %s", task_id, output_format
     )
     _report_progress(nc, task_id, 50.0, "validate")
+    markdown, resolved_ids, dropped_paths = convert_path_references(
+        nc,
+        markdown,
+        base_dir=source_dir or None,
+        user_id=user_id,
+        known_file_ids=file_reference_ids,
+    )
+    if dropped_paths:
+        LOGGER.warning(
+            "Task %s: %d image reference(s) in the deck source name Files "
+            "paths that do not resolve for %s; the deck renders without "
+            "those images",
+            task_id,
+            dropped_paths,
+            user_id or "the task owner",
+        )
+    image_file_ids: list[int | str] = [*file_reference_ids, *resolved_ids]
     validated = validate_deck(markdown, settings.max_deck_bytes, settings.max_slides)
-    # Bounds only, deliberately NOT require_complete: user-authored
-    # markdown may legitimately use only a subset of the provided files.
-    validate_image_references(validated.deck, image_file_ids)
+    if image_file_ids:
+        # Bounds only, deliberately NOT require_complete: user-authored
+        # markdown may legitimately use only a subset of the provided files.
+        validate_image_references(validated.deck, image_file_ids)
+    else:
+        stripped_markdown, removed = strip_image_references(markdown)
+        if removed:
+            LOGGER.warning(
+                "Task %s: the deck source references %d image(s) as "
+                "'#file:N' but no file_references were provided; rendering "
+                "without images",
+                task_id,
+                removed,
+            )
+            markdown = stripped_markdown
+            validated = validate_deck(
+                markdown, settings.max_deck_bytes, settings.max_slides
+            )
 
     # "all" expands like the authoring pipeline; every render and upload
     # precedes the single result report (render phases ping progress, and
@@ -1936,7 +2001,16 @@ def _re_render_deck(
         rendered.append((filename, file_bytes, mime_type))
     # fail-soft Files delivery, never pinged around, always before the
     # result report (the zombie constraint applies to it too)
-    _deliver_deck_files(nc, user_id, settings, task_id, rendered, markdown)
+    _deliver_deck_files(
+        nc,
+        user_id,
+        settings,
+        task_id,
+        rendered,
+        markdown,
+        image_file_ids,
+        validated.deck,
+    )
     _report_deck_result(nc, task_id, deck_files, markdown)
     return markdown
 
@@ -1981,7 +2055,7 @@ def _render_deck_file(
     validated: ValidatedDeck,
     markdown: str,
     output_format: str,
-    image_file_ids: list[int],
+    image_file_ids: Sequence[int | str],
     settings: Settings,
 ) -> tuple[bytes, str]:
     """The render phase SHARED by both task types: turn a validated deck
@@ -2127,6 +2201,8 @@ def _deliver_deck_files(
     task_id: int,
     rendered: list[tuple[str, bytes, str]],
     markdown: str,
+    image_file_ids: Sequence[int | str] = (),
+    deck: ParsedDeck | None = None,
 ) -> None:
     """Fail-soft delivery of the generated deck files plus the deck's
     Markdown source into the task owner's Files (a per-deck subdirectory
@@ -2139,11 +2215,21 @@ def _deliver_deck_files(
     otherwise); the source entry is precomputed here exactly the way
     ``_report_deck_result`` names its own source upload
     (``<stem>.md`` off the first rendered file, same bytes), and that
-    same stem is the delivery subdirectory. MUST run BEFORE
-    :func:`_report_deck_result` and NEVER ping progress around itself:
-    a progress ping after the result report would resurrect the finished
-    task as a RUNNING zombie. Delivery problems only log; they never
-    affect the task's outcome or its reported outputs."""
+    same stem is the delivery subdirectory.
+
+    The DELIVERED .md references images by real Files paths, not the
+    pipeline-internal ``#file:N`` (the appdata task output keeps
+    ``#file:N``): with ``deck`` and ``image_file_ids`` given,
+    :func:`_delivered_source_and_copies` rewrites every referenced image
+    to the user's ORIGINAL file when it verifiably resolves for the owner
+    (a copy is delivered beside the deck otherwise, and a truly
+    unresolvable image keeps ``#file:N``).
+
+    MUST run BEFORE :func:`_report_deck_result` and NEVER ping progress
+    around itself: a progress ping after the result report would
+    resurrect the finished task as a RUNNING zombie. Delivery problems
+    only log; they never affect the task's outcome or its reported
+    outputs."""
     if not settings.deliveries_folder:
         return
     if not user_id:
@@ -2155,9 +2241,13 @@ def _deliver_deck_files(
     source_name = source_markdown_filename(rendered[0][0])
     deck_stem = source_name[: -len(".md")]
     delivery_folder = f"{settings.deliveries_folder}/{deck_stem}"
+    delivered_markdown, image_copies = _delivered_source_and_copies(
+        nc, user_id, settings, task_id, markdown, image_file_ids, deck, deck_stem
+    )
     files = [
         *rendered,
-        (source_name, markdown.encode("utf-8"), MARKDOWN_MIME_TYPE),
+        *image_copies,
+        (source_name, delivered_markdown.encode("utf-8"), MARKDOWN_MIME_TYPE),
     ]
     try:
         written = deliver_deck_files(
@@ -2189,6 +2279,64 @@ def _deliver_deck_files(
             delivery_folder,
             user_id,
         )
+
+
+def _delivered_source_and_copies(
+    nc: NextcloudApp,
+    user_id: str,
+    settings: Settings,
+    task_id: int,
+    markdown: str,
+    image_file_ids: Sequence[int | str],
+    deck: ParsedDeck | None,
+    deck_stem: str,
+) -> tuple[str, list[tuple[str, bytes, str]]]:
+    """The delivered .md text and the image copies it may need: every
+    referenced image rewrites to a real Files path (the user's ORIGINAL
+    file when it verifiably resolves for the owner, a copy delivered
+    beside the deck as the self-contained fallback). Fail-soft per the
+    delivery contract: on any problem the source keeps ``#file:N`` (the
+    re-render degrade path still catches that) and no copies ride
+    along."""
+    indices = referenced_image_indices(deck) if deck is not None else []
+    if not indices or not image_file_ids:
+        return markdown, []
+    try:
+        paths, copies = resolve_delivered_image_paths(
+            nc,
+            user_id,
+            settings.deliveries_folder,
+            deck_stem,
+            image_file_ids,
+            indices,
+        )
+    except Exception as exc:  # noqa: BLE001 - fail-soft by contract: delivery must never affect the task
+        LOGGER.warning(
+            "Task %s: the delivered deck source keeps '#file:N' references; "
+            "resolving the referenced images to Files paths failed (%s)",
+            task_id,
+            exc,
+        )
+        return markdown, []
+    if not paths:
+        LOGGER.warning(
+            "Task %s: the delivered deck source keeps '#file:N' references; "
+            "no referenced image resolved to a Files path",
+            task_id,
+        )
+        return markdown, []
+    LOGGER.info(
+        "Task %s: the delivered deck source references %d image(s) by their "
+        "Files path(s)%s",
+        task_id,
+        len(paths),
+        (
+            f"; {len(copies)} image copy(ies) delivered beside the deck"
+            if copies
+            else ""
+        ),
+    )
+    return rewrite_source_to_paths(markdown, paths), copies
 
 
 def _report_deck_result(
@@ -2532,7 +2680,16 @@ def _generate_deck(
         # the per-format bytes ride along for the owner's Files delivery
         # (they die with this loop otherwise)
         rendered.append((filename, file_bytes, mime_type))
-    _deliver_deck_files(nc, user_id, settings, task_id, rendered, markdown)
+    _deliver_deck_files(
+        nc,
+        user_id,
+        settings,
+        task_id,
+        rendered,
+        markdown,
+        image_file_ids,
+        validated.deck,
+    )
     _report_deck_result(nc, task_id, deck_files, markdown)
     return markdown
 

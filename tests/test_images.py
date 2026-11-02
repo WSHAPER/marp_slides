@@ -15,11 +15,15 @@ from PIL import Image
 from marp_slides.deck_pipeline import DeckError, validate_deck
 from marp_slides.images import (
     MAX_IMAGE_BYTES,
+    convert_path_references,
     fetch_image_blobs,
     materialize_image_files,
     referenced_image_indices,
+    resolve_delivered_image_paths,
     rewrite_file_references,
+    rewrite_source_to_paths,
     sniff_image_content_type,
+    strip_image_references,
     validate_image_references,
     validate_images_slot,
 )
@@ -49,11 +53,13 @@ def fake_node(
     mimetype: str = "image/png",
     size: int | None = None,
     name: str = "x.png",
+    path: str | None = None,
 ):
     return SimpleNamespace(
         file_id=file_id,
         name=name,
         is_dir=False,
+        user_path=path,
         info=SimpleNamespace(
             mimetype=mimetype,
             content_length=len(png_bytes()) if size is None else size,
@@ -62,21 +68,36 @@ def fake_node(
 
 
 class FakeFilesAPI:
-    def __init__(self, nodes: dict[int, object], blobs: dict[int, bytes]) -> None:
+    def __init__(
+        self,
+        nodes: dict[int, object],
+        blobs: dict[int, bytes],
+        by_path_nodes: dict[str, object] | None = None,
+    ) -> None:
         self._nodes = nodes
         self._blobs = blobs
+        self._by_path = dict(by_path_nodes or {})
         self.downloaded: list[int] = []
+        self.impersonated: list[str] = []
 
     def by_id(self, file_id: int):
         return self._nodes.get(file_id)
+
+    def by_path(self, path: str):
+        return self._by_path.get(path)
 
     def download(self, node) -> bytes:
         self.downloaded.append(node.file_id)
         return self._blobs[node.file_id]
 
 
-def make_fake_nc(nodes: dict[int, object], blobs: dict[int, bytes]) -> SimpleNamespace:
-    return SimpleNamespace(files=FakeFilesAPI(nodes, blobs))
+def make_fake_nc(
+    nodes: dict[int, object],
+    blobs: dict[int, bytes],
+    by_path_nodes: dict[str, object] | None = None,
+) -> SimpleNamespace:
+    files = FakeFilesAPI(nodes, blobs, by_path_nodes)
+    return SimpleNamespace(files=files, set_user=files.impersonated.append)
 
 
 def image_deck(*refs: str) -> object:
@@ -472,3 +493,271 @@ def test_materialize_preserves_inline_sizing_keyword() -> None:
     markdown = "---\nmarp: true\ntitle: t\n---\n\n# T\n\n![Diagram w:200px](#file:1)\n"
     rewritten = materialize_image_files(markdown, {1: blob})
     assert f"![Diagram w:200px]({uri})" in rewritten
+
+
+# --- the delivered Files-path form and its inverse -------------------------
+
+
+def path_nc(
+    nodes: dict[int, object], blobs: dict[int, bytes], by_path: dict[str, object]
+) -> SimpleNamespace:
+    return make_fake_nc(nodes, blobs, by_path)
+
+
+def test_strip_removes_own_line_and_background_references() -> None:
+    """The last-resort degrade: own-line '#file:N' constructs (bg lines
+    included) and the deck-wide backgroundImage line go away, everything
+    else stays byte-for-byte."""
+    markdown = (
+        "---\n"
+        "marp: true\n"
+        "title: t\n"
+        "backgroundImage: '#file:2'\n"
+        "---\n"
+        "\n"
+        "# T\n"
+        "\n"
+        "![img](#file:1)\n"
+        "\n"
+        "![bg cover](#file:2)\n"
+        "\n"
+        "Text stays.\n"
+    )
+    stripped, removed = strip_image_references(markdown)
+    assert removed == 3
+    assert "#file:" not in stripped
+    assert "backgroundImage" not in stripped
+    assert "# T" in stripped
+    assert "Text stays." in stripped
+
+
+def test_strip_never_touches_fences_or_comments_and_is_identity() -> None:
+    """A '#file:N' lookalike inside a fenced code block is literal code
+    content, inside a comment it is a speaker note: neither is a deck
+    image reference. With nothing to remove the ORIGINAL string comes
+    back (the caller skips re-validation on identity)."""
+    markdown = (
+        "---\nmarp: true\n---\n\n# T\n\n```\n![x](#file:1)\n```\n\n"
+        "<!-- note about ![x](#file:1) -->\n"
+    )
+    stripped, removed = strip_image_references(markdown)
+    assert removed == 0
+    assert stripped is markdown
+
+
+def test_convert_resolves_root_relative_paths() -> None:
+    node = fake_node(101, path="Photos/cat.png")
+    nc = path_nc({101: node}, {101: png_bytes()}, {"Photos/cat.png": node})
+    markdown = "---\nmarp: true\ntitle: t\n---\n\n# T\n\n![img](Photos/cat.png)\n"
+    converted, resolved, dropped = convert_path_references(
+        nc, markdown, user_id="alice"
+    )
+    assert converted == ("---\nmarp: true\ntitle: t\n---\n\n# T\n\n![img](#file:1)")
+    assert resolved == [101]
+    assert dropped == 0
+    assert nc.files.impersonated == ["alice"]
+
+
+def test_convert_resolves_relative_paths_against_the_deck_folder() -> None:
+    """The delivered .md references its images relative to its own folder
+    ('../../Photos/cat.png' from 'Marp Slides/Q/'): the base dir is what
+    makes the traversal-bearing reference resolve."""
+    node = fake_node(101, path="Photos/cat.png")
+    nc = path_nc({101: node}, {101: png_bytes()}, {"Photos/cat.png": node})
+    markdown = "---\nmarp: true\ntitle: t\n---\n\n# T\n\n![img](../../Photos/cat.png)\n"
+    converted, resolved, dropped = convert_path_references(
+        nc, markdown, base_dir="Marp Slides/Q", user_id="alice"
+    )
+    assert "# T\n\n![img](#file:1)" in converted
+    assert resolved == [101]
+    assert dropped == 0
+
+
+def test_convert_decodes_percent_encoding_and_dedups_positions() -> None:
+    """Delivered paths are percent-encoded (spaces); one image referenced
+    twice resolves ONCE and both constructs share its position."""
+    node = fake_node(101, path="Photos/my cat.png")
+    nc = path_nc({101: node}, {101: png_bytes()}, {"Photos/my cat.png": node})
+    markdown = (
+        "---\nmarp: true\ntitle: t\n---\n\n# T\n\n![a](Photos/my%20cat.png)\n\n"
+        "---\n\n## D\n\n![b](Photos/my%20cat.png)\n"
+    )
+    converted, resolved, dropped = convert_path_references(
+        nc, markdown, user_id="alice"
+    )
+    assert "![a](#file:1)" in converted
+    assert "![b](#file:1)" in converted
+    assert resolved == [101]
+    assert dropped == 0
+
+
+def test_convert_appends_after_known_ids_and_reuses_them() -> None:
+    """'#file:N' and path references share ONE index space: a path that
+    resolves to an already-provided id maps to its existing position, a
+    fresh id appends after the file_references list."""
+    node = fake_node(202, path="Photos/cat.png")
+    nc = path_nc({202: node}, {202: png_bytes()}, {"Photos/cat.png": node})
+    markdown = "---\nmarp: true\ntitle: t\n---\n\n# T\n\n![img](Photos/cat.png)\n"
+    converted, resolved, dropped = convert_path_references(
+        nc, markdown, user_id="alice", known_file_ids=[101, 202]
+    )
+    assert "![img](#file:2)" in converted  # 202 sits at position 2 already
+    assert resolved == []
+    assert dropped == 0
+
+
+def test_convert_drops_unresolvable_own_line_references() -> None:
+    """A path that no longer resolves (image deleted, share gone) degrades
+    to rendering without the image: the own-line construct and the
+    background directive drop, counted for the caller's warning."""
+    nc = path_nc({}, {}, {})
+    markdown = (
+        "---\n"
+        "marp: true\n"
+        "title: t\n"
+        "backgroundImage: 'url(Photos/gone.png)'\n"
+        "---\n"
+        "\n"
+        "# T\n"
+        "\n"
+        "![img](Gone/deleted.png)\n"
+    )
+    converted, resolved, dropped = convert_path_references(
+        nc, markdown, user_id="alice"
+    )
+    assert resolved == []
+    assert dropped == 2
+    assert "Gone/deleted.png" not in converted
+    assert "backgroundImage" not in converted
+    assert "# T" in converted
+
+
+def test_convert_leaves_inline_urls_schemes_and_internal_form_alone() -> None:
+    """The conversion is surgical: an inline path that does not resolve
+    stays for the strict validator's own rejection (as do scheme URLs,
+    titled links and the pipeline's '#file:N'); an inline path that DOES
+    resolve rewrites in place."""
+    node = fake_node(101, path="a.png")
+    nc = path_nc({101: node}, {101: png_bytes()}, {"a.png": node})
+    markdown = (
+        "---\nmarp: true\ntitle: t\n---\n\n# T\n\n"
+        "See ![x](a.png) here\n\n"
+        "Remote ![y](https://example.com/i.png) stays\n\n"
+        'Titled ![z](b.png "t") stays\n\n'
+        "Internal ![w](#file:1) stays\n"
+    )
+    converted, resolved, dropped = convert_path_references(
+        nc, markdown, user_id="alice"
+    )
+    assert "See ![x](#file:1) here" in converted
+    assert "![y](https://example.com/i.png) stays" in converted
+    assert '![z](b.png "t") stays' in converted
+    assert "![w](#file:1) stays" in converted
+    assert resolved == [101]
+    assert dropped == 0
+
+
+def test_convert_background_url_wrapper_and_quotes_unwrap() -> None:
+    node = fake_node(101, path="Photos/bg.png")
+    nc = path_nc({101: node}, {101: png_bytes()}, {"Photos/bg.png": node})
+    for value in ("'url(Photos/bg.png)'", '"url(Photos/bg.png)"'):
+        markdown = f"---\nmarp: true\ntitle: t\nbackgroundImage: {value}\n---\n\n# T\n"
+        converted, resolved, dropped = convert_path_references(
+            nc, markdown, user_id="alice"
+        )
+        assert "backgroundImage: '#file:1'" in converted
+        assert resolved == [101]
+        assert dropped == 0
+
+
+def test_convert_degenerate_background_values_never_crash() -> None:
+    """Empty or CSS-ish backgroundImage values ('url()', a gradient with
+    spaces) are not path-shaped and stay untouched for the strict
+    validator's own rejection; a single-token value IS path-shaped, so a
+    miss degrades like any unresolvable reference (dropped, counted,
+    never an internal error)."""
+    nc = path_nc({}, {}, {})
+    for value in ("'url()'", "''", "'linear-gradient(red, blue)'"):
+        markdown = f"---\nmarp: true\ntitle: t\nbackgroundImage: {value}\n---\n\n# T\n"
+        converted, resolved, dropped = convert_path_references(
+            nc, markdown, user_id="alice"
+        )
+        assert converted is markdown
+        assert resolved == []
+        assert dropped == 0
+    markdown = "---\nmarp: true\ntitle: t\nbackgroundImage: 'red'\n---\n\n# T\n"
+    converted, resolved, dropped = convert_path_references(
+        nc, markdown, user_id="alice"
+    )
+    assert "backgroundImage" not in converted
+    assert resolved == []
+    assert dropped == 1
+
+
+def test_convert_identity_when_nothing_matches() -> None:
+    nc = path_nc({}, {}, {})
+    markdown = "---\nmarp: true\ntitle: t\n---\n\n# T\n\nText only.\n"
+    converted, resolved, dropped = convert_path_references(
+        nc, markdown, user_id="alice"
+    )
+    assert converted is markdown
+    assert resolved == []
+    assert dropped == 0
+
+
+def test_delivered_paths_prefer_verified_originals() -> None:
+    """The user's original file is referenced (no duplicate, no copy) when
+    its path verifiably resolves for the owner: both lookups must agree
+    on the file id. The reference is deck-folder-relative, encoded."""
+    node = fake_node(101, path="Photos/my cat.png")
+    nc = path_nc({101: node}, {101: png_bytes()}, {"Photos/my cat.png": node})
+    paths, copies = resolve_delivered_image_paths(
+        nc, "alice", "Marp Slides", "Quarterly-Review", [101], [1]
+    )
+    assert paths == {1: "../../Photos/my%20cat.png"}
+    assert copies == []
+    assert nc.files.downloaded == []  # nothing re-downloaded for an original
+    assert nc.files.impersonated == ["alice"]
+
+
+def test_delivered_paths_copy_when_the_original_is_unverifiable() -> None:
+    """A node whose path does not resolve for the owner (or carries none)
+    falls back to the self-contained copy: the blob beside the deck as
+    '<stem>-img-<N>.<ext>', referenced by its bare name."""
+    blob = png_bytes()
+    node = fake_node(101, path="Sharer/only/namespace.png")
+    nc = path_nc({101: node}, {101: blob}, {})  # by_path cannot verify it
+    paths, copies = resolve_delivered_image_paths(
+        nc, "alice", "Marp Slides", "Quarterly-Review", [101], [1]
+    )
+    assert paths == {1: "Quarterly-Review-img-1.png"}
+    assert copies == [("Quarterly-Review-img-1.png", blob, "image/png")]
+    assert nc.files.downloaded == [101]
+
+
+def test_delivered_paths_keep_file_form_when_undownloadable() -> None:
+    """A file that cannot even be fetched (deleted mid-task) has no
+    reference and no copy: the delivered source keeps '#file:N' for it
+    and the re-render degrade path still catches that."""
+    nc = path_nc({}, {}, {})
+    paths, copies = resolve_delivered_image_paths(
+        nc, "alice", "Marp Slides", "Quarterly-Review", [101], [1]
+    )
+    assert paths == {}
+    assert copies == []
+
+
+def test_rewrite_source_to_paths_forms() -> None:
+    """Content images take the plain encoded path, the deck-wide
+    background takes Marp's url(...) directive-value form; positions
+    without a path keep '#file:N'."""
+    markdown = (
+        "---\nmarp: true\nbackgroundImage: '#file:2'\n---\n\n# T\n\n"
+        "![img](#file:1)\n\n![bg](#file:3)\n"
+    )
+    rewritten = rewrite_source_to_paths(
+        markdown, {1: "a.png", 2: "../../Photos/bg.png"}
+    )
+    assert "![img](a.png)" in rewritten
+    assert "backgroundImage: 'url(../../Photos/bg.png)'" in rewritten
+    assert "![bg](#file:3)" in rewritten

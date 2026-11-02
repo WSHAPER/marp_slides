@@ -485,16 +485,126 @@ def test_out_of_bounds_reference_fails_actionably(settings) -> None:
     assert "only 1 image(s) were provided" in result["user_facing_error_message"]
 
 
-def test_reference_without_any_files_fails_actionably(settings) -> None:
+def test_reference_without_any_files_strips_and_renders(
+    monkeypatch, caplog, settings
+) -> None:
+    """The live failure this fixes: a picked .md that references '#file:N'
+    (the deck was generated WITH images) re-renders WITHOUT images instead
+    of failing — the references strip, a warning names the count, and the
+    honest deck beats locking the owner out of their own deck."""
+    caplog.set_level("WARNING", logger="marp_slides.task_worker")
+    built: dict[str, object] = {}
+
+    def capture_build(deck, title, images=None):
+        built["images"] = images
+        return b"PK-editable"
+
+    monkeypatch.setattr(task_worker, "build_pptx", capture_build)
     nc, api = make_fake_nc()
     markdown_with_ref = VALID_DECK + "\n\n![img](#file:1)\n"
     task_worker.process_task(
         nc, dict(RE_RENDER_TASK, input={"markdown": markdown_with_ref}), settings
     )
     (result,) = api.results
-    assert (
-        result["output"] is not None or result["user_facing_error_message"] is not None
+    assert result["output"] == {"slide_decks": [42], "slide_deck_source": 43}
+    assert built["images"] == {}  # rendered without images
+    assert "'#file:N' but no file_references" in caplog.text
+    _, (src_name, src_bytes, _src_mime) = api.uploads[1]
+    assert src_name.endswith(".md")
+    assert b"#file:1" not in src_bytes  # the echoed source is the stripped one
+
+
+def test_path_references_resolve_from_files(monkeypatch, settings) -> None:
+    """The delivered .md's real paths: '![img](Photos/cat.png)' resolves
+    through the owner's Files into the pipeline's '#file:1' (no
+    file_references needed), the image downloads and lands in the build,
+    and the task-output echo keeps the internal form."""
+    blob = png_bytes()
+    node = fake_node(101, path="Photos/cat.png")
+    files = FakeFilesAPI({101: node}, {101: blob}, {"Photos/cat.png": node})
+    nc, api = make_fake_nc(files=files)
+    built: dict[str, object] = {}
+
+    def capture_build(deck, title, images=None):
+        built["images"] = images
+        return b"PK-with-picture"
+
+    monkeypatch.setattr(task_worker, "build_pptx", capture_build)
+    markdown = VALID_DECK + "\n\n![img](Photos/cat.png)\n"
+    task_worker.process_task(
+        nc, dict(RE_RENDER_TASK, input={"markdown": markdown}), settings
     )
+    (result,) = api.results
+    assert result["output"]["slide_decks"] == [42]
+    assert built["images"] == {1: blob}
+    assert files.downloaded == [101]
+    _, (_src_name, src_bytes, _src_mime) = api.uploads[1]
+    assert b"#file:1" in src_bytes  # the task output keeps the internal form
+
+
+def test_picked_md_resolves_relative_paths_against_its_folder(
+    monkeypatch, settings
+) -> None:
+    """The pick-just-works flow: the .md picked from Files references its
+    delivered copy image by bare name; the reference resolves against the
+    PICKED FILE's folder, not the Files root."""
+    doc = (VALID_DECK + "\n\n![img](Quarterly-Review-img-1.png)\n").encode("utf-8")
+    source = fake_node(
+        303,
+        mimetype="text/markdown",
+        size=len(doc),
+        name="Quarterly-Review.md",
+        path="Marp Slides/Quarterly-Review/Quarterly-Review.md",
+    )
+    blob = png_bytes()
+    image = fake_node(
+        101, path="Marp Slides/Quarterly-Review/Quarterly-Review-img-1.png"
+    )
+    files = FakeFilesAPI({303: source, 101: image}, {303: doc, 101: blob})
+    nc, api = make_fake_nc(files=files)
+    built: dict[str, object] = {}
+
+    def capture_build(deck, title, images=None):
+        built["images"] = images
+        return b"PK-with-picture"
+
+    monkeypatch.setattr(task_worker, "build_pptx", capture_build)
+    task_worker.process_task(
+        nc,
+        dict(RE_RENDER_TASK, input={"deck_source_file": 303, "output_format": "pptx"}),
+        settings,
+    )
+    (result,) = api.results
+    assert result["output"]["slide_decks"] == [42]
+    assert built["images"] == {1: blob}
+    assert files.downloaded == [303, 101]  # the source, then the image
+
+
+def test_unresolvable_path_references_strip_with_warning(
+    monkeypatch, caplog, settings
+) -> None:
+    """An image whose path no longer resolves (deleted, share gone)
+    degrades exactly like a '#file:N' without files: strip, warn, render."""
+    caplog.set_level("WARNING", logger="marp_slides.task_worker")
+    built: dict[str, object] = {}
+
+    def capture_build(deck, title, images=None):
+        built["images"] = images
+        return b"PK-editable"
+
+    monkeypatch.setattr(task_worker, "build_pptx", capture_build)
+    nc, api = make_fake_nc()
+    markdown = VALID_DECK + "\n\n![img](Gone/deleted.png)\n"
+    task_worker.process_task(
+        nc, dict(RE_RENDER_TASK, input={"markdown": markdown}), settings
+    )
+    (result,) = api.results
+    assert result["output"]["slide_decks"] == [42]
+    assert built["images"] == {}
+    assert "do not resolve" in caplog.text
+    _, (_src_name, src_bytes, _src_mime) = api.uploads[1]
+    assert b"Gone/deleted.png" not in src_bytes
+    assert b"#file:" not in src_bytes
 
 
 def test_bad_file_references_slot_fails_with_the_shared_rules(settings) -> None:
