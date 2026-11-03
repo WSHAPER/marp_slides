@@ -77,13 +77,13 @@ A second task type, ``marp_slides:re_render`` (provider
 edit-source-then-re-render flow: it takes a complete Marp Markdown source
 (typically the retained ``slide_deck_source`` after edits), runs it
 through the SAME validator and the SAME render phase, and never calls the
-LLM: no authoring, no retry loop, no outline generation. The source
-arrives as EITHER the ``markdown`` text input OR the ``deck_source_file``
-file input (the .md delivered into the owner's Files, picked back from
-there: closing the edit-and-rerender loop without a copy-paste); the
-worker enforces exactly-one-of before any render work, and when both ride
-along the FILE wins (picking a concrete artifact is the more deliberate
-choice). The file content downloads through the same app-context
+LLM: no authoring, no retry loop, no outline generation. The source is
+the ``deck_source_file`` file input (the .md delivered into the owner's
+Files, picked back from there: closing the edit-and-rerender loop inside
+Files; the slot is the form's required primary control, and there is no
+text-paste twin: paste users save the .md to Files first): schedules
+without it are rejected, and the worker hard-requires it before any
+render work. The file content downloads through the same app-context
 by_id/download path the images use, decodes as UTF-8 text and then flows
 through the identical validate -> render path. Its image references
 arrive in two forms: real Files paths (the delivered .md's form) resolve
@@ -1837,58 +1837,46 @@ def _download_text_file(
     return name, text, parent_dir
 
 
-def _input_deck_markdown(value: object) -> str:
-    """Validate the re-render task's optional ``markdown`` text input: the
-    complete Marp Markdown deck source including the frontmatter. Returns
-    the stripped markdown (mirroring :func:`extract_markdown`'s only touch
-    on the authoring path, so the echoed source matches what the authoring
-    task would have retained)."""
-    if not isinstance(value, str) or not value.strip():
-        raise DeckError(
-            "The task input is missing the deck source: send the complete "
-            "Marp Markdown deck source (including the frontmatter) as the "
-            "'markdown' text, or pick the deck's .md file with the "
-            "'deck_source_file' input."
-        )
-    return value.strip()
-
-
 def _re_render_source_markdown(
     nc: NextcloudApp,
     task_input: Mapping[str, Any],
     settings: Settings,
     task_id: int,
 ) -> tuple[str, str]:
-    """Resolve the re-render deck source: exactly one of the optional
-    ``markdown`` text input and the optional ``deck_source_file`` file
-    input, BEFORE any render work. Both empty fails with the actionable
-    either-or message; both present resolves to the FILE (picking a
-    concrete artifact from Files is the more deliberate choice). The file
-    content decodes as UTF-8 text and passes the same non-empty gate as
-    the text input, so what flows onward is byte-identical regardless of
-    which input carried it. Returns ``(markdown, source_dir)`` — the
-    picked file's folder ('' for the text input or when unknown), the
-    base relative image paths in the source resolve against."""
+    """Resolve the re-render deck source: the REQUIRED ``deck_source_file``
+    file input, the task's one canonical source, BEFORE any render work.
+    A missing input fails with the actionable pick-the-file message (the
+    server already rejects such schedules against the required input
+    shape; this is the defense-in-depth gate for direct deliveries). The
+    file content decodes as UTF-8 text and passes the non-empty gate.
+    Returns ``(markdown, source_dir)`` — the picked file's folder in the
+    owner's Files ('' when unknown), the base relative image paths in
+    the source resolve against."""
     raw_file = task_input.get("deck_source_file")
-    if raw_file is not None:
-        file_id = _file_input_id(raw_file, "deck_source_file")
-        name, text, parent_dir = _download_text_file(
-            nc, file_id, "deck_source_file", settings.max_deck_bytes
+    if raw_file is None:
+        raise DeckError(
+            "The task input is missing the deck source: pick the deck's "
+            "Markdown source file from your Files with the "
+            "'deck_source_file' input (the .md delivered alongside the "
+            "deck, or any Marp Markdown file)."
         )
-        if not text.strip():
-            raise DeckError(
-                f"The deck source file '{name}' (file id {file_id}) is "
-                "empty. Pick the .md source delivered with the deck, or "
-                "send the source as the 'markdown' text input."
-            )
-        LOGGER.info(
-            "Task %s: re-rendering the deck source file %r (file id %s)",
-            task_id,
-            name,
-            file_id,
+    file_id = _file_input_id(raw_file, "deck_source_file")
+    name, text, parent_dir = _download_text_file(
+        nc, file_id, "deck_source_file", settings.max_deck_bytes
+    )
+    if not text.strip():
+        raise DeckError(
+            f"The deck source file '{name}' (file id {file_id}) is "
+            "empty. Pick the .md source delivered with the deck, or "
+            "another non-empty Marp Markdown file."
         )
-        return text.strip(), parent_dir
-    return _input_deck_markdown(task_input.get("markdown")), ""
+    LOGGER.info(
+        "Task %s: re-rendering the deck source file %r (file id %s)",
+        task_id,
+        name,
+        file_id,
+    )
+    return text.strip(), parent_dir
 
 
 def _re_render_file_ids(task_input: Mapping[str, Any]) -> list[int]:
@@ -1914,8 +1902,8 @@ def _re_render_deck(
     """Deterministic re-render of an edited deck source: the SAME strict
     validation (same rules, same error messages) and the SAME render phase
     as the authoring pipeline, minus the LLM call. The source is the
-    ``markdown`` text or the ``deck_source_file`` file input (exactly one;
-    see :func:`_re_render_source_markdown`). Image references arrive in
+    ``deck_source_file`` file input (the required primary control; see
+    :func:`_re_render_source_markdown`). Image references arrive in
     two forms and normalize to one before validation: path-form references
     (the delivered .md's real Files paths) resolve through the task
     owner's Files into ``#file:N`` (:func:`convert_path_references`), and

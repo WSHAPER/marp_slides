@@ -573,7 +573,11 @@ def test_re_render_path_delivers_files_too(monkeypatch, settings) -> None:
     and delivers them plus the submitted (stripped) source markdown
     before its own result report; user_id threads on this path too."""
     recordings: list[dict] = []
-    nc, api = make_fake_nc()
+    content = VALID_DECK.encode("utf-8")
+    files = FakeFilesAPI(
+        {303: md_node(303, content, "Quarterly-Review.md")}, {303: content}
+    )
+    nc, api = make_fake_nc(files=files)
     monkeypatch.setattr(
         task_worker, "deliver_deck_files", record_delivery(recordings, api)
     )
@@ -585,7 +589,7 @@ def test_re_render_path_delivers_files_too(monkeypatch, settings) -> None:
             "status": "STATUS_RUNNING",
             "userId": "alice",
             "appId": "marp_slides",
-            "input": {"markdown": VALID_DECK, "output_format": "pptx"},
+            "input": {"deck_source_file": 303, "output_format": "pptx"},
         },
         settings,
     )
@@ -648,10 +652,11 @@ def test_re_render_with_deck_source_file_flows_through(settings) -> None:
     assert api.uploads[1][1][1] == VALID_DECK.strip().encode("utf-8")
 
 
-def test_re_render_deck_source_file_wins_over_markdown_text(settings) -> None:
-    """Both source inputs riding along resolves to the FILE: picking a
-    concrete artifact from Files is the more deliberate choice, so the
-    text input is quietly ignored (never merged)."""
+def test_re_render_deck_source_file_wins_over_legacy_markdown_text(settings) -> None:
+    """A legacy payload still carrying the removed 'markdown' text key
+    alongside the file: the pasted text is ignored entirely (it is not an
+    input anymore), the picked FILE is the one source, and the echoed
+    source proves it."""
     content = VALID_DECK.encode("utf-8")
     files = FakeFilesAPI(
         {303: md_node(303, content, "Quarterly-Review.md")}, {303: content}
@@ -668,23 +673,24 @@ def test_re_render_deck_source_file_wins_over_markdown_text(settings) -> None:
 
 
 def test_re_render_without_any_deck_source_fails_actionably(settings) -> None:
-    """Neither source input given: the either-or guard fires BEFORE any
-    render work and names both remedies."""
+    """No deck source file given: the single-source guard fires BEFORE any
+    render work and names the required input and where the .md comes
+    from."""
     nc, api = make_fake_nc()
     task_worker.process_task(nc, re_render_task({}), settings)
     (result,) = api.results
     assert result["output"] is None
-    assert "'markdown'" in result["user_facing_error_message"]
     assert "'deck_source_file'" in result["user_facing_error_message"]
+    assert "Files" in result["user_facing_error_message"]
     assert api.uploads == []  # nothing rendered, nothing echoed
 
 
-def test_re_render_blank_markdown_text_is_not_a_source(settings) -> None:
-    """Whitespace-only markdown text counts as absent, so the task fails
-    with the same either-or message (a blank text must not slip through
-    as 'provided')."""
+def test_re_render_legacy_markdown_payload_is_not_a_source(settings) -> None:
+    """A payload carrying only the removed 'markdown' text input never
+    satisfies the source: the task fails the missing-deck_source_file
+    gate instead of rendering the pasted text."""
     nc, api = make_fake_nc()
-    task_worker.process_task(nc, re_render_task({"markdown": "   \n\n  "}), settings)
+    task_worker.process_task(nc, re_render_task({"markdown": OTHER_DECK}), settings)
     (result,) = api.results
     assert result["output"] is None
     assert "'deck_source_file'" in result["user_facing_error_message"]

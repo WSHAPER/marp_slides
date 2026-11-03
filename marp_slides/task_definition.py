@@ -195,36 +195,50 @@ PROVIDER = TaskProcessingProvider(
 #: authoring task, with no language model involved. This is the second half
 #: of the edit-source-then-re-render flow: the authoring task retains the
 #: deck source (and delivers it into the owner's Files), a later turn edits
-#: it (by hand or by a chat LLM) and feeds it back here. The source arrives
-#: as EITHER the ``markdown`` text OR the ``deck_source_file`` file input
-#: (both optional on the provider: picking the .md from Files is the same
-#: deliberate act as pasting the text).
+#: it (by hand or by a chat LLM), saves it in Files and picks it back here.
+#: The deck source FILE is the one canonical source: the required
+#: ``deck_source_file`` slot is the form's primary control, rendered first
+#: in the basic flow (the Assistant form renders required ``inputShape``
+#: fields directly; the picker must not hide behind the collapsed
+#: "Show advanced options" toggle that gates every ``optionalInputShape``
+#: field). Users who edit the source as pasted text save the .md to Files
+#: first: the app itself delivers every generated and re-rendered source
+#: there, so the round trip stays inside Files.
 #:
-#: Form flattening: ``output_format`` is declared here as a REQUIRED slot
-#: (with a registered default, below on the provider) because the Assistant
-#: form renders required ``inputShape`` fields directly in the basic flow
-#: while every ``optionalInputShape`` field hides behind the collapsed
-#: "Show advanced options" toggle (TaskTypeFields.vue gates the optional
-#: fields behind ``showAdvanced``, false by default). The server satisfies
-#: an absent required slot from its registered default and back-fills it
-#: (Manager.php ``validateInput``/``fillInputDefaults``), so callers that
-#: omit ``output_format`` keep working — same accepted payloads. The source
-#: pair and ``file_references`` CANNOT follow: TaskProcessing has no
-#: optional-but-visible placement, file slots may not carry defaults, and a
-#: required slot must actually be present (the server rejects absent keys
-#: and the form blocks submit until every required slot is non-empty),
-#: which would break the either/or source contract and the optional-images
-#: contract. They stay optional by protocol necessity, not by choice.
+#: Form flattening: ``deck_source_file`` and ``output_format`` are REQUIRED
+#: slots. ``output_format`` carries a registered default ('all', below on
+#: the provider): the server satisfies an absent required slot from its
+#: default and back-fills it (Manager.php ``validateInput``/
+#: ``fillInputDefaults``), so callers that omit the key keep working.
+#: ``deck_source_file`` is deliberately required with NO default (file
+#: slots may not carry one): schedules without it are rejected from now
+#: on. The surviving protocol pin is ``file_references`` (LIST_OF_FILES,
+#: optional): file lists cannot carry defaults either, and a required
+#: file list would force attaching images on every re-render, so it stays
+#: optional behind the advanced toggle by protocol necessity.
 RE_RENDER_TASK_TYPE = TaskType(
     id=RE_RENDER_TASK_TYPE_ID,
     name="Re-render a slide deck",
     description=(
         "Renders an existing Marp Markdown deck source into a fresh "
         "deliverable without a language model: the same validation and the "
-        "same rendering as the generation task, deterministically. Edit the "
-        "retained Markdown source and re-render to update the deck."
+        "same rendering as the generation task, deterministically. Pick the "
+        "deck source from your Files (the .md delivered alongside the deck, "
+        "or any Marp Markdown file), edit it there and re-render to update "
+        "the deck."
     ),
     input_shape=[
+        ShapeDescriptor(
+            name="deck_source_file",
+            description=(
+                "Pick the deck's Markdown source from your Files (the .md "
+                "delivered alongside the deck, or any Marp Markdown file). "
+                "Its content is rendered as-is: no AI generation, every "
+                "slide renders exactly as written. Images it references "
+                "by their Files path resolve from your Files."
+            ),
+            shape_type=ShapeType.FILE,
+        ),
         ShapeDescriptor(
             name="output_format",
             description=RE_RENDER_OUTPUT_FORMAT_SLOT_DESCRIPTION,
@@ -256,11 +270,12 @@ RE_RENDER_TASK_TYPE = TaskType(
 
 #: The deterministic re-render provider: synchronous (the render cost only,
 #: no authoring round), so the expected runtime is 10 seconds instead of
-#: the authoring task's 120. The ``output_format`` slot lives on the
-#: REQUIRED input shape (see RE_RENDER_TASK_TYPE) so the form shows it in
-#: the basic flow, preselected with the governance default 'all' — the
-#: dropdown values are the same shared list as the authoring provider's, so
-#: the two can never drift.
+#: the authoring task's 120. The form's primary controls (the deck source
+#: FILE picker and the output format dropdown) live on the REQUIRED input
+#: shape (see RE_RENDER_TASK_TYPE) so both render directly in the basic
+#: flow, the format preselected with the governance default 'all'; the
+#: dropdown values are the same shared list as the authoring provider's,
+#: so the two can never drift.
 RE_RENDER_PROVIDER = TaskProcessingProvider(
     id=RE_RENDER_PROVIDER_ID,
     name=RE_RENDER_PROVIDER_NAME,
@@ -272,31 +287,12 @@ RE_RENDER_PROVIDER = TaskProcessingProvider(
     # governance default for the flattened form: a deterministic re-render
     # refreshes every deliverable ('all' covers pptx, html and pdf); the
     # server back-fills it for callers that omit the key, and the worker
-    # accepts the same four values as before
+    # accepts the same four values as before. deck_source_file carries NO
+    # default: file slots may not, and the picker is the required input.
     input_shape_defaults={
         "output_format": "all",
     },
     optional_input_shape=[
-        ShapeDescriptor(
-            name="markdown",
-            description=(
-                "The complete Marp Markdown deck source to re-render, "
-                "including the frontmatter block. Either this text or the "
-                "deck source file must be given."
-            ),
-            shape_type=ShapeType.TEXT,
-        ),
-        ShapeDescriptor(
-            name="deck_source_file",
-            description=(
-                "Pick the deck's Markdown source from your Files (the .md "
-                "delivered alongside the deck, or any Marp Markdown file). "
-                "Its content is rendered as-is: no AI generation, every "
-                "slide renders exactly as written. Images it references "
-                "by their Files path resolve from your Files."
-            ),
-            shape_type=ShapeType.FILE,
-        ),
         ShapeDescriptor(
             name="file_references",
             description=(

@@ -33,14 +33,45 @@ from tests.test_task_plumbing import (
     png_bytes,
 )
 
+#: The file id the fake Files tree serves the deck source .md under: the
+#: task's ONE canonical source input (required, picker-first).
+DECK_FILE_ID = 303
+
 RE_RENDER_TASK = {
     "id": 7,
     "type": "marp_slides:re_render",
     "status": "STATUS_RUNNING",
     "userId": "alice",
     "appId": "marp_slides",
-    "input": {"markdown": VALID_DECK, "output_format": "pptx"},
+    "input": {"deck_source_file": DECK_FILE_ID, "output_format": "pptx"},
 }
+
+
+def deck_nc(
+    doc: str = VALID_DECK,
+    nodes: dict[int, object] | None = None,
+    blobs: dict[int, bytes] | None = None,
+    by_path_nodes: dict[str, object] | None = None,
+):
+    """The canonical single-source fake: the deck source .md served as the
+    picked ``deck_source_file`` (file id 303), plus optional extra
+    nodes/blobs/path aliases (images). Returns the (nc, api, files) triple
+    so tests can assert on the download order."""
+    data = doc.encode("utf-8")
+    source = fake_node(
+        DECK_FILE_ID,
+        mimetype="text/markdown",
+        size=len(data),
+        name="Quarterly-Review.md",
+        path="Marp Slides/Quarterly-Review.md",
+    )
+    files = FakeFilesAPI(
+        {DECK_FILE_ID: source, **(nodes or {})},
+        {DECK_FILE_ID: data, **(blobs or {})},
+        by_path_nodes,
+    )
+    nc, api = make_fake_nc(files=files)
+    return nc, api, files
 
 
 @pytest.fixture()
@@ -88,13 +119,12 @@ def no_llm_no_real_render(monkeypatch):
 def test_re_render_task_type_shape() -> None:
     tt = task_definition.RE_RENDER_TASK_TYPE
     assert tt.id == RE_RENDER_TASK_TYPE_ID == "marp_slides:re_render"
-    # output_format is the ONE required input (with a registered default on
-    # the provider) so the Assistant form renders it directly in the basic
-    # flow instead of behind the collapsed advanced toggle; the deck source
-    # itself stays optional (EITHER the 'markdown' text OR the
-    # 'deck_source_file' file below) — see the flatten guard test
-    assert [s.name for s in tt.input_shape] == ["output_format"]
-    assert tt.input_shape[0].shape_type == ShapeType.ENUM
+    # picker first: the deck source FILE is the required primary control
+    # (the form's first field), output_format second with its registered
+    # default on the provider; both render directly in the basic flow
+    assert [s.name for s in tt.input_shape] == ["deck_source_file", "output_format"]
+    assert tt.input_shape[0].shape_type == ShapeType.FILE
+    assert tt.input_shape[1].shape_type == ShapeType.ENUM
     assert [s.name for s in tt.output_shape] == ["slide_decks", "slide_deck_source"]
     assert tt.output_shape[0].shape_type == ShapeType.LIST_OF_FILES
     assert tt.output_shape[1].shape_type == ShapeType.FILE
@@ -105,65 +135,54 @@ def test_re_render_provider_shape() -> None:
     assert provider.id == RE_RENDER_PROVIDER_ID == "marp-slides:re_renderer"
     assert provider.task_type == RE_RENDER_TASK_TYPE_ID
     assert provider.expected_runtime == 10  # deterministic: render cost only
-    assert [s.name for s in provider.optional_input_shape] == [
-        "markdown",
-        "deck_source_file",
-        "file_references",
-    ]
-    text_slot, file_slot, files_slot = provider.optional_input_shape
-    assert text_slot.shape_type == ShapeType.TEXT
-    assert file_slot.shape_type == ShapeType.FILE
-    assert files_slot.shape_type == ShapeType.LIST_OF_FILES
-    # the moved slot: ENUM values and the governance default now ride on
-    # the REQUIRED input shape (visible in the basic flow, preselected)
+    # the ONLY optional input left is the image override list; the markdown
+    # text slot is gone from both shapes (one canonical source path)
+    assert [s.name for s in provider.optional_input_shape] == ["file_references"]
+    assert provider.optional_input_shape[0].shape_type == ShapeType.LIST_OF_FILES
+    # the required ENUM ships its dropdown values and the governance
+    # default; the required FILE slot ships NEITHER (file slots carry no
+    # defaults: the picker must be filled in, the format is preselected)
     assert [v.value for v in provider.input_shape_enum_values["output_format"]] == list(
         OUTPUT_FORMAT_VALUES
     )
     assert provider.input_shape_defaults == {"output_format": "all"}
-    # nothing optional is left with a dropdown or a default: the advanced
-    # section holds only the protocol-pinned plain slots
+    assert "deck_source_file" not in provider.input_shape_defaults
     assert provider.optional_input_shape_enum_values == {}
     assert provider.optional_input_shape_defaults == {}
     assert provider.optional_output_shape == []
 
 
 def test_re_render_form_is_flattened_to_the_protocol_limit() -> None:
-    """The UX-defect regression guard: no re_render input that CAN sit in
-    the basic flow is relegated to the advanced section. The Assistant form
-    renders required ``inputShape`` fields directly and every
-    ``optionalInputShape`` field behind the collapsed "Show advanced
-    options" toggle, so the testable flatten property is: every slot that
-    is advanced-hidden today is there because the TaskProcessing protocol
-    pins it — file slots cannot carry defaults (the server rejects defaults
-    on file/list slots), and a required slot must actually be present (the
-    server rejects absent keys and the form blocks submit until every
-    required slot is non-empty), which would break the either/or deck
-    source contract and the optional-images contract. Concretely: the only
-    defaultable slot (output_format, a scalar ENUM) MUST be required, and
-    exactly the three pinned slots may remain optional."""
+    """The UX-defect regression guard: the form's PRIMARY control (the deck
+    source picker) sits in the basic flow, first, required — never behind
+    the collapsed "Show advanced options" toggle that gates every
+    ``optionalInputShape`` field (TaskTypeFields.vue renders required
+    ``inputShape`` fields unconditionally). The markdown text input is
+    gone entirely: one canonical source path, and schedules without the
+    picker are rejected. The only advanced-relegated input left is
+    ``file_references``, pinned there by the TaskProcessing protocol
+    (file lists cannot carry defaults, and a required file list would
+    force attaching images on every re-render)."""
     provider = task_definition.RE_RENDER_PROVIDER
     tt = task_definition.RE_RENDER_TASK_TYPE
-    # the promotable slot was promoted: required, never advanced-hidden
-    assert "output_format" not in [s.name for s in provider.optional_input_shape]
-    assert [s.name for s in tt.input_shape] == ["output_format"]
-    # a required ENUM must ship its dropdown values and a default: the
-    # server validates the default like any value, and an absent key is
-    # satisfied by it (accepted payloads unchanged)
+    # picker-first required ordering, no markdown slot anywhere
+    assert [s.name for s in tt.input_shape] == ["deck_source_file", "output_format"]
+    shape_names = [s.name for s in tt.input_shape] + [
+        s.name for s in provider.optional_input_shape
+    ]
+    assert "markdown" not in shape_names
+    # the primary control is required with no default (file slots may not
+    # carry one) and no optional twin: it must be picked
+    assert "deck_source_file" not in [s.name for s in provider.optional_input_shape]
+    assert "deck_source_file" not in provider.input_shape_defaults
+    # the format slot keeps its dropdown values and default: an absent key
+    # is satisfied by the default server-side (accepted values unchanged)
     assert provider.input_shape_enum_values["output_format"] == (
         task_definition.OUTPUT_FORMAT_ENUM_VALUES
     )
-    default = provider.input_shape_defaults["output_format"]
-    assert default in OUTPUT_FORMAT_VALUES
-    # exactly the protocol-pinned slots stay in the advanced section
-    assert sorted(s.name for s in provider.optional_input_shape) == sorted(
-        ["markdown", "deck_source_file", "file_references"]
-    )
-    # none of the pinned slots is defaultable (file shapes): they MUST stay
-    # optional or previously accepted payloads would be rejected
-    assert all(
-        slot.shape_type in (ShapeType.FILE, ShapeType.LIST_OF_FILES, ShapeType.TEXT)
-        for slot in provider.optional_input_shape
-    )
+    assert provider.input_shape_defaults["output_format"] in OUTPUT_FORMAT_VALUES
+    # exactly one pinned optional slot remains
+    assert [s.name for s in provider.optional_input_shape] == ["file_references"]
 
 
 def test_re_render_governance_default_is_all_formats() -> None:
@@ -172,24 +191,26 @@ def test_re_render_governance_default_is_all_formats() -> None:
     html and pdf). The label must teach the same default the form
     preselects — never the authoring task's 'pptx'."""
     provider = task_definition.RE_RENDER_PROVIDER
-    fmt_slot = task_definition.RE_RENDER_TASK_TYPE.input_shape[0]
+    fmt_slot = task_definition.RE_RENDER_TASK_TYPE.input_shape[1]
     assert provider.input_shape_defaults == {"output_format": "all"}
     assert "'all'" in fmt_slot.description
     assert "default" in fmt_slot.description
     assert "'pptx' is the default" not in fmt_slot.description
 
 
-def test_re_render_source_slots_teach_the_either_of_choice() -> None:
-    """The two source inputs teach what to send: the text slot names the
-    frontmatter requirement and the either-or, the file slot promises the
-    as-is render (no AI round) and where the .md comes from."""
+def test_re_render_picker_slot_teaches_the_single_source_flow() -> None:
+    """The required picker slot is the task's one source of truth: the
+    label teaches the as-is render (no AI round) and where the .md comes
+    from. There is no either/or twin and no optional markdown slot left
+    to teach against."""
     provider = task_definition.RE_RENDER_PROVIDER
-    text_slot, file_slot, _files = provider.optional_input_shape
-    assert "frontmatter" in text_slot.description
-    assert "deck source file" in text_slot.description
-    assert "Markdown source" in file_slot.description
-    assert "rendered as-is" in file_slot.description
-    assert "no AI generation" in file_slot.description
+    picker_slot = task_definition.RE_RENDER_TASK_TYPE.input_shape[0]
+    assert picker_slot.name == "deck_source_file"
+    assert "Markdown source" in picker_slot.description
+    assert "rendered as-is" in picker_slot.description
+    assert "no AI generation" in picker_slot.description
+    assert "Files" in picker_slot.description
+    assert [s.name for s in provider.optional_input_shape] == ["file_references"]
 
 
 def test_re_render_output_format_enum_mirrors_the_authoring_provider() -> None:
@@ -238,10 +259,8 @@ def test_validation_is_the_shared_validator_verbatim(settings) -> None:
     bad = "---\nmarp: true\n---\n<!-- footer: F -->\n---\n# T\n\n### ###\n"
     with pytest.raises(DeckError) as direct:
         validate_deck(bad)
-    nc, api = make_fake_nc()
-    task_worker.process_task(
-        nc, dict(RE_RENDER_TASK, input={"markdown": bad}), settings
-    )
+    nc, api, _files = deck_nc(doc=bad)
+    task_worker.process_task(nc, RE_RENDER_TASK, settings)
     (result,) = api.results
     assert (
         result["output"] is not None or result["user_facing_error_message"] is not None
@@ -252,10 +271,8 @@ def test_validation_is_the_shared_validator_verbatim(settings) -> None:
 
 
 def test_missing_frontmatter_fails_like_an_authored_deck(settings) -> None:
-    nc, api = make_fake_nc()
-    task_worker.process_task(
-        nc, dict(RE_RENDER_TASK, input={"markdown": "# No frontmatter\n"}), settings
-    )
+    nc, api, _files = deck_nc(doc="# No frontmatter\n")
+    task_worker.process_task(nc, RE_RENDER_TASK, settings)
     (result,) = api.results
     assert (
         result["output"] is not None or result["user_facing_error_message"] is not None
@@ -263,21 +280,26 @@ def test_missing_frontmatter_fails_like_an_authored_deck(settings) -> None:
     assert "frontmatter" in result["user_facing_error_message"]
 
 
-def test_missing_markdown_input_is_actionable(settings) -> None:
+def test_missing_deck_source_file_is_actionable(settings) -> None:
+    """The single-source contract: no deck_source_file, no re-render. The
+    message names the required input and where the .md comes from (the
+    server rejects such schedules against the required shape already; this
+    pins the worker's defense-in-depth gate for direct deliveries)."""
     nc, api = make_fake_nc()
     task_worker.process_task(nc, dict(RE_RENDER_TASK, input={}), settings)
     (result,) = api.results
     assert (
         result["output"] is not None or result["user_facing_error_message"] is not None
     )
-    assert "'markdown'" in result["user_facing_error_message"]
+    assert "'deck_source_file'" in result["user_facing_error_message"]
+    assert "Files" in result["user_facing_error_message"]
 
 
 def test_invalid_output_format_rejected_before_validation(settings) -> None:
-    nc, api = make_fake_nc()
+    nc, api, _files = deck_nc()
     task_worker.process_task(
         nc,
-        dict(RE_RENDER_TASK, input={"markdown": VALID_DECK, "output_format": "odp"}),
+        dict(RE_RENDER_TASK, input={"output_format": "odp"}),
         settings,
     )
     (result,) = api.results
@@ -288,16 +310,14 @@ def test_invalid_output_format_rejected_before_validation(settings) -> None:
 
 
 def test_theme_input_is_not_enforced_on_re_render(settings) -> None:
-    """The markdown is the source of truth: a stray 'theme' key riding
-    along in the input does not constrain a re-render (the frontmatter's
-    own validated theme wins, unlike the authoring task's override)."""
-    nc, api = make_fake_nc()
+    """The deck source file is the source of truth: a stray 'theme' key
+    riding along in the input does not constrain a re-render (the
+    frontmatter's own validated theme wins, unlike the authoring task's
+    override)."""
+    nc, api, _files = deck_nc()
     task_worker.process_task(
         nc,
-        dict(
-            RE_RENDER_TASK,
-            input={"markdown": VALID_DECK, "theme": "gaia"},  # deck says default
-        ),
+        dict(RE_RENDER_TASK, input={**RE_RENDER_TASK["input"], "theme": "gaia"}),
         settings,
     )
     (result,) = api.results
@@ -311,7 +331,7 @@ def test_theme_input_is_not_enforced_on_re_render(settings) -> None:
 
 
 def test_pptx_re_render_builds_deck_and_echoes_source(settings) -> None:
-    nc, api = make_fake_nc()
+    nc, api, _files = deck_nc()
     task_worker.process_task(nc, RE_RENDER_TASK, settings)
     assert api.results == [
         {
@@ -333,15 +353,12 @@ def test_pptx_re_render_builds_deck_and_echoes_source(settings) -> None:
 
 
 def test_echoed_source_is_the_stripped_input_verbatim(settings) -> None:
-    """Surrounding whitespace in the task input is stripped (mirroring
-    extract_markdown's touch on the authoring path) before validation, so
-    a lazily edited source still validates and echoes back clean."""
-    nc, api = make_fake_nc()
-    task_worker.process_task(
-        nc,
-        dict(RE_RENDER_TASK, input={"markdown": f"\n\n{VALID_DECK}\n\n"}),
-        settings,
-    )
+    """Surrounding whitespace in the picked deck source file is stripped
+    (mirroring extract_markdown's touch on the authoring path) before
+    validation, so a lazily edited source still validates and echoes back
+    clean."""
+    nc, api, _files = deck_nc(doc=f"\n\n{VALID_DECK}\n\n")
+    task_worker.process_task(nc, RE_RENDER_TASK, settings)
     (result,) = api.results
     assert result["output"]["slide_decks"] == [42]
     assert api.uploads[1][1][1] == VALID_DECK.strip().encode("utf-8")
@@ -359,7 +376,7 @@ def test_pptx_re_render_gates_then_builds(monkeypatch, settings) -> None:
 
     monkeypatch.setattr(task_worker, "marp_html_gate", fake_gate)
     monkeypatch.setattr(task_worker, "build_pptx", fake_build)
-    nc, _api = make_fake_nc()
+    nc, _api, _files = deck_nc()
     task_worker.process_task(nc, RE_RENDER_TASK, settings)
     assert calls == ["gate", "build"]  # the same strict order as authoring
 
@@ -380,10 +397,12 @@ def test_html_re_render_renders_via_marp_only(monkeypatch, settings) -> None:
     monkeypatch.setattr(task_worker, "marp_html_gate", forbidden_gate)
     monkeypatch.setattr(task_worker, "build_pptx", forbidden_build)
     monkeypatch.setattr(task_worker, "render_deck_html", fake_render)
-    nc, api = make_fake_nc()
+    nc, api, _files = deck_nc()
     task_worker.process_task(
         nc,
-        dict(RE_RENDER_TASK, input={"markdown": VALID_DECK, "output_format": "html"}),
+        dict(
+            RE_RENDER_TASK, input={**RE_RENDER_TASK["input"], "output_format": "html"}
+        ),
         settings,
     )
     (result,) = api.results
@@ -414,10 +433,10 @@ def test_pdf_re_render_gates_then_renders(monkeypatch, settings) -> None:
     monkeypatch.setattr(task_worker, "marp_html_gate", fake_gate)
     monkeypatch.setattr(task_worker, "render_deck_pdf", fake_render)
     monkeypatch.setattr(task_worker, "build_pptx", forbidden_build)
-    nc, api = make_fake_nc()
+    nc, api, _files = deck_nc()
     task_worker.process_task(
         nc,
-        dict(RE_RENDER_TASK, input={"markdown": VALID_DECK, "output_format": "pdf"}),
+        dict(RE_RENDER_TASK, input={**RE_RENDER_TASK["input"], "output_format": "pdf"}),
         settings,
     )
     (result,) = api.results
@@ -433,9 +452,12 @@ def test_pdf_re_render_gates_then_renders(monkeypatch, settings) -> None:
 
 
 def test_default_output_format_is_pptx(settings) -> None:
-    nc, api = make_fake_nc()
+    """The worker's deep fallback when the output_format key is absent
+    entirely (direct deliveries; the server back-fills the form default
+    'all' for normal schedules, but the worker alone still picks pptx)."""
+    nc, api, _files = deck_nc()
     task_worker.process_task(
-        nc, dict(RE_RENDER_TASK, input={"markdown": VALID_DECK}), settings
+        nc, dict(RE_RENDER_TASK, input={"deck_source_file": DECK_FILE_ID}), settings
     )
     _task_id, (filename, _payload, mime) = api.uploads[0]
     assert filename == "Quarterly-Review.pptx"
@@ -450,8 +472,11 @@ def test_file_references_resolve_references_to_file_ids(monkeypatch, settings) -
     list on the authoring task: the referenced file is downloaded once and
     lands in the build as 1-based position -> bytes."""
     blob = png_bytes()
-    files = FakeFilesAPI({101: fake_node(101)}, {101: blob})
-    nc, api = make_fake_nc(files=files)
+    nc, api, files = deck_nc(
+        doc=VALID_DECK + "\n\n![img](#file:1)\n",
+        nodes={101: fake_node(101)},
+        blobs={101: blob},
+    )
     built: dict[str, object] = {}
 
     def capture_build(deck, title, images=None):
@@ -464,7 +489,7 @@ def test_file_references_resolve_references_to_file_ids(monkeypatch, settings) -
         dict(
             RE_RENDER_TASK,
             input={
-                "markdown": VALID_DECK + "\n\n![img](#file:1)\n",
+                **RE_RENDER_TASK["input"],
                 "file_references": [101],
             },
         ),
@@ -473,7 +498,7 @@ def test_file_references_resolve_references_to_file_ids(monkeypatch, settings) -
     (result,) = api.results
     assert result["output"]["slide_decks"] == [42]
     assert built["images"] == {1: blob}
-    assert files.downloaded == [101]  # only the referenced file was fetched
+    assert files.downloaded == [303, 101]  # the source, then the image
     _, (src_name, src_bytes, _src_mime) = api.uploads[1]
     assert src_name.endswith(".md")
     assert b"#file:1" in src_bytes  # the echo keeps the file-id form
@@ -483,35 +508,39 @@ def test_images_slot_alias_works_the_same(monkeypatch, settings) -> None:
     """The authoring task's 'images' key is accepted as an alias so a
     caller can reuse one payload across both task types."""
     blob = png_bytes()
-    files = FakeFilesAPI({101: fake_node(101)}, {101: blob})
-    nc, api = make_fake_nc(files=files)
+    nc, api, files = deck_nc(
+        doc=VALID_DECK + "\n\n![img](#file:1)\n",
+        nodes={101: fake_node(101)},
+        blobs={101: blob},
+    )
     task_worker.process_task(
         nc,
         dict(
             RE_RENDER_TASK,
-            input={"markdown": VALID_DECK + "\n\n![img](#file:1)\n", "images": [101]},
+            input={**RE_RENDER_TASK["input"], "images": [101]},
         ),
         settings,
     )
     (result,) = api.results
     assert result["output"]["slide_decks"] == [42]
-    assert files.downloaded == [101]
+    assert files.downloaded == [303, 101]
 
 
 def test_file_references_take_precedence_over_images(monkeypatch, settings) -> None:
     """'#file:N' indexes ONE list: when both keys ride along, only
     file_references is consulted (no silent index shift)."""
     blob = png_bytes()
-    files = FakeFilesAPI(
-        {101: fake_node(101), 202: fake_node(202)}, {101: blob, 202: blob}
+    nc, api, files = deck_nc(
+        doc=VALID_DECK + "\n\n![img](#file:1)\n",
+        nodes={101: fake_node(101), 202: fake_node(202)},
+        blobs={101: blob, 202: blob},
     )
-    nc, api = make_fake_nc(files=files)
     task_worker.process_task(
         nc,
         dict(
             RE_RENDER_TASK,
             input={
-                "markdown": VALID_DECK + "\n\n![img](#file:1)\n",
+                **RE_RENDER_TASK["input"],
                 "file_references": [202],
                 "images": [101],
             },
@@ -520,15 +549,17 @@ def test_file_references_take_precedence_over_images(monkeypatch, settings) -> N
     )
     (result,) = api.results
     assert result["output"]["slide_decks"] == [42]
-    assert files.downloaded == [202]
+    assert files.downloaded == [303, 202]
 
 
 def test_out_of_bounds_reference_fails_actionably(settings) -> None:
     deck = "---\nmarp: true\ntitle: t\n---\n\n# T\n\n---\n\n## D\n\n![x](#file:2)\n"
-    nc, api = make_fake_nc()
+    nc, api, _files = deck_nc(doc=deck)
     task_worker.process_task(
         nc,
-        dict(RE_RENDER_TASK, input={"markdown": deck, "file_references": [101]}),
+        dict(
+            RE_RENDER_TASK, input={**RE_RENDER_TASK["input"], "file_references": [101]}
+        ),
         settings,
     )
     (result,) = api.results
@@ -554,11 +585,8 @@ def test_reference_without_any_files_strips_and_renders(
         return b"PK-editable"
 
     monkeypatch.setattr(task_worker, "build_pptx", capture_build)
-    nc, api = make_fake_nc()
-    markdown_with_ref = VALID_DECK + "\n\n![img](#file:1)\n"
-    task_worker.process_task(
-        nc, dict(RE_RENDER_TASK, input={"markdown": markdown_with_ref}), settings
-    )
+    nc, api, _files = deck_nc(doc=VALID_DECK + "\n\n![img](#file:1)\n")
+    task_worker.process_task(nc, RE_RENDER_TASK, settings)
     (result,) = api.results
     assert result["output"] == {"slide_decks": [42], "slide_deck_source": 43}
     assert built["images"] == {}  # rendered without images
@@ -575,8 +603,12 @@ def test_path_references_resolve_from_files(monkeypatch, settings) -> None:
     and the task-output echo keeps the internal form."""
     blob = png_bytes()
     node = fake_node(101, path="Photos/cat.png")
-    files = FakeFilesAPI({101: node}, {101: blob}, {"Photos/cat.png": node})
-    nc, api = make_fake_nc(files=files)
+    nc, api, files = deck_nc(
+        doc=VALID_DECK + "\n\n![img](Photos/cat.png)\n",
+        nodes={101: node},
+        blobs={101: blob},
+        by_path_nodes={"Photos/cat.png": node},
+    )
     built: dict[str, object] = {}
 
     def capture_build(deck, title, images=None):
@@ -584,14 +616,11 @@ def test_path_references_resolve_from_files(monkeypatch, settings) -> None:
         return b"PK-with-picture"
 
     monkeypatch.setattr(task_worker, "build_pptx", capture_build)
-    markdown = VALID_DECK + "\n\n![img](Photos/cat.png)\n"
-    task_worker.process_task(
-        nc, dict(RE_RENDER_TASK, input={"markdown": markdown}), settings
-    )
+    task_worker.process_task(nc, RE_RENDER_TASK, settings)
     (result,) = api.results
     assert result["output"]["slide_decks"] == [42]
     assert built["images"] == {1: blob}
-    assert files.downloaded == [101]
+    assert files.downloaded == [303, 101]
     _, (_src_name, src_bytes, _src_mime) = api.uploads[1]
     assert b"#file:1" in src_bytes  # the task output keeps the internal form
 
@@ -647,11 +676,8 @@ def test_unresolvable_path_references_strip_with_warning(
         return b"PK-editable"
 
     monkeypatch.setattr(task_worker, "build_pptx", capture_build)
-    nc, api = make_fake_nc()
-    markdown = VALID_DECK + "\n\n![img](Gone/deleted.png)\n"
-    task_worker.process_task(
-        nc, dict(RE_RENDER_TASK, input={"markdown": markdown}), settings
-    )
+    nc, api, _files = deck_nc(doc=VALID_DECK + "\n\n![img](Gone/deleted.png)\n")
+    task_worker.process_task(nc, RE_RENDER_TASK, settings)
     (result,) = api.results
     assert result["output"]["slide_decks"] == [42]
     assert built["images"] == {}
@@ -665,10 +691,10 @@ def test_bad_file_references_slot_fails_with_the_shared_rules(settings) -> None:
     """file_references validates through the shared images-slot validator:
     same shape rules, same message (an input-data failure, never retried
     and with no LLM to fix it)."""
-    nc, api = make_fake_nc()
+    nc, api, _files = deck_nc()
     task_worker.process_task(
         nc,
-        dict(RE_RENDER_TASK, input={"markdown": VALID_DECK, "file_references": "nope"}),
+        dict(RE_RENDER_TASK, input={"file_references": "nope"}),
         settings,
     )
     (result,) = api.results
