@@ -14,7 +14,8 @@ both phases), and progress becomes real ("slide 3 of 10"). The validated
 slides are assembled with the frontmatter and footer/header chrome derived
 from the outline and validated once as a whole deck against the strict
 native-only construct set; the deck is then rendered per
-``output_format``: ``pptx`` (default) is syntax-checked by the browserless
+``output_format``: 'all' (the default: pptx, html and pdf, one file each)
+expands to every format, ``pptx`` is syntax-checked by the browserless
 marp HTML gate and built as a native editable PPTX in-process; ``html`` is
 rendered by marp-cli into a single standalone HTML file (Node only);
 ``pdf`` runs the same browserless HTML syntax gate FIRST (malformed Markdown
@@ -46,9 +47,10 @@ task file inputs (``![alt](#file:N)``): the PPTX build inserts them as
 native pictures, while the html/pdf renders materialize them into the
 throwaway marp workdir and hand marp a render-local markdown copy (the
 retained source keeps ``#file:N``). The optional ``theme`` input
-(``auto`` default) steers the deck theme: the outline prompt teaches the
-model to pick the best-fitting theme or carries the user's hard
-requirement (enforced against the outline as a retryable failure); html
+(``nextcloud`` default: the instance-branded theme, the app's showcase)
+steers the deck theme: the outline prompt carries the user's hard
+requirement (enforced against the outline as a retryable failure), while
+'auto' lets the model pick the best-fitting theme instead; html
 and pdf render through the chosen theme while the native PPTX build
 ignores it (python-pptx has no theme surface). The ``nextcloud`` theme
 is instance-branded and generated at render time: the worker reads the
@@ -198,6 +200,7 @@ from .repair import (
 )
 from .settings import (
     APP_ID,
+    GENERATION_OUTPUT_FORMAT_DEFAULT,
     HTML_MIME_TYPE,
     MARKDOWN_MIME_TYPE,
     OUTPUT_FORMAT_VALUES,
@@ -2610,7 +2613,9 @@ def _generate_deck(
     :func:`_resume_input_with_draft_file`). ``user_id`` (the task
     owner, threaded from process_task) gates the fail-soft Files
     delivery of the generated files."""
-    output_format = validate_output_format(task_input.get("output_format"))
+    output_format = validate_output_format(
+        task_input.get("output_format"), default=GENERATION_OUTPUT_FORMAT_DEFAULT
+    )
     theme = validate_theme(task_input.get("theme"))
     # The required input slot is 'input'; 'prompt' is read as a legacy
     # fallback so callers written against the old slot name keep working.

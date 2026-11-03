@@ -7,10 +7,25 @@ from __future__ import annotations
 import pytest
 
 from marp_slides.deck_pipeline import DeckError, validate_output_format
+from marp_slides.settings import GENERATION_OUTPUT_FORMAT_DEFAULT
 
 
 def test_none_means_default_pptx() -> None:
+    """The function's parameter default is the re-render task's 'pptx'
+    (its call site passes no default); the generation worker passes its
+    own 'all' default explicitly (next test)."""
     assert validate_output_format(None) == "pptx"
+
+
+def test_none_with_generation_default_means_all() -> None:
+    """The generation task's fallback: an omitted output_format yields
+    every deliverable ('all'), the single settings source the task-type
+    registration also uses."""
+    assert (
+        validate_output_format(None, default=GENERATION_OUTPUT_FORMAT_DEFAULT)
+        == "all"
+        == GENERATION_OUTPUT_FORMAT_DEFAULT
+    )
 
 
 def test_pptx_accepted() -> None:

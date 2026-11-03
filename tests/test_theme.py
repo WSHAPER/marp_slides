@@ -14,6 +14,7 @@ from marp_slides.constructs import (
     ALLOWED_THEMES,
     MARP_THEMES,
     THEME_AUTO,
+    THEME_NEXTCLOUD,
     THEME_VALUES,
 )
 from marp_slides.deck_pipeline import (
@@ -27,8 +28,11 @@ from marp_slides.deck_pipeline import (
 # --- the theme task input ------------------------------------------------------
 
 
-def test_none_means_auto() -> None:
-    assert validate_theme(None) == "auto"
+def test_none_means_nextcloud_default() -> None:
+    """The generation task's default theme is the instance branding
+    (nextcloud): the task-type registration and this validator fallback
+    share the constructs single source."""
+    assert validate_theme(None) == THEME_NEXTCLOUD == "nextcloud"
 
 
 def test_all_values_accepted_and_normalized() -> None:
@@ -97,6 +101,12 @@ def test_system_prompt_instructs_the_pick_into_the_frontmatter() -> None:
 def test_theme_values_stay_consistent_with_the_theme_list() -> None:
     assert tuple(name for name, _description in MARP_THEMES) == ALLOWED_THEMES
     assert (THEME_AUTO, *ALLOWED_THEMES) == THEME_VALUES
+    # the instance-branded theme is a first-class member: the default task
+    # input and the generated theme (theming.THEME_NAME) both name it
+    assert THEME_NEXTCLOUD in ALLOWED_THEMES
+    from marp_slides.theming import THEME_NAME
+
+    assert THEME_NAME == THEME_NEXTCLOUD
 
 
 def test_auto_prompt_carries_no_override_clause() -> None:

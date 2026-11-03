@@ -27,12 +27,15 @@ RE_RENDER_PROVIDER_ID = "marp-slides:re_renderer"
 RE_RENDER_PROVIDER_NAME = "Marp Slide Deck Re-renderer"
 RE_RENDER_EXPECTED_RUNTIME_S = 10
 
-#: Accepted ``output_format`` values since v0.1.0: ``pptx`` (the default;
-#: native editable build via python-pptx), ``html`` (a single standalone HTML
-#: file rendered by marp-cli: Node only, no browser involved) and ``pdf``
-#: (a PDF document rendered by marp-cli through the bundled Chromium: the
-#: one output format that uses the browser shipped in the base image).
-#: marp-cli cannot emit ODP, so it is not offered.
+#: Accepted ``output_format`` values since v0.1.0: ``pptx`` (native
+#: editable build via python-pptx; the re-render task's default), ``html``
+#: (a single standalone HTML file rendered by marp-cli: Node only, no
+#: browser involved) and ``pdf`` (a PDF document rendered by marp-cli
+#: through the bundled Chromium: the one output format that uses the
+#: browser shipped in the base image). ``all`` generates every format as
+#: separate files; it is the generation task's default (see
+#: :data:`GENERATION_OUTPUT_FORMAT_DEFAULT`). marp-cli cannot emit ODP, so
+#: it is not offered.
 OUTPUT_FORMAT_VALUES = ("pptx", "html", "pdf", "all")
 
 #: Display names for the ENUM slot values (one per OUTPUT_FORMAT_VALUES entry).
@@ -45,11 +48,19 @@ OUTPUT_FORMAT_LABELS = {
 
 #: Description for the ``output_format`` input slot (states the allowed values).
 OUTPUT_FORMAT_DESCRIPTION = (
-    "Output file format for the deck: 'pptx' (editable PowerPoint, the default), "
-    "'html' (a single standalone HTML file), 'pdf' (a PDF document), or 'all' "
-    "(generates all three formats as separate files). ODP cannot be produced "
-    "because the Marp renderer has no ODP output."
+    "Output file format for the deck: 'pptx' (editable PowerPoint; the "
+    "re-render default), 'html' (a single standalone HTML file), 'pdf' (a "
+    "PDF document), or 'all' (generates all three formats as separate "
+    "files; the generation default). ODP cannot be produced because the "
+    "Marp renderer has no ODP output."
 )
+
+#: Default ``output_format`` of the GENERATION task type
+#: (``marp_slides:slide_deck_generation``) and its worker fallback: ``all``
+#: hands the user every deliverable (pptx, html and pdf plus the retained
+#: Markdown source) unless they deliberately narrow the selection. The
+#: re-render task keeps ``pptx`` (a single-deliverable refresh flow).
+GENERATION_OUTPUT_FORMAT_DEFAULT = "all"
 
 #: Input key of the nested ``core:text2text`` task (verified in
 #: server/lib/public/TaskProcessing/TaskTypes/TextToText.php).

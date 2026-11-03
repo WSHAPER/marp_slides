@@ -165,7 +165,14 @@ ALLOWED_FRONTMATTER_KEYS = (
 #: writes the chosen name into the frontmatter theme key.
 THEME_AUTO = "auto"
 
-#: The deck theme contract: the three themes bundled with marp-core, name +
+#: The instance-branded theme: unlike the marp-core themes its CSS is not
+#: bundled but generated at render time from this instance's theming values
+#: (:mod:`marp_slides.theming`, ``theming.THEME_NAME`` must match). The
+#: default ``theme`` task input of the generation task.
+THEME_NEXTCLOUD = "nextcloud"
+
+#: The deck theme contract: the three themes bundled with marp-core plus
+#: the generated instance-branded theme, name +
 #: 1-2 sentence description. Single source of truth: the validator's
 #: allow-list and the deck-authoring prompt's theme instructions are both
 #: derived from it, so prompt and validation cannot disagree. Custom CSS,
@@ -193,7 +200,7 @@ MARP_THEMES: tuple[tuple[str, str], ...] = (
         ),
     ),
     (
-        "nextcloud",
+        THEME_NEXTCLOUD,
         (
             "an instance-branded theme derived from this Nextcloud's admin "
             "theming (colors, background, slogan), for company or "

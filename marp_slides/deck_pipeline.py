@@ -21,7 +21,7 @@ from collections.abc import Mapping
 from pathlib import Path
 from typing import Any
 
-from .constructs import THEME_AUTO, THEME_VALUES
+from .constructs import THEME_AUTO, THEME_NEXTCLOUD, THEME_VALUES
 from .images import materialize_image_files
 from .marp_cli import (
     MARPRC_CONTENT,
@@ -162,15 +162,20 @@ def _validated_choice(
 
 
 def validate_output_format(
-    value: object, allowed: tuple[str, ...] = OUTPUT_FORMAT_VALUES
+    value: object,
+    allowed: tuple[str, ...] = OUTPUT_FORMAT_VALUES,
+    default: str = OUTPUT_FORMAT_VALUES[0],
 ) -> str:
     """Validate the optional ``output_format`` input; returns the normalized
-    value (or ``'pptx'`` default when absent). The default derives from
-    :data:`marp_slides.settings.OUTPUT_FORMAT_VALUES` so the accepted set
-    has exactly one source."""
+    value, or ``default`` when absent. The parameter default is the
+    re-render task's ``'pptx'``; the generation worker passes
+    :data:`marp_slides.settings.GENERATION_OUTPUT_FORMAT_DEFAULT`
+    (``'all'``) so each task type keeps its own default from one settings
+    source. The accepted set always derives from
+    :data:`marp_slides.settings.OUTPUT_FORMAT_VALUES`."""
     return _validated_choice(
         value,
-        "pptx",
+        default,
         allowed,
         "output_format",
         "ODP cannot be produced because the Marp renderer has no ODP output.",
@@ -179,17 +184,19 @@ def validate_output_format(
 
 def validate_theme(value: object, allowed: tuple[str, ...] = THEME_VALUES) -> str:
     """Validate the optional ``theme`` input; returns the normalized value
-    (or ``'auto'`` default when absent, meaning the model picks the
-    best-fitting theme). The default derives from
-    :data:`marp_slides.constructs.THEME_VALUES` so the accepted set has
-    exactly one source."""
+    (or ``'nextcloud'`` default when absent, the instance-branded theme:
+    the generation task's showcase default. 'auto' lets the model pick
+    the best-fitting theme instead). The default and the accepted set
+    derive from :data:`marp_slides.constructs` so the registration, the
+    validation and the tests share one source."""
     return _validated_choice(
         value,
-        THEME_AUTO,
+        THEME_NEXTCLOUD,
         allowed,
         "theme",
-        "Only the three themes bundled with Marp are supported; 'auto' "
-        "(the default) lets the model pick the best fit.",
+        "Only the three themes bundled with Marp and the instance-branded "
+        "nextcloud theme are supported; 'auto' lets the model pick the "
+        "best fit.",
     )
 
 

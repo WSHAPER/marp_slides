@@ -62,9 +62,13 @@ TASK = {
 }
 
 #: The default 3-slide Phase 1 plan (matching the slide outputs below).
+#: The plan carries the branded theme: the generation task's default
+#: ``theme`` input is 'nextcloud' (see constructs.THEME_NEXTCLOUD), so the
+#: default-theme plan the no-theme task inputs exercise must satisfy the
+#: override check against it.
 OUTLINE = {
     "title": "Quarterly Review",
-    "theme": "default",
+    "theme": THEME_NAME,
     "slides": [
         {"title": "Quarterly Review", "summary": "Open the deck.", "has_image": False},
         {"title": "Results", "summary": "Revenue and churn.", "has_image": False},
@@ -87,7 +91,7 @@ ASSEMBLED = assemble_deck(parse_outline(OUTLINE_JSON), SLIDES_OK)
 IMG_OUTLINE_JSON = json.dumps(
     {
         "title": "Img Deck",
-        "theme": "default",
+        "theme": THEME_NAME,
         "slides": [
             {"title": "Img Deck", "summary": "Open.", "has_image": False},
             {"title": "Diagram", "summary": "The diagram.", "has_image": True},
@@ -230,16 +234,22 @@ def no_real_build(monkeypatch):
     measurement drivers are faked so tests never need marp, Chromium or
     docker. The fit fakes report a fit (None per slide, no overflowing
     slide); overflow behavior is tested by overriding them per test."""
-    monkeypatch.setattr(task_worker, "marp_html_gate", lambda md, wd, t, bin: None)
+    monkeypatch.setattr(
+        task_worker, "marp_html_gate", lambda md, wd, t, bin, theming_values=None: None
+    )
     monkeypatch.setattr(
         task_worker,
         "render_deck_html",
-        lambda md, wd, t, bin, image_blobs=None: b"<html>standalone</html>",
+        lambda md, wd, t, bin, image_blobs=None, theming_values=None: (
+            b"<html>standalone</html>"
+        ),
     )
     monkeypatch.setattr(
         task_worker,
         "render_deck_pdf",
-        lambda md, wd, t, bin, image_blobs=None: b"%PDF-1.7 standalone",
+        lambda md, wd, t, bin, image_blobs=None, theming_values=None: (
+            b"%PDF-1.7 standalone"
+        ),
     )
     monkeypatch.setattr(
         task_worker, "build_pptx", lambda deck, title, images=None: b"PK-editable"
@@ -364,7 +374,11 @@ def test_all_formats_reports_every_deck_file(monkeypatch, settings) -> None:
     monkeypatch.setattr(task_worker, "schedule_and_wait", fake)
     monkeypatch.setattr(task_worker, "render_deck_html", lambda *a, **k: b"<html>x")
     monkeypatch.setattr(task_worker, "render_deck_pdf", lambda *a, **k: b"%PDF-x")
-    monkeypatch.setattr(task_worker, "marp_html_gate", lambda md, wd, t, bin: None)
+    monkeypatch.setattr(
+        task_worker,
+        "marp_html_gate",
+        lambda md, wd, t, bin, theming_values=None: None,
+    )
     monkeypatch.setattr(
         task_worker, "build_pptx", lambda deck, title, images=None: b"PK"
     )
@@ -387,6 +401,46 @@ def test_all_formats_reports_every_deck_file(monkeypatch, settings) -> None:
     ]
     # exactly ONE result report, after every render (no zombie re-pings)
     assert len(api.results) == 1
+
+
+def test_omitted_inputs_default_to_all_formats_and_nextcloud_theme(
+    monkeypatch, settings
+) -> None:
+    """The v0.2 defaults end to end: a task input naming ONLY the prompt
+    still gets every deliverable ('all') in the instance branding
+    ('nextcloud') - the outline prompt carries the theme requirement, the
+    assembled frontmatter names the branded theme, and all three formats
+    upload in generation order."""
+    fake, calls = nc_deck_scheduler()
+    monkeypatch.setattr(task_worker, "schedule_and_wait", fake)
+    monkeypatch.setattr(task_worker, "render_deck_html", lambda *a, **k: b"<html>x")
+    monkeypatch.setattr(task_worker, "render_deck_pdf", lambda *a, **k: b"%PDF-x")
+    monkeypatch.setattr(
+        task_worker,
+        "marp_html_gate",
+        lambda md, wd, t, bin, theming_values=None: None,
+    )
+    monkeypatch.setattr(
+        task_worker, "build_pptx", lambda deck, title, images=None: b"PK"
+    )
+    nc, api = make_fake_nc(capabilities={"theming": NC_THEMING_CAPS})
+    task_worker.process_task(
+        nc, dict(TASK, input={"prompt": "a deck about bees"}), settings
+    )
+    # the absent theme input resolved to the nextcloud requirement
+    assert "requires the 'nextcloud' theme" in calls[0]["input"]
+    (result,) = api.results
+    if result["output"] is not None:
+        assert result["output"]["slide_decks"] == [42, 43, 44]  # pptx, html, pdf
+        assert result["output"]["slide_deck_source"] == 45
+        assert [(t, f[0]) for t, f in api.uploads] == [
+            (5, "Quarterly-Review.pptx"),
+            (5, "Quarterly-Review.html"),
+            (5, "Quarterly-Review.pdf"),
+            (5, "Quarterly-Review.md"),
+        ]
+        # the retained source asks for the branded theme
+        assert b"theme: nextcloud" in api.uploads[3][1][1]
 
 
 # --- Files delivery of the deliverables (success path) -----------------------
@@ -742,7 +796,7 @@ def test_html_task_never_touches_pptx_builder_or_gate(monkeypatch, settings) -> 
     monkeypatch.setattr(task_worker, "schedule_and_wait", fake)
     calls: list[str] = []
 
-    def forbidden_gate(md, wd, t, bin):
+    def forbidden_gate(md, wd, t, bin, theming_values=None):
         calls.append("gate")
         raise AssertionError("gate must not run for html tasks")
 
@@ -750,7 +804,7 @@ def test_html_task_never_touches_pptx_builder_or_gate(monkeypatch, settings) -> 
         calls.append("build")
         raise AssertionError("build_pptx must not run for html tasks")
 
-    def fake_render(md, wd, t, bin, image_blobs=None):
+    def fake_render(md, wd, t, bin, image_blobs=None, theming_values=None):
         calls.append("render")
         return b"<html>standalone</html>"
 
@@ -775,7 +829,7 @@ def test_html_render_failure_not_retried(monkeypatch, settings) -> None:
     fake, calls = deck_scheduler()
     monkeypatch.setattr(task_worker, "schedule_and_wait", fake)
 
-    def failing(md, wd, t, bin, image_blobs=None):
+    def failing(md, wd, t, bin, image_blobs=None, theming_values=None):
         raise DeckError("The generated deck failed Marp HTML rendering (exit code 1).")
 
     monkeypatch.setattr(task_worker, "render_deck_html", failing)
@@ -845,14 +899,14 @@ def test_pdf_task_gate_first_then_render_never_pptx(monkeypatch, settings) -> No
     monkeypatch.setattr(task_worker, "schedule_and_wait", fake)
     calls: list[str] = []
 
-    def fake_gate(md, wd, t, bin):
+    def fake_gate(md, wd, t, bin, theming_values=None):
         calls.append("gate")
 
-    def fake_render_html(md, wd, t, bin, image_blobs=None):
+    def fake_render_html(md, wd, t, bin, image_blobs=None, theming_values=None):
         calls.append("render_html")
         raise AssertionError("html render must not run for pdf tasks")
 
-    def fake_render(md, wd, t, bin, image_blobs=None):
+    def fake_render(md, wd, t, bin, image_blobs=None, theming_values=None):
         calls.append("render_pdf")
         return b"%PDF-1.7 standalone"
 
@@ -881,7 +935,7 @@ def test_pdf_render_failure_not_retried(monkeypatch, settings) -> None:
     fake, calls = deck_scheduler()
     monkeypatch.setattr(task_worker, "schedule_and_wait", fake)
 
-    def failing(md, wd, t, bin, image_blobs=None):
+    def failing(md, wd, t, bin, image_blobs=None, theming_values=None):
         raise DeckError("The generated deck failed Marp PDF rendering (exit code 1).")
 
     monkeypatch.setattr(task_worker, "render_deck_pdf", failing)
@@ -905,10 +959,10 @@ def test_pdf_gate_failure_skips_chromium_render(monkeypatch, settings) -> None:
     fake, calls = deck_scheduler()
     monkeypatch.setattr(task_worker, "schedule_and_wait", fake)
 
-    def failing(md, wd, t, bin):
+    def failing(md, wd, t, bin, theming_values=None):
         raise DeckError("The generated deck failed Marp validation (exit code 1).")
 
-    def forbidden(md, wd, t, bin, image_blobs=None):
+    def forbidden(md, wd, t, bin, image_blobs=None, theming_values=None):
         raise AssertionError("Chromium render must not run after a gate failure")
 
     monkeypatch.setattr(task_worker, "marp_html_gate", failing)
@@ -1011,7 +1065,7 @@ def test_deck_error_from_gate_or_build_surfaces(monkeypatch, settings) -> None:
     fake, _calls = deck_scheduler()
     monkeypatch.setattr(task_worker, "schedule_and_wait", fake)
 
-    def failing(md, wd, t, bin):
+    def failing(md, wd, t, bin, theming_values=None):
         raise DeckError("The generated deck failed Marp validation (exit code 1).")
 
     monkeypatch.setattr(task_worker, "marp_html_gate", failing)
@@ -1240,7 +1294,7 @@ def test_gate_failure_not_retried(monkeypatch, settings) -> None:
     fake, calls = deck_scheduler()
     monkeypatch.setattr(task_worker, "schedule_and_wait", fake)
 
-    def failing(md, wd, t, bin):
+    def failing(md, wd, t, bin, theming_values=None):
         raise DeckError("The generated deck failed Marp validation (exit code 1).")
 
     monkeypatch.setattr(task_worker, "marp_html_gate", failing)
@@ -1366,7 +1420,7 @@ def test_outline_image_coverage_repaired_deterministically(
     under_marked = json.dumps(
         {
             "title": "Quarterly Review",
-            "theme": "default",
+            "theme": THEME_NAME,
             "slides": [
                 {"title": "Quarterly Review", "summary": "Open.", "has_image": True},
                 {"title": "Results", "summary": "Revenue.", "has_image": True},
@@ -1396,7 +1450,14 @@ def test_outline_image_coverage_repaired_deterministically(
     with caplog.at_level("INFO", logger="marp_slides.task_worker"):
         task_worker.process_task(
             nc,
-            dict(TASK, input={"prompt": "x", "images": [101, 102, 103, 104]}),
+            dict(
+                TASK,
+                input={
+                    "prompt": "x",
+                    "images": [101, 102, 103, 104],
+                    "output_format": "pptx",
+                },
+            ),
             settings,
         )
     # exactly TWO outline rounds (both under-marked), then 4 slides
@@ -1477,7 +1538,9 @@ def test_success_with_images_downloads_and_builds_with_blobs(
 
     monkeypatch.setattr(task_worker, "build_pptx", capture_build)
     task_worker.process_task(
-        nc, dict(TASK, input={"prompt": "x", "images": [101]}), settings
+        nc,
+        dict(TASK, input={"prompt": "x", "images": [101], "output_format": "pptx"}),
+        settings,
     )
     (result,) = api.results
     # the 120s minimum may cause a budget-exhausted failure depending on
@@ -1567,7 +1630,9 @@ def test_outline_without_image_marks_repaired_before_slides(
     nc, api = make_fake_nc(files=files)
     with caplog.at_level("INFO", logger="marp_slides.task_worker"):
         task_worker.process_task(
-            nc, dict(TASK, input={"prompt": "x", "images": [101]}), settings
+            nc,
+            dict(TASK, input={"prompt": "x", "images": [101], "output_format": "pptx"}),
+            settings,
         )
     assert len(calls) == 5  # two outline attempts + three slides, no third ask
     # the retry outline round carried the validation error as feedback
@@ -1601,7 +1666,9 @@ def test_deck_ignoring_planned_image_fails_after_re_authoring(
     files = FakeFilesAPI({101: fake_node(101)}, {101: png_bytes()})
     nc, api = make_fake_nc(files=files)
     task_worker.process_task(
-        nc, dict(TASK, input={"prompt": "x", "images": [101]}), settings
+        nc,
+        dict(TASK, input={"prompt": "x", "images": [101], "output_format": "pptx"}),
+        settings,
     )
     (result,) = api.results
     assert (
@@ -1626,7 +1693,9 @@ def test_missing_image_retry_re_authors_until_complete(monkeypatch, settings) ->
     files = FakeFilesAPI({101: fake_node(101)}, {101: blob})
     nc, api = make_fake_nc(files=files)
     task_worker.process_task(
-        nc, dict(TASK, input={"prompt": "x", "images": [101]}), settings
+        nc,
+        dict(TASK, input={"prompt": "x", "images": [101], "output_format": "pptx"}),
+        settings,
     )
     (result,) = api.results
     # the 120s minimum may cause a budget-exhausted failure depending on
@@ -1656,7 +1725,7 @@ def test_html_task_with_images_passes_blobs_to_render(monkeypatch, settings) -> 
     nc, api = make_fake_nc(files=files)
     seen: dict[str, object] = {}
 
-    def fake_render(md, wd, t, bin, image_blobs=None):
+    def fake_render(md, wd, t, bin, image_blobs=None, theming_values=None):
         seen["markdown"] = md
         seen["blobs"] = image_blobs
         return b"<html>standalone</html>"
@@ -1690,10 +1759,10 @@ def test_pdf_task_gates_imageless_then_renders_with_blobs(
     nc, api = make_fake_nc(files=files)
     calls: list[str] = []
 
-    def fake_gate(md, wd, t, bin):
+    def fake_gate(md, wd, t, bin, theming_values=None):
         calls.append(f"gate:{md == IMG_ASSEMBLED}")
 
-    def fake_render(md, wd, t, bin, image_blobs=None):
+    def fake_render(md, wd, t, bin, image_blobs=None, theming_values=None):
         calls.append(f"render:{image_blobs == {1: blob}}:{md == IMG_ASSEMBLED}")
         return b"%PDF-1.7 standalone"
 
@@ -1750,7 +1819,9 @@ def test_theme_override_mismatch_retried_then_corrected(
     nc, api = make_fake_nc()
     with caplog.at_level("WARNING", logger="marp_slides.task_worker"):
         task_worker.process_task(
-            nc, dict(TASK, input={"prompt": "x", "theme": "gaia"}), settings
+            nc,
+            dict(TASK, input={"prompt": "x", "theme": "gaia", "output_format": "pptx"}),
+            settings,
         )
     assert len(calls) == 5
     for llm_input in (calls[0]["input"], calls[1]["input"]):
@@ -1787,7 +1858,9 @@ def test_auto_theme_never_constrains_the_pick(monkeypatch, settings) -> None:
     monkeypatch.setattr(task_worker, "schedule_and_wait", fake)
     nc, api = make_fake_nc()
     task_worker.process_task(
-        nc, dict(TASK, input={"prompt": "x", "theme": "auto"}), settings
+        nc,
+        dict(TASK, input={"prompt": "x", "theme": "auto", "output_format": "pptx"}),
+        settings,
     )
     assert len(calls) == 4
     assert "requires the" not in calls[0]["input"]
@@ -1995,7 +2068,12 @@ def test_nextcloud_theme_pptx_logs_that_pptx_ignores_it(
     monkeypatch.setattr(task_worker, "marp_html_gate", fake_gate)
     with caplog.at_level("INFO", logger="marp_slides.task_worker"):
         task_worker.process_task(
-            nc, dict(TASK, input={"prompt": "x", "theme": "nextcloud"}), settings
+            nc,
+            dict(
+                TASK,
+                input={"prompt": "x", "theme": "nextcloud", "output_format": "pptx"},
+            ),
+            settings,
         )
     (result,) = api.results
     # the 120s minimum may cause a budget-exhausted failure depending on
@@ -2012,10 +2090,12 @@ def test_nextcloud_theme_pptx_logs_that_pptx_ignores_it(
 
 
 def test_bundled_theme_renders_without_theming_kwargs(monkeypatch, settings) -> None:
-    """A bundled theme (the default path) must not carry the branded-theme
-    payload: the render kwargs stay exactly as before the nextcloud theme
-    existed, even when theming capabilities ARE available."""
-    fake, _calls = deck_scheduler()
+    """A bundled theme must not carry the branded-theme payload: the
+    render kwargs stay exactly as before the nextcloud theme existed,
+    even when theming capabilities ARE available. The theme is requested
+    explicitly (the task default is the branded nextcloud theme now)."""
+    outline = json.dumps(dict(OUTLINE, theme="default"), indent=2)
+    fake, _calls = deck_scheduler(slides=SLIDES_OK, outline_json=outline)
     monkeypatch.setattr(task_worker, "schedule_and_wait", fake)
     nc, api = make_fake_nc(capabilities={"theming": NC_THEMING_CAPS})
     seen: dict[str, object] = {}
@@ -2026,7 +2106,12 @@ def test_bundled_theme_renders_without_theming_kwargs(monkeypatch, settings) -> 
 
     monkeypatch.setattr(task_worker, "render_deck_html", fake_render)
     task_worker.process_task(
-        nc, dict(TASK, input={"prompt": "x", "output_format": "html"}), settings
+        nc,
+        dict(
+            TASK,
+            input={"prompt": "x", "output_format": "html", "theme": "default"},
+        ),
+        settings,
     )
     (result,) = api.results
     # the 120s minimum may cause a budget-exhausted failure depending on
@@ -2087,7 +2172,9 @@ def test_image_reference_out_of_bounds_is_retried_then_corrects(
     nc, api = make_fake_nc(files=files)
     with caplog.at_level("WARNING", logger="marp_slides.task_worker"):
         task_worker.process_task(
-            nc, dict(TASK, input={"prompt": "x", "images": [101]}), settings
+            nc,
+            dict(TASK, input={"prompt": "x", "images": [101], "output_format": "pptx"}),
+            settings,
         )
     assert len(calls) == 4  # outline + slide 1 + slide 2 twice
     assert "#file:2" in calls[3]["input"]  # corrective feedback names the ref
@@ -2103,7 +2190,7 @@ def test_image_reference_without_images_input_fails_actionably(
     outline = json.dumps(
         {
             "title": "Quarterly Review",
-            "theme": "default",
+            "theme": THEME_NAME,
             "slides": [
                 {"title": "Quarterly Review", "summary": "Open.", "has_image": False},
                 {"title": "Diagram", "summary": "The diagram.", "has_image": False},
@@ -2133,7 +2220,9 @@ def test_image_fetch_failure_not_retried(monkeypatch, settings) -> None:
     files = FakeFilesAPI({101: node}, {101: png_bytes()})
     nc, api = make_fake_nc(files=files)
     task_worker.process_task(
-        nc, dict(TASK, input={"prompt": "x", "images": [101]}), settings
+        nc,
+        dict(TASK, input={"prompt": "x", "images": [101], "output_format": "pptx"}),
+        settings,
     )
     assert len(calls) == 3
     (result,) = api.results
@@ -2243,7 +2332,7 @@ def test_final_attempt_slide_is_heurastically_repaired(monkeypatch) -> None:
     outline = json.dumps(
         {
             "title": "T",
-            "theme": "default",
+            "theme": THEME_NAME,
             "slides": [{"title": "S", "summary": "", "has_image": False}],
         }
     )
@@ -2371,7 +2460,9 @@ def test_max_slides_input_binds_the_outline_plan(monkeypatch) -> None:
     monkeypatch.setattr(task_worker, "schedule_and_wait", fake)
     nc, api = make_fake_nc()
     task_worker.process_task(
-        nc, dict(TASK, input={"prompt": "x", "max_slides": 6}), Settings()
+        nc,
+        dict(TASK, input={"prompt": "x", "max_slides": 6, "output_format": "pptx"}),
+        Settings(),
     )
     assert api.results[0]["output"] == SUCCESS_OUTPUT
     outline_prompt = prompts[0]
@@ -2435,7 +2526,7 @@ def test_overflowing_slide_retried_with_fit_feedback(monkeypatch, settings) -> N
     report = overflow_report(slide=1)  # a lone section measures as 1
     measured: list[str] = []
 
-    def fake_measure(md, wd):
+    def fake_measure(md, wd, theming_values=None):
         measured.append(md)
         return report if "bullet 30" in md else None
 
@@ -2455,7 +2546,7 @@ def test_overflowing_slide_retried_with_fit_feedback(monkeypatch, settings) -> N
     (result,) = api.results
     assert result["output"] == SUCCESS_OUTPUT  # the corrected slide shipped
     overflowing_md = next(md for md in measured if "bullet 30" in md)
-    assert overflowing_md.startswith("---\nmarp: true\ntheme: default\n---")
+    assert overflowing_md.startswith("---\nmarp: true\ntheme: nextcloud\n---")
 
 
 def test_overflowing_slide_failing_twice_reports_overflow(
@@ -2469,7 +2560,7 @@ def test_overflowing_slide_failing_twice_reports_overflow(
     the third, prescription round before the deterministic tiers."""
     report = overflow_report()
 
-    def fake_measure(md, wd):
+    def fake_measure(md, wd, theming_values=None):
         return report if "bullet" in md else None
 
     monkeypatch.setattr(task_worker, "measure_slide_overflow", fake_measure)
@@ -2493,10 +2584,10 @@ def test_deck_overflow_backstop_fails_render_before_any_output(
     batch render-time measurement rejects: non-retryable like the other
     render gates, BEFORE the marp gate runs or any file uploads."""
 
-    def overflowing_deck(md, wd):
+    def overflowing_deck(md, wd, theming_values=None):
         return (overflow_report(),)
 
-    def forbidden_gate(md, wd, t, bin):
+    def forbidden_gate(md, wd, t, bin, theming_values=None):
         raise AssertionError("the fit backstop must reject before the marp gate")
 
     monkeypatch.setattr(task_worker, "measure_deck_overflow", overflowing_deck)
@@ -2520,7 +2611,7 @@ def test_per_slide_one_line_grace_passes(monkeypatch, settings) -> None:
     burn the retry, the slide ships verbatim."""
     graceful = replace(overflow_report(slide=1), overflow_y_px=20)  # 20 < 33px line
 
-    def fake_measure(md, wd):
+    def fake_measure(md, wd, theming_values=None):
         return graceful
 
     monkeypatch.setattr(task_worker, "measure_slide_overflow", fake_measure)
@@ -2542,7 +2633,7 @@ def test_deck_backstop_one_line_grace_passes(monkeypatch, settings) -> None:
     the test above)."""
     graceful = (replace(overflow_report(), overflow_y_px=25),)  # 25 < 33px line
 
-    def graceful_deck(md, wd):
+    def graceful_deck(md, wd, theming_values=None):
         return graceful
 
     monkeypatch.setattr(task_worker, "measure_deck_overflow", graceful_deck)
@@ -2562,7 +2653,7 @@ def test_exhausted_overflow_slide_shrinks_to_fit(monkeypatch, settings, caplog) 
     the cut slide re-passes validation and the fit gate, and the log
     NAMES what was dropped."""
 
-    def fake_measure(md, wd):
+    def fake_measure(md, wd, theming_values=None):
         return overflow_report(slide=1) if "bullet 30" in md else None
 
     monkeypatch.setattr(task_worker, "measure_slide_overflow", fake_measure)
@@ -2600,7 +2691,7 @@ def test_exhausted_overflow_slide_without_bullets_fails(monkeypatch, settings) -
         f"Paragraph {i} with a lot of words that wrap." for i in range(1, 12)
     )
 
-    def fake_measure(md, wd):
+    def fake_measure(md, wd, theming_values=None):
         return overflow_report(slide=1) if "Paragraph 11" in md else None
 
     monkeypatch.setattr(task_worker, "measure_slide_overflow", fake_measure)
@@ -2622,10 +2713,10 @@ def test_fitting_deck_pipeline_output_unchanged(monkeypatch, settings) -> None:
     slide_measures: list[str] = []
     deck_measures: list[str] = []
 
-    def fitting_slide(md, wd):
+    def fitting_slide(md, wd, theming_values=None):
         slide_measures.append(md)  # falls through: a fit is reported as None
 
-    def fitting_deck(md, wd):
+    def fitting_deck(md, wd, theming_values=None):
         deck_measures.append(md)
         return ()
 
@@ -2657,10 +2748,10 @@ def test_overflow_check_off_skips_both_gates(monkeypatch, settings) -> None:
     never invoked (the toggle skips the checks; it does not fake a fit)."""
     calls: list[str] = []
 
-    def forbidden_slide(md, wd):
+    def forbidden_slide(md, wd, theming_values=None):
         calls.append("slide")
 
-    def forbidden_deck(md, wd):
+    def forbidden_deck(md, wd, theming_values=None):
         calls.append("deck")
 
     monkeypatch.setattr(task_worker, "measure_slide_overflow", forbidden_slide)
@@ -2723,7 +2814,11 @@ def test_nextcloud_theme_measurement_gets_theming_values(monkeypatch, settings) 
     )
     nc, api = make_fake_nc(capabilities={"theming": NC_THEMING_CAPS})
     task_worker.process_task(
-        nc, dict(TASK, input={"prompt": "x", "theme": "nextcloud"}), settings
+        nc,
+        dict(
+            TASK, input={"prompt": "x", "theme": "nextcloud", "output_format": "pptx"}
+        ),
+        settings,
     )
     (result,) = api.results
     assert result["output"] == SUCCESS_OUTPUT
@@ -2741,13 +2836,22 @@ def test_nextcloud_theme_measurement_gets_theming_values(monkeypatch, settings) 
         assert isinstance(deck_values, ThemingValues)
         assert deck_values.color == "#0082c9"
 
-    # bundled theme: no theming kwarg rides either measurement
+    # bundled theme: no theming kwarg rides either measurement (the theme
+    # is requested explicitly; the task default is the branded theme)
     slide_kwargs.clear()
     deck_kwargs.clear()
-    fake, _calls = deck_scheduler()
+    bundled_outline = json.dumps(dict(OUTLINE, theme="default"), indent=2)
+    fake, _calls = deck_scheduler(slides=SLIDES_OK, outline_json=bundled_outline)
     monkeypatch.setattr(task_worker, "schedule_and_wait", fake)
     nc, api = make_fake_nc(capabilities={"theming": NC_THEMING_CAPS})
-    task_worker.process_task(nc, TASK, settings)
+    task_worker.process_task(
+        nc,
+        dict(
+            TASK,
+            input={"prompt": "x", "theme": "default", "output_format": "pptx"},
+        ),
+        settings,
+    )
     assert api.results[0]["output"] == SUCCESS_OUTPUT
     assert slide_kwargs == [{} for _ in range(3)]
     assert deck_kwargs == [{}, {}]  # fit pass + render gate
@@ -2779,11 +2883,11 @@ BAD_SLIDE = "## Bad\n\n### ###"
 
 
 def checkpoint_draft(**overrides: object) -> DeckDraft:
-    """A checkpoint matching OUTLINE (3 slides, theme default) that a
-    resume task picks up via draft_id 'abc123def456'."""
+    """A checkpoint matching OUTLINE (3 slides, the default nextcloud
+    theme) that a resume task picks up via draft_id 'abc123def456'."""
     values: dict[str, object] = {
         "prompt": "a deck about bees",
-        "theme": "default",
+        "theme": THEME_NAME,
         "max_slides": 8,
         "image_file_ids": [],
         "outline": json.loads(OUTLINE_JSON),
@@ -2808,7 +2912,7 @@ def test_checkpoint_created_at_outline_completion(
     assert base_dir == fake_draft_store.base_dir
     assert first.slides == {}
     assert first.outline["title"] == "Quarterly Review"
-    assert first.outline["theme"] == "default"
+    assert first.outline["theme"] == THEME_NAME
     assert [s["title"] for s in first.outline["slides"]] == [
         s["title"] for s in OUTLINE["slides"]
     ]
@@ -2818,7 +2922,7 @@ def test_checkpoint_created_at_outline_completion(
         s.title for s in parse_outline(OUTLINE_JSON).slides
     ]
     assert first.prompt == "a deck about bees"
-    assert first.theme == "default"  # the outline's concrete theme
+    assert first.theme == THEME_NAME  # the outline's concrete theme
     assert first.max_slides == 8
     assert re.match(r"^[0-9a-f]{12}$", first.draft_id)
 
@@ -2926,7 +3030,14 @@ def test_resume_skips_done_slides(monkeypatch, settings, fake_draft_store) -> No
     nc, api = make_fake_nc()
     task_worker.process_task(
         nc,
-        dict(TASK, input={"prompt": "a deck about bees", "draft_id": "abc123def456"}),
+        dict(
+            TASK,
+            input={
+                "prompt": "a deck about bees",
+                "draft_id": "abc123def456",
+                "output_format": "pptx",
+            },
+        ),
         settings,
     )
     (result,) = api.results
@@ -2948,13 +3059,21 @@ def test_resume_with_mismatched_theme_is_rejected(
     """Compatibility: the prompt may be rephrased, but a hard theme that
     differs from the checkpoint's outline theme rejects the resume with
     the actionable mismatch message (both themes named, remedy given)."""
-    fake_draft_store.seed(checkpoint_draft())  # outline theme 'default'
+    fake_draft_store.seed(checkpoint_draft())  # outline theme 'nextcloud'
     fake, calls = make_llm(["unused"])
     monkeypatch.setattr(task_worker, "schedule_and_wait", fake)
     nc, api = make_fake_nc()
     task_worker.process_task(
         nc,
-        dict(TASK, input={"prompt": "x", "theme": "gaia", "draft_id": "abc123def456"}),
+        dict(
+            TASK,
+            input={
+                "prompt": "x",
+                "theme": "gaia",
+                "draft_id": "abc123def456",
+                "output_format": "pptx",
+            },
+        ),
         settings,
     )
     assert calls == []  # rejected before any LLM round
@@ -2962,7 +3081,7 @@ def test_resume_with_mismatched_theme_is_rejected(
     assert result["output"] is None
     message = result["user_facing_error_message"]
     assert "cannot be resumed" in message
-    assert "'default'" in message and "'gaia'" in message
+    assert "'nextcloud'" in message and "'gaia'" in message
     assert "Re-run without draft_id" in message
 
 
@@ -3044,7 +3163,9 @@ def test_generation_with_draft_file_resumes_from_header_comment(
     monkeypatch.setattr(task_worker, "schedule_and_wait", fake)
     nc, api = make_fake_nc(files=files)
     task_worker.process_task(
-        nc, dict(TASK, input={"prompt": "x", "draft_file": 303}), settings
+        nc,
+        dict(TASK, input={"prompt": "x", "draft_file": 303, "output_format": "pptx"}),
+        settings,
     )
     (result,) = api.results
     assert result["output"] == SUCCESS_OUTPUT
@@ -3089,7 +3210,12 @@ def test_generation_draft_file_wins_over_draft_id_text(
         nc,
         dict(
             TASK,
-            input={"prompt": "x", "draft_id": "999000999000", "draft_file": 303},
+            input={
+                "prompt": "x",
+                "draft_id": "999000999000",
+                "draft_file": 303,
+                "output_format": "pptx",
+            },
         ),
         settings,
     )
@@ -3111,7 +3237,9 @@ def test_generation_draft_file_without_header_comment_fails_actionably(
     monkeypatch.setattr(task_worker, "schedule_and_wait", fake)
     nc, api = make_fake_nc(files=files)
     task_worker.process_task(
-        nc, dict(TASK, input={"prompt": "x", "draft_file": 303}), settings
+        nc,
+        dict(TASK, input={"prompt": "x", "draft_file": 303, "output_format": "pptx"}),
+        settings,
     )
     assert calls == []  # rejected before any round
     (result,) = api.results
@@ -3135,7 +3263,9 @@ def test_generation_draft_file_pruned_checkpoint_surfaces_store_remedy(
     monkeypatch.setattr(task_worker, "schedule_and_wait", fake)
     nc, api = make_fake_nc(files=files)
     task_worker.process_task(
-        nc, dict(TASK, input={"prompt": "x", "draft_file": 303}), settings
+        nc,
+        dict(TASK, input={"prompt": "x", "draft_file": 303, "output_format": "pptx"}),
+        settings,
     )
     assert calls == []
     (result,) = api.results
@@ -3224,7 +3354,12 @@ def test_resume_rides_checkpoint_images_when_task_has_none(
     files = FakeFilesAPI({101: fake_node(101)}, {101: png_bytes()})
     nc, api = make_fake_nc(files=files)
     task_worker.process_task(
-        nc, dict(TASK, input={"prompt": "x", "draft_id": "abc123def456"}), settings
+        nc,
+        dict(
+            TASK,
+            input={"prompt": "x", "draft_id": "abc123def456", "output_format": "pptx"},
+        ),
+        settings,
     )
     (result,) = api.results
     assert result["output"] == SUCCESS_OUTPUT
@@ -3256,7 +3391,15 @@ def test_resume_task_images_win_over_checkpoint(
     nc, api = make_fake_nc(files=files)
     task_worker.process_task(
         nc,
-        dict(TASK, input={"prompt": "x", "draft_id": "abc123def456", "images": [202]}),
+        dict(
+            TASK,
+            input={
+                "prompt": "x",
+                "draft_id": "abc123def456",
+                "images": [202],
+                "output_format": "pptx",
+            },
+        ),
         settings,
     )
     (result,) = api.results
@@ -3361,7 +3504,11 @@ def test_resume_end_to_end_with_real_store(
         nc2,
         dict(
             TASK,
-            input={"prompt": "a rephrased request about bees", "draft_id": draft_id},
+            input={
+                "prompt": "a rephrased request about bees",
+                "draft_id": draft_id,
+                "output_format": "pptx",
+            },
         ),
         settings,
     )
@@ -3403,7 +3550,9 @@ def test_re_authoring_after_completeness_failure_updates_draft_in_place(
     files = FakeFilesAPI({101: fake_node(101)}, {101: png_bytes()})
     nc, api = make_fake_nc(files=files)
     task_worker.process_task(
-        nc, dict(TASK, input={"prompt": "x", "images": [101]}), settings
+        nc,
+        dict(TASK, input={"prompt": "x", "images": [101], "output_format": "pptx"}),
+        settings,
     )
     (result,) = api.results
     assert result["output"] is None

@@ -30,9 +30,10 @@ from nc_py_api.ex_app.providers.task_processing import (
     TaskType,
 )
 
-from .constructs import ALLOWED_THEMES, THEME_AUTO, THEME_VALUES
+from .constructs import ALLOWED_THEMES, THEME_AUTO, THEME_NEXTCLOUD, THEME_VALUES
 from .settings import (
     EXPECTED_RUNTIME_S,
+    GENERATION_OUTPUT_FORMAT_DEFAULT,
     OUTPUT_FORMAT_LABELS,
     OUTPUT_FORMAT_VALUES,
     PROVIDER_ID,
@@ -50,12 +51,13 @@ THEME_LABELS = {
     THEME_AUTO: "Automatic: the model picks the best fit",
 } | {name: name.capitalize() for name in ALLOWED_THEMES}
 
-#: Description for the ``theme`` input slot (states the allowed values and
-#: that the pptx output ignores the theme).
+#: Description for the ``theme`` input slot (states the default, the
+#: allowed values and that the pptx output ignores the theme).
 THEME_DESCRIPTION = (
-    "Deck theme for the html and pdf outputs: 'auto' (the default; the model "
-    f"picks the best-fitting of {list(ALLOWED_THEMES)}) or one of those theme "
-    "names to require it for the deck. The pptx output ignores the theme."
+    "Deck theme for the html and pdf outputs: 'nextcloud' (the default; "
+    "this instance's branding), one of "
+    f"{list(ALLOWED_THEMES)} to require it for the deck, or 'auto' to "
+    "let the model pick the best fit. The pptx output ignores the theme."
 )
 
 #: The ``output_format`` ENUM slot values, shared verbatim by both providers
@@ -65,15 +67,15 @@ OUTPUT_FORMAT_ENUM_VALUES = [
     for value in OUTPUT_FORMAT_VALUES
 ]
 
-#: Description for the ``output_format`` slot of the authoring provider.
-OUTPUT_FORMAT_SLOT_DESCRIPTION = (
-    "Output file format for the deck; 'pptx' is the default."
+#: Description for the GENERATION task's ``output_format`` slot: the
+#: governance default is 'all' (every deliverable at once).
+GENERATION_OUTPUT_FORMAT_SLOT_DESCRIPTION = (
+    "Output file format for the deck; 'all' (pptx + html + pdf) is the default."
 )
 
-#: Description for the re-render task's ``output_format`` slot: the SAME
-#: slot, but the re-render form carries its own default ('all', the
-#: governance default for the deterministic re-render: every deliverable
-#: fresh), so the label names that default instead of the authoring one.
+#: Description for the re-render task's ``output_format`` slot: the same
+#: governance default ('all'), so a deterministic re-render delivers every
+#: format fresh from the edited source.
 RE_RENDER_OUTPUT_FORMAT_SLOT_DESCRIPTION = (
     "Output file format for the deck; 'all' (pptx + html + pdf) is the default."
 )
@@ -84,8 +86,9 @@ TASK_TYPE = TaskType(
     description=(
         "Turns a prompt into a slide deck. A language model writes Marp "
         "Markdown from the prompt; the deck is rendered as an editable "
-        "PowerPoint (PPTX, the default), a standalone HTML presentation or "
-        "a PDF document, with speaker notes (except PDF, which excludes "
+        "PowerPoint (PPTX), a standalone HTML presentation and a PDF "
+        "document by default (all three formats unless you narrow the "
+        "selection), with speaker notes (except PDF, which excludes "
         "them). The validated Markdown source is kept alongside."
     ),
     input_shape=[
@@ -128,7 +131,7 @@ PROVIDER = TaskProcessingProvider(
     optional_input_shape=[
         ShapeDescriptor(
             name="output_format",
-            description=OUTPUT_FORMAT_SLOT_DESCRIPTION,
+            description=GENERATION_OUTPUT_FORMAT_SLOT_DESCRIPTION,
             shape_type=ShapeType.ENUM,
         ),
         ShapeDescriptor(
@@ -181,8 +184,8 @@ PROVIDER = TaskProcessingProvider(
         ],
     },
     optional_input_shape_defaults={
-        "output_format": OUTPUT_FORMAT_VALUES[0],
-        "theme": THEME_AUTO,
+        "output_format": GENERATION_OUTPUT_FORMAT_DEFAULT,
+        "theme": THEME_NEXTCLOUD,
         "max_slides": 8,
     },
 )

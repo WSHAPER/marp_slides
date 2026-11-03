@@ -8,7 +8,9 @@ from __future__ import annotations
 from nc_py_api.ex_app.providers.task_processing import ShapeType
 
 from marp_slides import task_definition
+from marp_slides.constructs import THEME_NEXTCLOUD, THEME_VALUES
 from marp_slides.settings import (
+    GENERATION_OUTPUT_FORMAT_DEFAULT,
     OUTPUT_FORMAT_LABELS,
     OUTPUT_FORMAT_VALUES,
     PROVIDER_ID,
@@ -62,12 +64,24 @@ def test_provider_shape() -> None:
     ]
     assert all(v.name and v.name != v.value for v in enum_values)
     assert provider.optional_input_shape_defaults == {
-        "output_format": "pptx",
-        "theme": "auto",
+        "output_format": GENERATION_OUTPUT_FORMAT_DEFAULT,
+        "theme": THEME_NEXTCLOUD,
         "max_slides": 8,
     }
     assert theme_slot.shape_type == ShapeType.ENUM
     assert images_slot.shape_type == ShapeType.LIST_OF_FILES
+
+
+def test_generation_defaults_are_the_contract_constants() -> None:
+    """The registered defaults have ONE source each: the 'all' output
+    format default must be a member of the ENUM the provider registers,
+    and the theme default must be a value the theme ENUM offers (a
+    registered default the dropdown cannot show would drift silently)."""
+    from marp_slides.settings import OUTPUT_FORMAT_VALUES
+
+    assert GENERATION_OUTPUT_FORMAT_DEFAULT == "all"
+    assert GENERATION_OUTPUT_FORMAT_DEFAULT in OUTPUT_FORMAT_VALUES
+    assert THEME_NEXTCLOUD in THEME_VALUES
 
 
 def test_theme_slot_enum_mirrors_the_constructs_constant() -> None:
@@ -89,7 +103,10 @@ def test_theme_description_states_values_and_pptx_limit() -> None:
     (_fmt, theme_slot, _ms, _draft, _draft_file, _images) = (
         provider.optional_input_shape
     )
+    # the default (nextcloud, the instance branding) is stated, 'auto' and
+    # every bundled theme remain named, and the pptx limitation stays
     assert "'auto'" in theme_slot.description
+    assert "'nextcloud' (the default" in theme_slot.description
     for name in ("default", "gaia", "uncover"):
         assert f"'{name}'" in theme_slot.description
     assert "pptx output ignores the theme" in theme_slot.description
@@ -136,9 +153,11 @@ def test_enum_description_is_one_clean_sentence() -> None:
     provider = task_definition.PROVIDER
     (fmt, _theme, _ms, _draft, _draft_file, _images) = provider.optional_input_shape
     # one short human sentence: the dropdown options already enumerate the
-    # formats, so the label only states the purpose and the default
+    # formats, so the label only states the purpose and the default. The
+    # GENERATION default is 'all'; the re-render task keeps its own 'pptx'
+    # default and its own slot description (untouched by this change).
     assert fmt.description == (
-        "Output file format for the deck; 'pptx' is the default."
+        "Output file format for the deck; 'all' (pptx + html + pdf) is the default."
     )
 
 
