@@ -65,9 +65,17 @@ OUTPUT_FORMAT_ENUM_VALUES = [
     for value in OUTPUT_FORMAT_VALUES
 ]
 
-#: Description for the ``output_format`` slot, shared by both providers.
+#: Description for the ``output_format`` slot of the authoring provider.
 OUTPUT_FORMAT_SLOT_DESCRIPTION = (
     "Output file format for the deck; 'pptx' is the default."
+)
+
+#: Description for the re-render task's ``output_format`` slot: the SAME
+#: slot, but the re-render form carries its own default ('all', the
+#: governance default for the deterministic re-render: every deliverable
+#: fresh), so the label names that default instead of the authoring one.
+RE_RENDER_OUTPUT_FORMAT_SLOT_DESCRIPTION = (
+    "Output file format for the deck; 'all' (pptx + html + pdf) is the default."
 )
 
 TASK_TYPE = TaskType(
@@ -187,8 +195,23 @@ PROVIDER = TaskProcessingProvider(
 #: it (by hand or by a chat LLM) and feeds it back here. The source arrives
 #: as EITHER the ``markdown`` text OR the ``deck_source_file`` file input
 #: (both optional on the provider: picking the .md from Files is the same
-#: deliberate act as pasting the text), so the task type itself declares no
-#: required input.
+#: deliberate act as pasting the text).
+#:
+#: Form flattening: ``output_format`` is declared here as a REQUIRED slot
+#: (with a registered default, below on the provider) because the Assistant
+#: form renders required ``inputShape`` fields directly in the basic flow
+#: while every ``optionalInputShape`` field hides behind the collapsed
+#: "Show advanced options" toggle (TaskTypeFields.vue gates the optional
+#: fields behind ``showAdvanced``, false by default). The server satisfies
+#: an absent required slot from its registered default and back-fills it
+#: (Manager.php ``validateInput``/``fillInputDefaults``), so callers that
+#: omit ``output_format`` keep working — same accepted payloads. The source
+#: pair and ``file_references`` CANNOT follow: TaskProcessing has no
+#: optional-but-visible placement, file slots may not carry defaults, and a
+#: required slot must actually be present (the server rejects absent keys
+#: and the form blocks submit until every required slot is non-empty),
+#: which would break the either/or source contract and the optional-images
+#: contract. They stay optional by protocol necessity, not by choice.
 RE_RENDER_TASK_TYPE = TaskType(
     id=RE_RENDER_TASK_TYPE_ID,
     name="Re-render a slide deck",
@@ -198,7 +221,13 @@ RE_RENDER_TASK_TYPE = TaskType(
         "same rendering as the generation task, deterministically. Edit the "
         "retained Markdown source and re-render to update the deck."
     ),
-    input_shape=[],
+    input_shape=[
+        ShapeDescriptor(
+            name="output_format",
+            description=RE_RENDER_OUTPUT_FORMAT_SLOT_DESCRIPTION,
+            shape_type=ShapeType.ENUM,
+        ),
+    ],
     output_shape=[
         ShapeDescriptor(
             name="slide_decks",
@@ -224,12 +253,26 @@ RE_RENDER_TASK_TYPE = TaskType(
 
 #: The deterministic re-render provider: synchronous (the render cost only,
 #: no authoring round), so the expected runtime is 10 seconds instead of
-#: the authoring task's 120.
+#: the authoring task's 120. The ``output_format`` slot lives on the
+#: REQUIRED input shape (see RE_RENDER_TASK_TYPE) so the form shows it in
+#: the basic flow, preselected with the governance default 'all' — the
+#: dropdown values are the same shared list as the authoring provider's, so
+#: the two can never drift.
 RE_RENDER_PROVIDER = TaskProcessingProvider(
     id=RE_RENDER_PROVIDER_ID,
     name=RE_RENDER_PROVIDER_NAME,
     task_type=RE_RENDER_TASK_TYPE_ID,
     expected_runtime=RE_RENDER_EXPECTED_RUNTIME_S,
+    input_shape_enum_values={
+        "output_format": OUTPUT_FORMAT_ENUM_VALUES,
+    },
+    # governance default for the flattened form: a deterministic re-render
+    # refreshes every deliverable ('all' covers pptx, html and pdf); the
+    # server back-fills it for callers that omit the key, and the worker
+    # accepts the same four values as before
+    input_shape_defaults={
+        "output_format": "all",
+    },
     optional_input_shape=[
         ShapeDescriptor(
             name="markdown",
@@ -252,11 +295,6 @@ RE_RENDER_PROVIDER = TaskProcessingProvider(
             shape_type=ShapeType.FILE,
         ),
         ShapeDescriptor(
-            name="output_format",
-            description=OUTPUT_FORMAT_SLOT_DESCRIPTION,
-            shape_type=ShapeType.ENUM,
-        ),
-        ShapeDescriptor(
             name="file_references",
             description=(
                 "Optional override images for the markdown's '#file:N' "
@@ -268,10 +306,6 @@ RE_RENDER_PROVIDER = TaskProcessingProvider(
             shape_type=ShapeType.LIST_OF_FILES,
         ),
     ],
-    optional_input_shape_enum_values={
-        "output_format": OUTPUT_FORMAT_ENUM_VALUES,
-    },
-    optional_input_shape_defaults={
-        "output_format": OUTPUT_FORMAT_VALUES[0],
-    },
+    optional_input_shape_enum_values={},
+    optional_input_shape_defaults={},
 )

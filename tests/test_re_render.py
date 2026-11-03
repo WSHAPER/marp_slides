@@ -16,6 +16,7 @@ from marp_slides.deck_pipeline import DeckError, validate_deck
 from marp_slides.settings import (
     HTML_MIME_TYPE,
     MARKDOWN_MIME_TYPE,
+    OUTPUT_FORMAT_VALUES,
     PDF_MIME_TYPE,
     PPTX_MIME_TYPE,
     PROVIDER_ID,
@@ -87,10 +88,13 @@ def no_llm_no_real_render(monkeypatch):
 def test_re_render_task_type_shape() -> None:
     tt = task_definition.RE_RENDER_TASK_TYPE
     assert tt.id == RE_RENDER_TASK_TYPE_ID == "marp_slides:re_render"
-    # no required inputs: the deck source arrives as EITHER the optional
-    # 'markdown' text OR the optional 'deck_source_file' file (declared on
-    # the provider below), enforced exactly-one-of by the worker
-    assert tt.input_shape == []
+    # output_format is the ONE required input (with a registered default on
+    # the provider) so the Assistant form renders it directly in the basic
+    # flow instead of behind the collapsed advanced toggle; the deck source
+    # itself stays optional (EITHER the 'markdown' text OR the
+    # 'deck_source_file' file below) — see the flatten guard test
+    assert [s.name for s in tt.input_shape] == ["output_format"]
+    assert tt.input_shape[0].shape_type == ShapeType.ENUM
     assert [s.name for s in tt.output_shape] == ["slide_decks", "slide_deck_source"]
     assert tt.output_shape[0].shape_type == ShapeType.LIST_OF_FILES
     assert tt.output_shape[1].shape_type == ShapeType.FILE
@@ -104,24 +108,75 @@ def test_re_render_provider_shape() -> None:
     assert [s.name for s in provider.optional_input_shape] == [
         "markdown",
         "deck_source_file",
-        "output_format",
         "file_references",
     ]
-    text_slot, file_slot, fmt_slot, files_slot = provider.optional_input_shape
+    text_slot, file_slot, files_slot = provider.optional_input_shape
     assert text_slot.shape_type == ShapeType.TEXT
     assert file_slot.shape_type == ShapeType.FILE
-    assert fmt_slot.shape_type == ShapeType.ENUM
     assert files_slot.shape_type == ShapeType.LIST_OF_FILES
-    assert [
-        v.value for v in provider.optional_input_shape_enum_values["output_format"]
-    ] == [
-        "pptx",
-        "html",
-        "pdf",
-        "all",
-    ]
-    assert provider.optional_input_shape_defaults == {"output_format": "pptx"}
+    # the moved slot: ENUM values and the governance default now ride on
+    # the REQUIRED input shape (visible in the basic flow, preselected)
+    assert [v.value for v in provider.input_shape_enum_values["output_format"]] == list(
+        OUTPUT_FORMAT_VALUES
+    )
+    assert provider.input_shape_defaults == {"output_format": "all"}
+    # nothing optional is left with a dropdown or a default: the advanced
+    # section holds only the protocol-pinned plain slots
+    assert provider.optional_input_shape_enum_values == {}
+    assert provider.optional_input_shape_defaults == {}
     assert provider.optional_output_shape == []
+
+
+def test_re_render_form_is_flattened_to_the_protocol_limit() -> None:
+    """The UX-defect regression guard: no re_render input that CAN sit in
+    the basic flow is relegated to the advanced section. The Assistant form
+    renders required ``inputShape`` fields directly and every
+    ``optionalInputShape`` field behind the collapsed "Show advanced
+    options" toggle, so the testable flatten property is: every slot that
+    is advanced-hidden today is there because the TaskProcessing protocol
+    pins it — file slots cannot carry defaults (the server rejects defaults
+    on file/list slots), and a required slot must actually be present (the
+    server rejects absent keys and the form blocks submit until every
+    required slot is non-empty), which would break the either/or deck
+    source contract and the optional-images contract. Concretely: the only
+    defaultable slot (output_format, a scalar ENUM) MUST be required, and
+    exactly the three pinned slots may remain optional."""
+    provider = task_definition.RE_RENDER_PROVIDER
+    tt = task_definition.RE_RENDER_TASK_TYPE
+    # the promotable slot was promoted: required, never advanced-hidden
+    assert "output_format" not in [s.name for s in provider.optional_input_shape]
+    assert [s.name for s in tt.input_shape] == ["output_format"]
+    # a required ENUM must ship its dropdown values and a default: the
+    # server validates the default like any value, and an absent key is
+    # satisfied by it (accepted payloads unchanged)
+    assert provider.input_shape_enum_values["output_format"] == (
+        task_definition.OUTPUT_FORMAT_ENUM_VALUES
+    )
+    default = provider.input_shape_defaults["output_format"]
+    assert default in OUTPUT_FORMAT_VALUES
+    # exactly the protocol-pinned slots stay in the advanced section
+    assert sorted(s.name for s in provider.optional_input_shape) == sorted(
+        ["markdown", "deck_source_file", "file_references"]
+    )
+    # none of the pinned slots is defaultable (file shapes): they MUST stay
+    # optional or previously accepted payloads would be rejected
+    assert all(
+        slot.shape_type in (ShapeType.FILE, ShapeType.LIST_OF_FILES, ShapeType.TEXT)
+        for slot in provider.optional_input_shape
+    )
+
+
+def test_re_render_governance_default_is_all_formats() -> None:
+    """The flattened form's visible default is the governance default
+    'all': a deterministic re-render refreshes every deliverable (pptx,
+    html and pdf). The label must teach the same default the form
+    preselects — never the authoring task's 'pptx'."""
+    provider = task_definition.RE_RENDER_PROVIDER
+    fmt_slot = task_definition.RE_RENDER_TASK_TYPE.input_shape[0]
+    assert provider.input_shape_defaults == {"output_format": "all"}
+    assert "'all'" in fmt_slot.description
+    assert "default" in fmt_slot.description
+    assert "'pptx' is the default" not in fmt_slot.description
 
 
 def test_re_render_source_slots_teach_the_either_of_choice() -> None:
@@ -129,7 +184,7 @@ def test_re_render_source_slots_teach_the_either_of_choice() -> None:
     frontmatter requirement and the either-or, the file slot promises the
     as-is render (no AI round) and where the .md comes from."""
     provider = task_definition.RE_RENDER_PROVIDER
-    text_slot, file_slot, _fmt, _files = provider.optional_input_shape
+    text_slot, file_slot, _files = provider.optional_input_shape
     assert "frontmatter" in text_slot.description
     assert "deck source file" in text_slot.description
     assert "Markdown source" in file_slot.description
@@ -138,13 +193,12 @@ def test_re_render_source_slots_teach_the_either_of_choice() -> None:
 
 
 def test_re_render_output_format_enum_mirrors_the_authoring_provider() -> None:
-    """One source for the dropdown: the re-render ENUM values equal the
-    authoring provider's entry for entry (pydantic copies the shared list
-    into each dataclass, so equality, not identity)."""
+    """One source for the dropdown: the re-render ENUM values (now on the
+    required input shape) equal the authoring provider's entry for entry
+    (pydantic copies the shared list into each dataclass, so equality, not
+    identity)."""
     assert (
-        task_definition.RE_RENDER_PROVIDER.optional_input_shape_enum_values[
-            "output_format"
-        ]
+        task_definition.RE_RENDER_PROVIDER.input_shape_enum_values["output_format"]
         == task_definition.PROVIDER.optional_input_shape_enum_values["output_format"]
     )
 
