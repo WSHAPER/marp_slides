@@ -1805,7 +1805,7 @@ def test_html_image_fetch_failure_not_retried(monkeypatch, settings) -> None:
     assert (
         result["output"] is not None or result["user_facing_error_message"] is not None
     )
-    assert "only PNG and JPEG" in result["user_facing_error_message"]
+    assert "only PNG, JPEG and WebP" in result["user_facing_error_message"]
 
 
 # --- v0.1.x: the theme input threads through authoring --------------------------
@@ -2235,7 +2235,7 @@ def test_image_fetch_failure_not_retried(monkeypatch, settings) -> None:
     assert (
         result["output"] is not None or result["user_facing_error_message"] is not None
     )
-    assert "only PNG and JPEG" in result["user_facing_error_message"]
+    assert "only PNG, JPEG and WebP" in result["user_facing_error_message"]
 
 
 def test_invalid_images_slot_fails_before_any_llm_round(monkeypatch, settings) -> None:

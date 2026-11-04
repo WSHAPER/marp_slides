@@ -12,11 +12,16 @@ id it contains: this module resolves the references through nc_py_api
 path context_agent uses) and enforces the caps with actionable messages
 BEFORE anything reaches the builder:
 
-- PNG and JPEG only (SVG and every other image format are rejected);
+- PNG, JPEG and WebP only (SVG and every other image format are rejected);
+- WebP is normalized to PNG ONCE, right after the download: python-pptx
+  cannot embed WebP, so the transcoded PNG is the only byte form any
+  consumer (the html/pdf data URIs and the native PPTX build) ever sees;
 - max 5 MB per image, checked against the server-reported size AND the
-  downloaded bytes;
+  downloaded bytes (bounding the download and decode effort) AND the
+  post-transcode PNG size (the embedded bytes are the honest budget);
 - the downloaded bytes are sniffed (magic bytes, not the server metadata)
-  and must really be PNG or JPEG.
+  and must really be PNG, JPEG or WebP, and a file claiming PNG or JPEG
+  that is really WebP (or the reverse) is rejected as a mislabeled file.
 
 Only images actually referenced by the deck are downloaded.
 
@@ -49,27 +54,43 @@ instead of failing the task — the honest deck beats no deck.
 from __future__ import annotations
 
 import base64
+import io
 import posixpath
 import re
 from collections.abc import Iterator, Mapping, Sequence
 from typing import Any
 from urllib.parse import quote, unquote
 
-from PIL import UnidentifiedImageError
+from PIL import Image, ImageOps, UnidentifiedImageError
 from pptx.parts.image import Image as PPTXImage
 
 from .editable_pptx import ImageBlock, ParsedDeck
 from .slide_blocks import FENCE_OPEN_RE
 from .validator import DeckError
 
-#: Hard caps for deck images (PNG/JPEG only, no SVG in v1).
+#: Hard caps for deck images (PNG/JPEG/WebP in, no SVG in v1; WebP is
+#: transcoded to PNG on download because python-pptx cannot embed it).
 MAX_IMAGE_BYTES = 5 * 1024 * 1024
-ALLOWED_IMAGE_MIME_TYPES = ("image/png", "image/jpeg")
-ALLOWED_IMAGE_CONTENT_TYPES = ("image/png", "image/jpeg")
+ALLOWED_IMAGE_MIME_TYPES = ("image/png", "image/jpeg", "image/webp")
+ALLOWED_IMAGE_CONTENT_TYPES = ("image/png", "image/jpeg", "image/webp")
 
-#: File extension for each sniffed-and-allowed content type, used when the
-#: html/pdf renders materialize blobs into the marp workdir (file-N.<ext>).
-IMAGE_FILE_EXTENSIONS = {"image/png": "png", "image/jpeg": "jpg"}
+#: File extension for each sniffed-and-allowed content type, used when a
+#: delivered deck folder falls back to a copied image
+#: (``<stem>-img-<N>.<ext>``): the copy keeps the user's original bytes
+#: (WebP included; the re-render path re-transcodes on every fetch).
+IMAGE_FILE_EXTENSIONS = {
+    "image/png": "png",
+    "image/jpeg": "jpg",
+    "image/webp": "webp",
+}
+
+#: The content types the render embedders accept AS-IS (data URIs for the
+#: html/pdf renders, native pictures for the PPTX build). WebP is absent
+#: on purpose: downloads transcode WebP to PNG before any consumer sees
+#: the bytes, so a WebP blob reaching an embedder means the normalization
+#: point was bypassed, and it is rejected rather than embedded in a form
+#: the PPTX build could not consume.
+EMBEDDABLE_IMAGE_CONTENT_TYPES = ("image/png", "image/jpeg")
 
 #: The validated image construct, exactly: ``![alt](#file:N)``. The rewrite
 #: below only ever touches this shape (an image reference carrying a 1-based
@@ -93,12 +114,44 @@ def sniff_image_content_type(data: bytes) -> str:
     (python-pptx/PIL header sniffing, not the server's metadata). Raises
     DeckError with an actionable message when the bytes are not a readable
     image at all."""
+    if data[0:4] == b"RIFF" and data[8:12] == b"WEBP":
+        # python-pptx cannot sniff WebP (its header table predates the
+        # format), so the magic signature is checked first; the same
+        # check the theme-background sniff runs on its bytes.
+        return "image/webp"
     try:
         return PPTXImage.from_blob(data).content_type
     except (UnidentifiedImageError, ValueError) as exc:
         raise DeckError(
-            "The image data could not be read as an image at all (PNG and JPEG are "
-            "supported). Use a valid PNG or JPEG file, or remove the image reference."
+            "The image data could not be read as an image at all (PNG, JPEG "
+            "and WebP are supported). Use a valid PNG, JPEG or WebP file, or "
+            "remove the image reference."
+        ) from exc
+
+
+def _transcode_webp_to_png(data: bytes) -> bytes:
+    """Decode WebP bytes and re-encode them as PNG: the ONE normalization
+    every WebP download goes through before any consumer sees the bytes
+    (python-pptx has no WebP support, and the html/pdf data URIs and the
+    PPTX build must consume the same blob set). An animated WebP yields
+    its first frame (a deck slide is a static picture); EXIF orientation
+    is applied and the ICC profile carried over so the pixels survive
+    visually intact, which lossless WebP does bit for bit. Raises
+    DeckError with an actionable message when the bytes do not decode."""
+    try:
+        with Image.open(io.BytesIO(data)) as source:
+            icc_profile: bytes | None = source.info.get("icc_profile")
+            frame = ImageOps.exif_transpose(source)
+            if frame.mode not in ("RGB", "RGBA"):
+                frame = frame.convert("RGBA")
+            out = io.BytesIO()
+            frame.save(out, format="PNG", icc_profile=icc_profile)
+            return out.getvalue()
+    except Exception as exc:  # an undecodable WebP is bad input data
+        raise DeckError(
+            "The WebP image data could not be decoded (a corrupt or "
+            "truncated file). Use a valid PNG, JPEG or WebP file, or remove "
+            "the image reference."
         ) from exc
 
 
@@ -177,6 +230,43 @@ def validate_image_references(
     return indices
 
 
+def _normalized_image_bytes(data: bytes, mimetype: str, where: str, name: str) -> bytes:
+    """Sniff the downloaded bytes, reject disallowed content and WebP
+    declaration lies, and normalize: a WebP blob is transcoded to PNG
+    here, the ONE point at which any consumer's bytes change form. The
+    post-transcode size is checked against the cap: the embedded bytes
+    are the honest budget, while the caller's checks bound the download
+    and decode effort."""
+    content_type = sniff_image_content_type(data)
+    if content_type not in ALLOWED_IMAGE_CONTENT_TYPES:
+        raise DeckError(
+            f"{where}, '{name}', is actually a '{content_type}' image "
+            f"although the server declared it '{mimetype}'; only PNG, JPEG "
+            "and WebP are supported. Convert the image or remove the "
+            "reference."
+        )
+    if (content_type == "image/webp") != (mimetype == "image/webp"):
+        # WebP alone changes what happens to the bytes (a transcode to
+        # PNG), so a PNG/JPEG declaration on WebP bytes, or the reverse,
+        # is a mislabeled file, not an accepted image.
+        raise DeckError(
+            f"{where}, '{name}', is actually a '{content_type}' image "
+            f"although the server declared it '{mimetype}'; a WebP image "
+            "must be declared as WebP. Convert the image or remove the "
+            "reference."
+        )
+    if content_type != "image/webp":
+        return data
+    data = _transcode_webp_to_png(data)
+    if len(data) > MAX_IMAGE_BYTES:
+        raise DeckError(
+            f"{where}, '{name}', converts to a {len(data)}-byte "
+            f"PNG for embedding; the maximum is {MAX_IMAGE_BYTES} "
+            "bytes (5 MB) per image. Use a smaller image."
+        )
+    return data
+
+
 def fetch_image_blobs(
     nc: Any, file_ids: Sequence[int | str], indices: Sequence[int]
 ) -> dict[int, bytes]:
@@ -184,9 +274,11 @@ def fetch_image_blobs(
     API (``by_id`` + ``download``), enforcing the caps. ``file_ids`` may mix
     task-input ids (ints) and path-resolved ids (the opaque strings
     ``by_path`` reports) — ``by_id`` accepts both. Returns a mapping of
-    1-based deck position -> picture bytes. Download failures and cap
-    violations raise DeckError with actionable messages (input-data failures:
-    the worker does NOT retry them: only deck-authoring failures retry)."""
+    1-based deck position -> picture bytes, with WebP positions normalized
+    to PNG bytes (the only form any consumer ever receives). Download
+    failures and cap violations raise DeckError with actionable messages
+    (input-data failures: the worker does NOT retry them: only
+    deck-authoring failures retry)."""
     blobs: dict[int, bytes] = {}
     for index in indices:
         file_id = file_ids[index - 1]
@@ -204,9 +296,9 @@ def fetch_image_blobs(
         mimetype = node.info.mimetype
         if mimetype not in ALLOWED_IMAGE_MIME_TYPES:
             raise DeckError(
-                f"{where}, '{node.name}', is a '{mimetype}' file; only PNG and JPEG "
-                "images are supported (SVG and every other format are not). Convert "
-                "the image or remove the reference."
+                f"{where}, '{node.name}', is a '{mimetype}' file; only PNG, "
+                "JPEG and WebP images are supported (SVG and every other "
+                "format are not). Convert the image or remove the reference."
             )
         reported_size = node.info.content_length
         if reported_size > MAX_IMAGE_BYTES:
@@ -221,14 +313,7 @@ def fetch_image_blobs(
                 f"maximum is {MAX_IMAGE_BYTES} bytes (5 MB) per image. Use a "
                 "smaller image."
             )
-        content_type = sniff_image_content_type(data)
-        if content_type not in ALLOWED_IMAGE_CONTENT_TYPES:
-            raise DeckError(
-                f"{where}, '{node.name}', is actually a '{content_type}' image "
-                f"although the server declared it '{mimetype}'; only PNG and JPEG "
-                "are supported. Convert the image or remove the reference."
-            )
-        blobs[index] = data
+        blobs[index] = _normalized_image_bytes(data, mimetype, where, node.name)
     return blobs
 
 
@@ -275,10 +360,12 @@ def materialize_image_files(markdown: str, image_blobs: Mapping[int, bytes]) -> 
     file_names: dict[int, str] = {}
     for index, blob in image_blobs.items():
         content_type = sniff_image_content_type(blob)
-        if content_type not in IMAGE_FILE_EXTENSIONS:
+        if content_type not in EMBEDDABLE_IMAGE_CONTENT_TYPES:
             raise DeckError(
-                f"Image {index} is a '{content_type}' image; only PNG and JPEG are "
-                "supported. Convert the image or remove the reference."
+                f"Image {index} is a '{content_type}' image; only PNG and "
+                "JPEG can be embedded in renders (a WebP image is converted "
+                "to PNG when it is downloaded). Convert the image or remove "
+                "the reference."
             )
         file_names[index] = (
             f"data:{content_type};base64,{base64.b64encode(blob).decode('ascii')}"

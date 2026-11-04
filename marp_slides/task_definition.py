@@ -170,8 +170,8 @@ PROVIDER = TaskProcessingProvider(
         ShapeDescriptor(
             name="images",
             description=(
-                "Optional images to place in the deck (PNG or JPEG, max 5 MB "
-                "each; SVG is not supported)."
+                "Optional images to place in the deck (PNG, JPEG or WebP, "
+                "max 5 MB each; SVG is not supported)."
             ),
             shape_type=ShapeType.LIST_OF_FILES,
         ),
@@ -297,7 +297,7 @@ RE_RENDER_PROVIDER = TaskProcessingProvider(
             name="file_references",
             description=(
                 "Optional override images for the markdown's '#file:N' "
-                "references (PNG or JPEG, max 5 MB each; SVG is not "
+                "references (PNG, JPEG or WebP, max 5 MB each; SVG is not "
                 "supported). Images referenced by their Files path resolve "
                 "automatically; a '#file:N' reference with no provided "
                 "image is dropped and the deck renders without it."

@@ -80,7 +80,8 @@ SUPPORTED_CONSTRUCTS: tuple[tuple[str, str], ...] = (
         (
             "images provided with the task as '![alt text](#file:N)' on a line of their "
             "own, N is the 1-based position in the task's images input list; each becomes "
-            "a native picture (PNG or JPEG, max 5 MB per image), optionally with a "
+            "a native picture (PNG, JPEG or WebP, max 5 MB per image; WebP is converted "
+            "to PNG), optionally with a "
             "sizing keyword ('![w:200px](#file:N)', h: likewise; html and pdf output "
             "apply it, the PPTX build keeps the native size)"
         ),

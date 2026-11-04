@@ -61,11 +61,11 @@ def test_system_prompt_teaches_exactly_the_supported_constructs() -> None:
 
 def test_system_prompt_teaches_the_file_id_image_form() -> None:
     """v0.1.0: the only image form taught is '![alt text](#file:N)' on a line
-    of its own, 1-based into the task's images list, PNG/JPEG, 5 MB cap."""
+    of its own, 1-based into the task's images list, PNG/JPEG/WebP, 5 MB cap."""
     for fragment in (
         "![alt text](#file:N)",
         "1-based position in the task's images list",
-        "PNG or JPEG, max 5 MB",
+        "PNG, JPEG or WebP, max 5 MB",
         "never invent positions",
         "SVG is not supported",
     ):

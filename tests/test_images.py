@@ -11,7 +11,9 @@ from types import SimpleNamespace
 
 import pytest
 from PIL import Image
+from pptx.parts.image import Image as PPTXImage
 
+from marp_slides import images as images_module
 from marp_slides.deck_pipeline import DeckError, validate_deck
 from marp_slides.images import (
     MAX_IMAGE_BYTES,
@@ -45,6 +47,17 @@ def gif_bytes() -> bytes:
     buf = io.BytesIO()
     Image.new("RGB", (10, 10), "green").save(buf, "GIF")
     return buf.getvalue()
+
+
+def webp_bytes(
+    w: int = 60, h: int = 30, color: tuple[int, int, int] = (13, 77, 201)
+) -> bytes:
+    buf = io.BytesIO()
+    Image.new("RGB", (w, h), color).save(buf, "WEBP", lossless=True)
+    return buf.getvalue()
+
+
+PNG_MAGIC = b"\x89PNG\r\n\x1a\n"
 
 
 def fake_node(
@@ -222,6 +235,15 @@ def test_sniff_garbage_rejected_actionably() -> None:
         sniff_image_content_type(b"definitely not image data")
 
 
+def test_sniff_webp() -> None:
+    # python-pptx cannot sniff WebP (its header table predates the format),
+    # so the magic signature carries it; a RIFF container that is NOT webp
+    # (a WAV) still falls through to the honest unreadable-image error
+    assert sniff_image_content_type(webp_bytes()) == "image/webp"
+    with pytest.raises(DeckError, match="could not be read as an image"):
+        sniff_image_content_type(b"RIFF____WAVEfmt ")
+
+
 # --- capped download through the fake nc client ---------------------------------------
 
 
@@ -262,14 +284,14 @@ def test_fetch_folder_rejected() -> None:
 def test_fetch_wrong_mimetype_rejected() -> None:
     node = fake_node(7, mimetype="image/svg+xml", name="d.svg")
     nc = make_fake_nc({7: node}, {7: b"<svg/>"})
-    with pytest.raises(DeckError, match=r"image/svg\+xml.*only PNG and JPEG"):
+    with pytest.raises(DeckError, match=r"image/svg\+xml.*only PNG, JPEG and WebP"):
         fetch_image_blobs(nc, [7], [1])
 
 
 def test_fetch_gif_rejected() -> None:
     node = fake_node(8, mimetype="image/gif", name="a.gif")
     nc = make_fake_nc({8: node}, {8: gif_bytes()})
-    with pytest.raises(DeckError, match="only PNG and JPEG"):
+    with pytest.raises(DeckError, match="only PNG, JPEG and WebP"):
         fetch_image_blobs(nc, [8], [1])
 
 
@@ -301,6 +323,112 @@ def test_fetch_garbage_bytes_rejected() -> None:
     nc = make_fake_nc({3: node}, {3: b"\x00" * 64})
     with pytest.raises(DeckError, match="could not be read as an image"):
         fetch_image_blobs(nc, [3], [1])
+
+
+# --- WebP: accepted at the slot, normalized to PNG at the fetch seam ---------------
+
+
+def test_fetch_webp_accepted_and_transcoded_to_png() -> None:
+    """A WebP task-input image is accepted and normalized: the fetched
+    bytes carry the PNG magic, and a LOSSLESS WebP survives the transcode
+    pixel for pixel (decode quality verified empirically, not just the
+    absence of exceptions)."""
+    original = webp_bytes(64, 32, (17, 120, 9))
+    node = fake_node(11, mimetype="image/webp", name="pic.webp", size=len(original))
+    nc = make_fake_nc({11: node}, {11: original})
+    blobs = fetch_image_blobs(nc, [11], [1])
+    (blob,) = blobs.values()
+    assert blob[:8] == PNG_MAGIC
+    with (
+        Image.open(io.BytesIO(blob)) as normalized,
+        Image.open(io.BytesIO(original)) as source,
+    ):
+        assert normalized.format == "PNG"
+        assert normalized.size == source.size
+        assert normalized.convert("RGB").tobytes() == source.convert("RGB").tobytes()
+
+
+def test_fetch_webp_feeds_materialize_and_pptx_as_png() -> None:
+    """ONE normalization point: the same fetched dict feeds the html/pdf
+    data-URI materialization and the native PPTX picture build (which
+    cannot embed WebP), and both receive clean PNG bytes."""
+    node = fake_node(11, mimetype="image/webp", name="pic.webp")
+    nc = make_fake_nc({11: node}, {11: webp_bytes()})
+    blobs = fetch_image_blobs(nc, [11], [1])
+    rewritten = materialize_image_files("![a](#file:1)\n", blobs)
+    assert "data:image/png;base64," in rewritten
+    assert "webp" not in rewritten.lower()
+    # exactly what slide.shapes.add_picture does with the blob
+    assert PPTXImage.from_blob(blobs[1]).content_type == "image/png"
+
+
+def test_fetch_webp_claiming_png_rejected() -> None:
+    # a file claiming PNG that is really WebP: the sniff catches the lie
+    blob = webp_bytes()
+    node = fake_node(12, mimetype="image/png", name="fake.png", size=len(blob))
+    nc = make_fake_nc({12: node}, {12: blob})
+    with pytest.raises(DeckError, match="must be declared as WebP"):
+        fetch_image_blobs(nc, [12], [1])
+
+
+def test_fetch_png_claiming_webp_rejected() -> None:
+    # and the reverse: a WebP declaration on PNG bytes is equally a lie
+    blob = png_bytes()
+    node = fake_node(13, mimetype="image/webp", name="fake.webp", size=len(blob))
+    nc = make_fake_nc({13: node}, {13: blob})
+    with pytest.raises(DeckError, match="must be declared as WebP"):
+        fetch_image_blobs(nc, [13], [1])
+
+
+def test_fetch_jpeg_bytes_under_png_name_still_accepted() -> None:
+    # PNG and JPEG declarations stay interchangeable (both embed as-is,
+    # no transcode decision rides on them); only the WebP boundary is
+    # strict, because only WebP changes what happens to the bytes
+    blob = jpeg_bytes()
+    node = fake_node(15, mimetype="image/png", name="photo.png", size=len(blob))
+    nc = make_fake_nc({15: node}, {15: blob})
+    assert fetch_image_blobs(nc, [15], [1]) == {1: blob}
+
+
+def test_fetch_webp_cap_applies_to_transcoded_png(monkeypatch) -> None:
+    """Size-cap placement pinned: the pre-transcode checks (server-reported
+    and downloaded size) bound the download and decode effort, and the cap
+    that guards the output is the POST-transcode PNG size: this WebP passes
+    both pre-checks yet its PNG conversion exceeds the cap and fails."""
+    original = webp_bytes(60, 30, (13, 77, 201))
+    node = fake_node(14, mimetype="image/webp", name="pic.webp", size=len(original))
+    nc = make_fake_nc({14: node}, {14: original})
+    monkeypatch.setattr(images_module, "MAX_IMAGE_BYTES", len(original))
+    with pytest.raises(DeckError, match=r"converts to a \d+-byte PNG.*maximum"):
+        fetch_image_blobs(nc, [14], [1])
+
+
+def test_fetch_corrupt_webp_rejected_actionably() -> None:
+    # the magic survives truncation, so the transcode is where a broken
+    # WebP surfaces: an actionable input-data error, never an internal one
+    broken = webp_bytes()[:24] + b"\x00" * 8
+    node = fake_node(16, mimetype="image/webp", name="broken.webp", size=len(broken))
+    nc = make_fake_nc({16: node}, {16: broken})
+    with pytest.raises(DeckError, match="could not be decoded"):
+        fetch_image_blobs(nc, [16], [1])
+
+
+def test_fetch_animated_webp_takes_its_first_frame() -> None:
+    # a deck slide is a static picture: an animated WebP normalizes to the
+    # frame the decoder itself yields first, pixel for pixel
+    frame0 = Image.new("RGB", (20, 20), (200, 0, 0))
+    frame1 = Image.new("RGB", (20, 20), (0, 0, 200))
+    buf = io.BytesIO()
+    frame0.save(buf, "WEBP", save_all=True, append_images=[frame1], duration=500)
+    animated = buf.getvalue()
+    with Image.open(io.BytesIO(animated)) as decoded:
+        first_frame = decoded.convert("RGB").tobytes()
+    node = fake_node(17, mimetype="image/webp", name="anim.webp", size=len(animated))
+    nc = make_fake_nc({17: node}, {17: animated})
+    (blob,) = fetch_image_blobs(nc, [17], [1]).values()
+    with Image.open(io.BytesIO(blob)) as normalized:
+        assert normalized.format == "PNG"
+        assert normalized.convert("RGB").tobytes() == first_frame
 
 
 # --- render materialization (html/pdf output) ------------------------------------------
@@ -365,8 +493,18 @@ def test_materialize_garbage_blob_rejected(tmp_path) -> None:
 
 
 def test_materialize_unsupported_type_rejected(tmp_path) -> None:
-    with pytest.raises(DeckError, match="only PNG and JPEG"):
+    with pytest.raises(DeckError, match="only PNG and JPEG can be embedded"):
         materialize_image_files("![a](#file:1)\n", {1: gif_bytes()})
+
+
+def test_materialize_rejects_raw_webp_blobs(tmp_path) -> None:
+    """WebP must arrive already transcoded (the fetch seam does it), so a
+    raw WebP blob reaching the embedder means the normalization point was
+    bypassed: rejected, never silently embedded in a form the PPTX build
+    could not consume."""
+    with pytest.raises(DeckError, match=r"only PNG and JPEG can be embedded"):
+        materialize_image_files("![a](#file:1)\n", {1: webp_bytes()})
+    assert list(tmp_path.iterdir()) == []
 
 
 # --- background images: bounds + render materialization -------------------------------
@@ -606,6 +744,26 @@ def test_convert_appends_after_known_ids_and_reuses_them() -> None:
     assert dropped == 0
 
 
+def test_rerender_path_resolves_webp_and_normalizes_identically() -> None:
+    """A delivered-path reference to a WebP original resolves back to
+    '#file:N' on the re-render path, and the SAME fetch normalization
+    applies: the blob the renders and the PPTX build receive is PNG."""
+    original = webp_bytes(50, 25, (9, 90, 9))
+    node = fake_node(
+        101, mimetype="image/webp", name="pic.webp", path="Photos/pic.webp"
+    )
+    nc = path_nc({101: node}, {101: original}, {"Photos/pic.webp": node})
+    markdown = "---\nmarp: true\ntitle: t\n---\n\n# T\n\n![img](Photos/pic.webp)\n"
+    converted, resolved, dropped = convert_path_references(
+        nc, markdown, user_id="alice"
+    )
+    assert "![img](#file:1)" in converted
+    assert resolved == [101]
+    assert dropped == 0
+    (blob,) = fetch_image_blobs(nc, [101], [1]).values()
+    assert blob[:8] == PNG_MAGIC
+
+
 def test_convert_drops_unresolvable_own_line_references() -> None:
     """A path that no longer resolves (image deleted, share gone) degrades
     to rendering without the image: the own-line construct and the
@@ -745,6 +903,23 @@ def test_delivered_paths_keep_file_form_when_undownloadable() -> None:
     )
     assert paths == {}
     assert copies == []
+
+
+def test_delivered_paths_copy_keeps_webp_original() -> None:
+    """The self-contained copy beside the deck keeps the user's WebP bytes
+    under a .webp name (the delivered source stays faithful to what was
+    attached); every re-render re-transcodes on fetch, so no generational
+    PNG copy is ever stored."""
+    original = webp_bytes()
+    node = fake_node(
+        101, mimetype="image/webp", name="pic.webp", path="Sharer/only/pic.webp"
+    )
+    nc = path_nc({101: node}, {101: original}, {})  # by_path cannot verify it
+    paths, copies = resolve_delivered_image_paths(
+        nc, "alice", "Marp Slides", "Quarterly-Review", [101], [1]
+    )
+    assert paths == {1: "Quarterly-Review-img-1.webp"}
+    assert copies == [("Quarterly-Review-img-1.webp", original, "image/webp")]
 
 
 def test_rewrite_source_to_paths_forms() -> None:

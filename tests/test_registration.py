@@ -167,8 +167,8 @@ def test_images_slot_description_is_one_clean_sentence() -> None:
         provider.optional_input_shape
     )
     assert images_slot.description == (
-        "Optional images to place in the deck (PNG or JPEG, max 5 MB "
-        "each; SVG is not supported)."
+        "Optional images to place in the deck (PNG, JPEG or WebP, "
+        "max 5 MB each; SVG is not supported)."
     )
     # the '#file:N' reference syntax is LLM-facing and is taught where the
     # model needs it (prompts/deck_system_prompt.md), not in the form label
