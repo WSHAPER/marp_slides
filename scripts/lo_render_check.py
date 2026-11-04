@@ -19,14 +19,29 @@ container is unavailable. Then verify with pdftotext:
 
 Usage:
     python3 scripts/lo_render_check.py FIXTURE.md [--keep DIR]
+    python3 scripts/lo_render_check.py FIXTURE.md --ci
 
 The Collabora container name comes from the COLLABORA_CONTAINER
 environment variable (default: collabora-code).
+
+--ci mode (nightly lane): non-interactive, machine-readable, structured
+exit codes. The existing checks run unchanged; only the reporting and
+the failure taxonomy differ. Exactly one JSON object goes to stdout:
+
+    {"schema": 1, "status": "pass"|"fail"|"error", "engine": ...,
+     "fixture": ..., "checks": {"survival": {...}, "overflow": {...},
+     "monospace": {...}}, "failure_count": N}
+
+Exit codes: 0 all checks pass; 1 a check failed (deck content or
+rendering); 2 environment/infrastructure error (a needed tool missing,
+the conversion itself failing, an invalid fixture). Prose output and
+exit semantics WITHOUT --ci are unchanged.
 """
 
 from __future__ import annotations
 
 import argparse
+import json
 import os
 import re
 import shutil
@@ -41,6 +56,7 @@ sys.path.insert(0, str(REPO))
 
 from marp_slides.deck_pipeline import validate_deck
 from marp_slides.editable_pptx import build_pptx
+from marp_slides.validator import DeckError
 
 # Deployment-specific container name; override per environment.
 COLLABORA_CONTAINER = os.environ.get("COLLABORA_CONTAINER", "collabora-code")
@@ -192,11 +208,24 @@ def check_monospace(pdf: Path) -> list[str]:
 
 
 def main() -> int:
+    """Parse the invocation; the human path stays in :func:`_human_main`
+    (its branch shape is unchanged) and --ci dispatches to :func:`_ci_run`."""
     parser = argparse.ArgumentParser()
     parser.add_argument("fixture", type=Path)
     parser.add_argument("--keep", type=Path, default=None)
+    parser.add_argument(
+        "--ci",
+        action="store_true",
+        help="machine-readable JSON summary and structured exit codes "
+        "(0 pass / 1 check failure / 2 infrastructure error)",
+    )
     args = parser.parse_args()
+    if args.ci:
+        return _ci_run(args)
+    return _human_main(args)
 
+
+def _human_main(args: argparse.Namespace) -> int:
     markdown = args.fixture.read_text(encoding="utf-8")
     validated = validate_deck(markdown)
     pptx_bytes = build_pptx(validated.deck, "Render audit")
@@ -242,6 +271,96 @@ def main() -> int:
     else:
         print("PASS monospace: code renders in a monospace family")
     return 1 if failures else 0
+
+
+_CI_SCHEMA = 1
+
+
+def _ci_preflight() -> str | None:
+    """The --ci tool requirements, or the reason they are unmet."""
+    for tool in ("pdftotext", "pdffonts"):
+        if shutil.which(tool) is None:
+            return f"{tool} is not on PATH"
+    if shutil.which("docker") is None and shutil.which("soffice") is None:
+        return "neither docker nor soffice is on PATH"
+    return None
+
+
+def _ci_error(fixture: Path, message: str) -> int:
+    print(
+        json.dumps(
+            {
+                "schema": _CI_SCHEMA,
+                "status": "error",
+                "engine": None,
+                "fixture": str(fixture),
+                "checks": {},
+                "failure_count": 0,
+                "error": message,
+            }
+        )
+    )
+    return 2
+
+
+def _ci_run(args: argparse.Namespace) -> int:
+    """The --ci lane: same conversion, same three checks, JSON verdict.
+
+    Infrastructure failures (missing tools, a failing conversion, an
+    invalid fixture) exit 2 with status "error"; check failures exit 1
+    with status "fail" and the offending items inside their check
+    objects, so a nightly consumer can tell "the deck regressed" from
+    "the lane is broken" without parsing prose.
+    """
+    missing = _ci_preflight()
+    if missing:
+        return _ci_error(args.fixture, f"environment incomplete: {missing}")
+    try:
+        markdown = args.fixture.read_text(encoding="utf-8")
+        validated = validate_deck(markdown)
+        pptx_bytes = build_pptx(validated.deck, "Render audit")
+        markers = fence_markers(markdown)
+    except (DeckError, OSError) as exc:
+        return _ci_error(args.fixture, f"fixture rejected: {exc}")
+    try:
+        with tempfile.TemporaryDirectory(prefix="lo-render-ci-") as td:
+            workdir = Path(td)
+            pptx = workdir / (args.fixture.stem + ".pptx")
+            pptx.write_bytes(pptx_bytes)
+            pdf, engine = convert_to_pdf(pptx, workdir)
+            missing_markers = check_survival(pdf, markers)
+            overflow = check_overflow(pdf)
+            mono = check_monospace(pdf)
+    except (subprocess.SubprocessError, OSError) as exc:
+        return _ci_error(args.fixture, f"render infrastructure failed: {exc}")
+    payload = {
+        "schema": _CI_SCHEMA,
+        "status": "pass",
+        "engine": engine,
+        "fixture": str(args.fixture),
+        "checks": {
+            "survival": {
+                "status": "fail" if missing_markers else "pass",
+                "markers": len(markers),
+                "missing": missing_markers,
+            },
+            "overflow": {
+                "status": "fail" if overflow else "pass",
+                "violations": overflow,
+            },
+            "monospace": {
+                "status": "pass" if mono else "fail",
+                "families": mono,
+            },
+        },
+        "failure_count": 0,
+    }
+    payload["failure_count"] = sum(
+        1 for check in payload["checks"].values() if check["status"] == "fail"
+    )
+    payload["status"] = "fail" if payload["failure_count"] else "pass"
+    print(json.dumps(payload))
+    return 1 if payload["failure_count"] else 0
 
 
 if __name__ == "__main__":

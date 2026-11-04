@@ -1,0 +1,35 @@
+{
+  "deck": "visual.md",
+  "diff": {
+    "channel_tolerance": 16,
+    "dense_cell_threshold": 64,
+    "dense_window_px": 32,
+    "max_dense_cells": 0,
+    "max_diff_pixels": 0
+  },
+  "render": {
+    "chrome_version": "Chromium 156.0.8078.47 snap",
+    "image_scale": 1,
+    "marp_cli_version": "@marp-team/marp-cli v4.5.1 (w/ @marp-team/marp-core v4.4.0)",
+    "slide_size_px": [
+      1280,
+      720
+    ],
+    "strict_config": "MARPRC_CONTENT + --no-html (app render parity)"
+  },
+  "schema": 1,
+  "slides": {
+    "1": {
+      "bytes": 15208,
+      "sha256": "5e0a97bd376cfec37860d6fd7b9460d6fcb390dd968fd8d09334930136006298"
+    },
+    "2": {
+      "bytes": 48971,
+      "sha256": "50f7f840935946d5ee580ab2a19301bb91a15c9fcd69beae8f8fc5c78f183551"
+    },
+    "3": {
+      "bytes": 39085,
+      "sha256": "9c28f42d72769836859da89b90453e76ea47fb5049172e05ccd631a7f82ab171"
+    }
+  }
+}
