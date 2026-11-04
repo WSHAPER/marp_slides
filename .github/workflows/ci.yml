@@ -125,7 +125,7 @@ jobs:
         run: npm install --no-save @marp-team/marp-cli@4.5.1
       - name: Provision headless Chromium and put marp on PATH
         run: |
-          npx --yes @puppeteer/browsers install chrome@stable --path "$HOME/.chrome" >/dev/null
+          npx --yes @puppeteer/browsers install chrome@156.0.8078.80 --path "$HOME/.chrome" >/dev/null
           binary="$(find "$HOME/.chrome" -type f -name chrome -perm -u+x | head -1)"
           if [[ -z "$binary" ]]; then
             echo "FAIL: no chrome binary found under $HOME/.chrome" >&2
@@ -159,8 +159,11 @@ jobs:
           cache: pip
       - name: Install the pinned dev toolchain
         run: pip install -r requirements_dev.txt
-      # Exit 5 tolerance as in battery: carrier for future mutation/LibreOffice
-      # jobs; provisioning grows when those land.
+      # The nightly smoke drives lo_render_check --ci under host-soffice;
+      # monospace fidelity is required only under the Collabora engine, so
+      # the headless impress install is sufficient here.
+      - name: Install LibreOffice for the nightly smoke
+        run: sudo apt-get update && sudo apt-get install -y libreoffice-impress
       - name: Nightly lane (pytest -m nightly; exit 5 = lane empty, still green)
         run: |
           set +e

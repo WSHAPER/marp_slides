@@ -8,7 +8,7 @@
     "max_diff_pixels": 0
   },
   "render": {
-    "chrome_version": "Chromium 156.0.8078.47 snap",
+    "chrome_version": "Google Chrome for Testing 156.0.8078.80",
     "image_scale": 1,
     "marp_cli_version": "@marp-team/marp-cli v4.5.1 (w/ @marp-team/marp-core v4.4.0)",
     "slide_size_px": [
@@ -24,12 +24,12 @@
       "sha256": "5e0a97bd376cfec37860d6fd7b9460d6fcb390dd968fd8d09334930136006298"
     },
     "2": {
-      "bytes": 48971,
-      "sha256": "50f7f840935946d5ee580ab2a19301bb91a15c9fcd69beae8f8fc5c78f183551"
+      "bytes": 49217,
+      "sha256": "41ce0a57fe0e68d88872f9fa8aa3f0b3d683897be164dd48ae91c98b643e9567"
     },
     "3": {
-      "bytes": 39085,
-      "sha256": "9c28f42d72769836859da89b90453e76ea47fb5049172e05ccd631a7f82ab171"
+      "bytes": 38951,
+      "sha256": "f0f0866359c2dc8d047ab4bc265d6121f5751cdf801274e85078503600e58d93"
     }
   }
 }
