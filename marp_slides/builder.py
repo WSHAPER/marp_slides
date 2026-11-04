@@ -35,6 +35,7 @@ from .blocks import (
     Subheading,
     TableBlock,
 )
+from .determinism import normalize_pptx
 from .elements import (
     add_chrome_box,
     add_code_box,
@@ -116,7 +117,15 @@ def build_pptx(
 
     buf = io.BytesIO()
     prs.save(buf)
-    return buf.getvalue()
+    # python-pptx stamps every ZIP entry with the wall clock, so two
+    # builds of the same deck never match byte-for-byte; the
+    # deterministic archive rewrite (fixed SOURCE_DATE_EPOCH-derived
+    # timestamps, stable entry order) restores the pipeline's
+    # re-render byte-stability guarantee before the bytes leave the
+    # builder. A set-but-unparseable SOURCE_DATE_EPOCH surfaces here as
+    # an actionable ValueError, which the worker wraps into its
+    # existing DeckError handling for build failures.
+    return normalize_pptx(buf.getvalue())
 
 
 def _build_slide(

@@ -22,6 +22,7 @@ from pathlib import Path
 from typing import Any
 
 from .constructs import THEME_AUTO, THEME_NEXTCLOUD, THEME_VALUES
+from .determinism import normalize_pdf
 from .images import materialize_image_files
 from .marp_cli import (
     MARPRC_CONTENT,
@@ -279,7 +280,7 @@ def render_deck_pdf(
     """
     if image_blobs:
         markdown = materialize_image_files(markdown, image_blobs)
-    return marp_render_pdf(
+    raw = marp_render_pdf(
         markdown,
         workdir,
         marp_timeout_s,
@@ -288,6 +289,23 @@ def render_deck_pdf(
         allow_local_files=False,  # data URIs carry the bytes; nothing local to read
         theming_values=theming_values,
     )
+    # Chromium embeds the wall-clock /CreationDate and /ModDate of the
+    # print inside a compressed object stream (and the trailing xref
+    # offsets shift with it), so raw renders are never byte-stable.
+    # The deterministic date rewrite (SOURCE_DATE_EPOCH-derived, plus
+    # the re-encoded cross-reference) restores the pipeline's
+    # re-render byte-stability guarantee before the bytes leave the
+    # delivery path. Best-effort by contract: an unexpected PDF shape
+    # passes through unchanged (with a warning) rather than failing a
+    # valid render; the battery golden-render gate makes that visible.
+    # A set-but-unparseable SOURCE_DATE_EPOCH is NOT best-effort: it
+    # fails the delivery with an actionable error like every other
+    # strict knob, because silently ignoring it would quietly
+    # reintroduce non-determinism.
+    try:
+        return normalize_pdf(raw)
+    except ValueError as exc:
+        raise DeckError(f"Invalid deck rendering settings: {exc}") from exc
 
 
 # --- LLM output extraction ----------------------------------------------------

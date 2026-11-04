@@ -1,0 +1,25 @@
+# Golden-render SHA-256 pins (Typst-style 32-byte pins; the
+# rendered artifacts themselves are NOT committed).
+#
+# Provenance the pins were generated under; a running marp that
+# differs skips the pin comparison (byte-identity still gates):
+# marp: @marp-team/marp-cli v4.2.3 (w/ @marp-team/marp-core v4.2.0)
+#
+# Update path (deliberate action, never automatic):
+#   MARP_SLIDES_UPDATE_GOLDEN_HASHES=1 pytest -m battery tests/test_golden_render.py
+# (fails once by design: review the diff, commit this file, re-run)
+deck.md html b35a554e38d1ea42833c1bc0b0244ca3b8fc632a38473b61b4b49e89b2172601
+deck.md pdf bb6d407329cb062603fb88e879fd6e88d3cfe15d8ffb122a962656c882ccfa24
+deck.md pptx 6056320188d230701a41d0d3dd7e791109675f90c08d33d31427ee95f0a4c9a5
+deck-code-audit.md html 389a584330977446fe9a84559eaa2d154e29634305f58723a9021bfebb8c76ab
+deck-code-audit.md pdf 7ff88a49a13a006366ac049564613518fe6d7d0f5c4f7c338ee9bb17360a8ab2
+deck-code-audit.md pptx 1c05eb08ffa01e91352d1712a0cf0381ed6ef318cfbf269a160f2a94bd2b2868
+deck-constructs.md html 3c10707eace5ace99f71c6a1bdb2707d68444c3f3a8e5dc4b5001e0c17f36dda
+deck-constructs.md pdf c6790ec90cd639edb3b862270bd0f80c28aabed5621e4bba3e7a8afe218ecfb2
+deck-constructs.md pptx c7279d3fa959931fab8c78b6801601855333099c1b09f318182f665be1d1c14f
+deck-directives.md html 4ff61b36a845b94b397e0617c333b8f9c49461419b85e89fef572d318c1d91ff
+deck-directives.md pdf 210ccafa031c7eb89155595726f27b4b267a7b1de980de3abbb223d7d1eb68ba
+deck-directives.md pptx 4f685b86efd4f76b0880fb0de6bda01b76b24eb458c9fe224594e2215ea01842
+deck-images.md html 58c29c30c4537aa5d6a65cbcbe9240928a8ae4cba5bc6d87bc8fa311b6203f9d
+deck-images.md pdf 9098f2f527d45ba9fbb22ba8dbd700e44206aabd5b565d8f7d5467ddb54327c1
+deck-images.md pptx 723f56b12d7cfbdf08cbb27d648f035f90fa1a41f90cb6cfe283993f45fb2515
