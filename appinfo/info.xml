@@ -36,7 +36,7 @@
 			<variable>
 				<name>MARP_SLIDES_TOTAL_LLM_TIMEOUT</name>
 				<display-name>Total inner LLM time cap (seconds)</display-name>
-				<description>Total time budget across BOTH inner LLM attempts (the first plus the self-correcting retry). Default: 480.</description>
+				<description>Total time budget across BOTH inner LLM attempts (the first plus the self-correcting retry). Default: 1800.</description>
 			</variable>
 			<variable>
 				<name>MARP_SLIDES_LOG_EXCERPT</name>
