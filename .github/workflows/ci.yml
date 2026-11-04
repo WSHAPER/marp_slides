@@ -1,0 +1,173 @@
+# Continuous integration for marp_slides: the CI carrier for the tiered
+# gate lanes (see README.md "Quality gates").
+#
+#   gates     scripts/check.sh verbatim — the hermetic gate suite (no
+#             network, no browser), identical to the local/pre-commit run.
+#   coverage  hermetic suite under coverage, then a diff-cover changed-lines
+#             ratchet vs origin/main: only lines a change touches must be
+#             covered; the existing suite stays grandfathered.
+#   pip-audit the network job the offline suite defers to: CVEs in the
+#             runtime pins (requirements.txt), not the dev toolchain.
+#   battery   the marp toolchain lane (pytest -m battery): python + marp-cli
+#             pinned to @marp-team/marp-cli@4.5.1 (the npm spelling of the
+#             Dockerfile base image pin marpteam/marp-cli:v4.5.1) +
+#             headless Chromium. Weekly schedule and manual dispatch; no
+#             docker involved.
+#   nightly   the slow lane (pytest -m nightly; mutation, LibreOffice smoke).
+#             Daily schedule.
+#
+# gates/coverage/pip-audit run on pushes to main and pull requests.
+# battery/nightly tolerate pytest exit code 5 ("no tests collected") so the
+# carrier lanes exist and stay green before their first tests land.
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+  schedule:
+    - cron: "17 3 * * *" # nightly lane, daily; off the :00 scheduling spike
+    - cron: "23 3 * * 1" # battery lane, weekly on Mondays
+
+permissions:
+  contents: read
+
+# Superseded push/PR runs may cancel each other; scheduled runs never cancel
+# (the group embeds the event and, for schedules, the cron pattern, so the
+# nightly and weekly jobs coexist).
+concurrency:
+  group: ci-${{ github.event_name }}-${{ github.event.schedule || github.ref }}
+  cancel-in-progress: ${{ github.event_name != 'schedule' }}
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  gates:
+    if: github.event_name != 'schedule'
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.11" # ruff target-version py311, mypy python_version 3.11
+          cache: pip
+      - name: Install the pinned dev toolchain
+        run: pip install -r requirements_dev.txt
+      - name: scripts/check.sh (full hermetic gate suite)
+        run: bash scripts/check.sh
+
+  coverage:
+    if: github.event_name != 'schedule'
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0 # diff-cover needs the origin/main ref
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.11"
+          cache: pip
+      - name: Install the pinned dev toolchain
+        run: pip install -r requirements_dev.txt
+      - name: Hermetic suite under coverage
+        run: pytest --cov=marp_slides --cov-report=xml
+      - name: Changed-lines coverage ratchet (diff-cover vs origin/main)
+        run: diff-cover coverage.xml --compare-branch=origin/main --fail-under=100
+
+  pip-audit:
+    if: github.event_name != 'schedule'
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.11"
+      # Pinned in the job, not requirements_dev.txt: this is the network job
+      # the offline gate suite deliberately excludes (README.md "Quality
+      # gates"), so its tool does not belong in the hermetic pin set.
+      - name: Install pip-audit (pinned)
+        run: pip install pip-audit==2.10.1
+      # --strict: a dependency that cannot be collected fails the whole audit
+      # instead of being silently skipped (an unaudited dep is a hole).
+      # Resolution mode (not --no-deps): audits the transitive tree exactly
+      # the way the Docker build installs it; --require-hashes does not apply
+      # because the pins carry no hashes yet.
+      - name: Audit runtime dependency pins
+        run: pip-audit -r requirements.txt --strict --progress-spinner off
+
+  battery:
+    if: >-
+      ${{ github.event_name == 'workflow_dispatch' ||
+      (github.event_name == 'schedule' && github.event.schedule == '23 3 * * 1') }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.11"
+          cache: pip
+      - uses: actions/setup-node@v7
+        with:
+          node-version: "20"
+      - name: Install the pinned dev toolchain
+        run: pip install -r requirements_dev.txt
+      # @marp-team/marp-cli@4.5.1 is the npm package for the Dockerfile base
+      # image pin marpteam/marp-cli:v4.5.1 (verified: bin `marp`, node>=18);
+      # --no-save keeps the checkout free of generated package files.
+      - name: Install marp-cli (pinned to the Dockerfile base image)
+        run: npm install --no-save @marp-team/marp-cli@4.5.1
+      - name: Provision headless Chromium and put marp on PATH
+        run: |
+          npx --yes @puppeteer/browsers install chrome@stable --path "$HOME/.chrome" >/dev/null
+          binary="$(find "$HOME/.chrome" -type f -name chrome -perm -u+x | head -1)"
+          if [[ -z "$binary" ]]; then
+            echo "FAIL: no chrome binary found under $HOME/.chrome" >&2
+            exit 1
+          fi
+          echo "CHROME_PATH=$binary" >> "$GITHUB_ENV"
+          echo "PATH=$PWD/node_modules/.bin:$PATH" >> "$GITHUB_ENV"
+      # Exit 5 = "no tests collected": the lane is a carrier for battery tests
+      # landing in waves; empty stays green instead of red.
+      - name: Battery lane (pytest -m battery; exit 5 = lane empty, still green)
+        run: |
+          set +e
+          pytest -m battery
+          code=$?
+          if [[ $code -eq 5 ]]; then
+            echo "battery: no tests collected yet (carrier lane, vacuous green)"
+            exit 0
+          fi
+          exit "$code"
+
+  nightly:
+    if: >-
+      ${{ github.event_name == 'schedule' && github.event.schedule == '17 3 * * *' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.11"
+          cache: pip
+      - name: Install the pinned dev toolchain
+        run: pip install -r requirements_dev.txt
+      # Exit 5 tolerance as in battery: carrier for future mutation/LibreOffice
+      # jobs; provisioning grows when those land.
+      - name: Nightly lane (pytest -m nightly; exit 5 = lane empty, still green)
+        run: |
+          set +e
+          pytest -m nightly
+          code=$?
+          if [[ $code -eq 5 ]]; then
+            echo "nightly: no tests collected yet (carrier lane, vacuous green)"
+            exit 0
+          fi
+          exit "$code"

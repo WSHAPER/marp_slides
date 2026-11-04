@@ -130,6 +130,8 @@ scripts/check.sh                 # all quality gates + the full test suite
 .venv/bin/pytest -q              # tests alone: fakes only, no Nextcloud, no docker
 ```
 
+The default suite is hermetic (fakes only). Two opt-in lanes exist as registered pytest markers: `pytest -m battery` needs the real marp toolchain (marp-cli on PATH — locally `npm install @marp-team/marp-cli@4.5.1` to match the Dockerfile base image — plus a headless Chromium pointed at by `CHROME_PATH`), and `pytest -m nightly` is the slow lane (mutation, LibreOffice smoke). CI runs both lanes on their own schedules (see below). Both lanes are empty until their first tests land; `pytest` exits with code 5 ("no tests collected") and the CI jobs treat that as green.
+
 ### Quality gates
 
 `scripts/check.sh` runs the full static gate suite (plus the tests) and stops
@@ -137,6 +139,17 @@ at the first failure; `.pre-commit-config.yaml` runs the same core gates on
 every commit. What runs, and why it is in the suite:
 
 Each gate exists because it caught real issues in this codebase. See `scripts/check.sh` and `pyproject.toml` for the configuration.
+
+Continuous integration (`.github/workflows/ci.yml`) runs five jobs. On every push to `main` and every pull request:
+
+- **gates** — `scripts/check.sh` verbatim on the pinned `requirements_dev.txt` toolchain, the same suite as the local and pre-commit runs.
+- **coverage** — the hermetic suite under `pytest --cov=marp_slides`, then a changed-lines ratchet: `diff-cover coverage.xml --compare-branch=origin/main --fail-under=100`. Only lines a change actually touches must be covered, so the existing suite is grandfathered and new code cannot land below full changed-line coverage.
+- **pip-audit** — the network job the offline suite defers to (see below): it audits the runtime pins in `requirements.txt`, resolving the full dependency tree exactly the way the Docker build installs it, with `--strict` so a dependency that cannot be collected fails the audit instead of being silently skipped.
+
+On their own schedules:
+
+- **battery** (weekly Mondays 03:23 UTC, plus manual `workflow_dispatch`) — provisions the battery lane contract — python, `@marp-team/marp-cli@4.5.1` pinned to match the Dockerfile base image, and a headless Chromium — and runs `pytest -m battery`. No docker.
+- **nightly** (daily 03:17 UTC) — runs `pytest -m nightly`, the slow lane. Its provisioning grows as mutation and LibreOffice jobs land.
 
 Documented exemptions, each inline in the code with a reason: `process_task`
 carries the only complexity/size noqas (the 5%/50%/80% pipeline phases read
@@ -149,8 +162,9 @@ Not standalone tools on purpose: pylint (fully covered by ruff + mypy at a
 fraction of the noise), radon (ruff's C901 is the same cyclomatic check),
 bandit (ruff's `S` rules cover it; the `marp` subprocess calls go through an
 injected argv-list runner with no `shell=True` anywhere), and pip-audit
-(dependency CVEs are a different, network-dependent job — run it in CI, not
-in the offline gate suite).
+(dependency CVEs are a different, network-dependent job — the dedicated
+pip-audit CI job audits the runtime pins in `requirements.txt`, outside the
+offline gate suite).
 
 Real-code probe against the built image:
 
