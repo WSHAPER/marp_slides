@@ -322,6 +322,17 @@ blockquote {{
     border-left-color: {_rgba_css(values.color_text, 0.5)};
 }}
 
+/* Tables: the default theme paints every table row an opaque light
+   color, which buries the header and odd body rows under an opaque
+   light box no matter the slide's pairing (the translucent re-tints
+   below composite over it, so a white-text instance rendered the
+   header and odd rows white-on-white). Rows go transparent so the
+   slide's own background shows through; the th and zebra re-tints
+   stay translucent and therefore readable on any pairing. */
+table tr {{
+    background-color: transparent;
+}}
+
 table th {{
     background-color: {_rgba_css(values.color_text, 0.15)};
 }}

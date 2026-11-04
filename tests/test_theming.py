@@ -356,6 +356,34 @@ def test_light_branding_tints_flip_with_the_text_color() -> None:
     assert "rgba(34, 34, 34, 0.12)" in css
 
 
+def test_table_rows_never_paint_opaque() -> None:
+    """The regression this fix pins: the default theme paints every
+    table row an opaque light color, and the theme recolored only the
+    header cells and the even zebra rows, so the header row and the odd
+    body rows kept the default theme's opaque light box behind the
+    instance's white text - white-on-white on a real render (only the
+    even rows' higher-specificity zebra override survived). The row
+    paint must be neutralized to transparent, letting the slide's own
+    background (brand color, or the scrim over the admin image) show
+    through under the translucent th/zebra re-tints. Transparent, not
+    an opaque re-tint: an opaque color would flip the same failure
+    onto the opposite text/background pairing."""
+    css = generate_theme_css(caps())
+    rows = re.search(r"table tr \{[^}]*\}", css)
+    assert rows is not None, "the table row paint neutralization rule is gone"
+    assert "background-color: transparent" in rows.group(0)
+    th = re.search(r"table th \{[^}]*\}", css)
+    assert th is not None
+    assert "rgba(255, 255, 255, 0.15)" in th.group(0)
+    zebra = re.search(r"table tbody tr:nth-child\(even\) \{[^}]*\}", css)
+    assert zebra is not None
+    assert "rgba(255, 255, 255, 0.05)" in zebra.group(0)
+    # the dark-text pairing stays readable too: its re-tints flip with
+    # the text color and the row paint stays pairing-agnostic
+    dark = generate_theme_css(caps(color="#f2c94c", **{"color-text": "#222222"}))
+    assert "rgba(34, 34, 34, 0.05)" in dark
+
+
 # --- write_theme_css: the background materialization seam ------------------------
 
 
