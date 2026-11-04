@@ -1,0 +1,188 @@
+# yaml-language-server: $schema=https://promptfoo.dev/config-schema.json
+# CI (deterministic) tier of the marp_slides LLM eval lane.
+#
+# Run (pinned promptfoo; from the evals/ directory so relative file paths
+# and the promptfoo cache stay inside evals/):
+#
+#   cd evals && npx promptfoo@0.125.1 eval -c promptfooconfig.yaml --no-cache
+#
+# ZERO network, ZERO LLM calls: the provider replays the recorded golden
+# generations in evals/golden/ (see evals/providers/outline_replay.py).
+# --no-cache is deliberate: this tier is free and deterministic, and the
+# response cache could otherwise serve a stale recording after a fixture
+# edit. This tier gates prompt-adjacent REGRESSIONS: schema mirror,
+# outline contract, fixture provenance, and config wiring.
+#
+# What each piece pins:
+# - prompts: one hole ({{outline_prompt}}); each test loads the rendered
+#   REAL Phase 1 prompt snapshot (evals/prompts/*.txt, generated from
+#   marp_slides.outline.build_outline_prompt by
+#   evals/scripts/render_prompt_snapshots.py) as a file:// var.
+# - is-json + schema/outline.schema.json: the outline JSON contract
+#   mirrored from marp_slides/outline.py parse_outline.
+# - asserts/outline_contract.py: the parse-level gates JSON Schema cannot
+#   express (whitespace-only strings, image coverage, per-task slide cap,
+#   pinned theme, planning budget, required topics).
+# - asserts/golden_provenance.py: the test row and its golden fixture
+#   describe the same task (no config/fixture drift).
+# - per-test contains pins: fixture-specific structure anchors.
+#
+# Before running after a prompt change:
+#   PYTHONPATH=<repo root> <venv python> evals/scripts/render_prompt_snapshots.py check
+description: marp_slides outline eval — CI tier (golden replay, deterministic assertions only)
+
+prompts:
+  - '{{outline_prompt}}'
+
+providers:
+  - id: file://providers/outline_replay.py
+    label: golden-replay (zero network, zero LLM)
+
+defaultTest:
+  assert:
+    - type: is-json
+      value: file://schema/outline.schema.json
+      metric: outline-schema
+    - type: python
+      value: file://asserts/outline_contract.py
+      metric: outline-contract
+    - type: python
+      value: file://asserts/golden_provenance.py
+      metric: golden-provenance
+
+tests:
+  - description: default theme — project kickoff (business deck shape)
+    vars:
+      golden: default-project-kickoff
+      outline_prompt: file://prompts/outline-auto.txt
+      user_request: "Create a presentation for our internal project kickoff meeting. Introduce the Aurora project's goals for this quarter, the timeline through the end of March, who is on the team and what they own, and the main risks with their mitigations. Keep it practical; the audience is the whole engineering department."
+      theme: auto
+      image_count: '0'
+      max_slides: '8'
+      required_topics: 'agenda,goals,timeline,risks'
+    assert:
+      - type: contains
+        value: Agenda
+      - type: contains
+        value: '"theme": "default"'
+
+  - description: default theme — sprint review with metrics
+    vars:
+      golden: default-sprint-review
+      outline_prompt: file://prompts/outline-auto.txt
+      user_request: 'Prepare a sprint review deck for sprint 42 of the billing squad. Cover the sprint goals, the key metrics (velocity, cycle time, open bugs), what was delivered, what carried over and why, and one improvement we commit to next sprint.'
+      theme: auto
+      image_count: '0'
+      max_slides: '8'
+      required_topics: 'metrics,velocity,carried'
+    assert:
+      - type: contains
+        value: Key Metrics
+
+  - description: nextcloud theme pinned by the task input
+    vars:
+      golden: nextcloud-onboarding
+      outline_prompt: file://prompts/outline-nextcloud.txt
+      user_request: 'Build an onboarding deck for new employees explaining how we use Nextcloud at our company: what it is, working with files and sharing, calendar and contacts, and collaborating in Talk. It should end with where to get help. Use our Nextcloud branding.'
+      theme: nextcloud
+      image_count: '0'
+      max_slides: '8'
+      required_topics: 'files,sharing,calendar,talk,help'
+    assert:
+      - type: contains
+        value: '"theme": "nextcloud"'
+
+  - description: nextcloud theme with full deck chrome (colors, footer, header)
+    vars:
+      golden: nextcloud-quarterly-report
+      outline_prompt: file://prompts/outline-nextcloud.txt
+      user_request: "Create the Q3 quarterly report deck for the leadership meeting with our Nextcloud branding colors: a #0082C9 background, a footer reading 'Quarterly Report Q3', and a header 'Internal Only'. Cover revenue, churn, hiring and the roadmap."
+      theme: nextcloud
+      image_count: '0'
+      max_slides: '8'
+      required_topics: 'revenue,churn,hiring,roadmap'
+    assert:
+      - type: contains
+        value: '"backgroundColor": "#0082c9"'
+      - type: contains
+        value: '"footer": "Quarterly Report Q3"'
+
+  - description: two attached images — coverage and placement hints
+    vars:
+      golden: images-product-launch
+      outline_prompt: file://prompts/outline-auto-images-2.txt
+      user_request: 'Make a launch deck for the Nimbus smart thermostat with the two attached images: use the product photo as the opening slide background and put the lifestyle photo beside the pricing slide. Cover the product story, top features, pricing tiers, and availability.'
+      theme: auto
+      image_count: '2'
+      max_slides: '8'
+      required_topics: 'pricing,availability,features'
+    assert:
+      - type: contains
+        value: Pricing Tiers
+      - type: contains
+        value: '"has_image": true'
+
+  - description: four attached images incl. deck background reference
+    vars:
+      golden: images-team-offsite
+      outline_prompt: file://prompts/outline-auto-images-4.txt
+      user_request: 'Prepare a short deck for our team offsite in Lisbon with the four attached photos: the group photo as the deck background, the venue photo on the schedule slide, the workshop photo on the workshops slide, and the dinner photo on the social slide. Cover the schedule, the workshops and the budget.'
+      theme: auto
+      image_count: '4'
+      max_slides: '8'
+      required_topics: 'schedule,workshops,budget'
+    assert:
+      - type: contains
+        value: '"backgroundImage": "#file:4"'
+
+  - description: dense fact-heavy prompt — planning budget discipline
+    vars:
+      golden: dense-pricing-matrix
+      outline_prompt: file://prompts/outline-auto-dense-12.txt
+      user_request: 'Create a detailed pricing overview deck for our SaaS with the three plans Starter, Professional and Enterprise: what each plan costs per month, the per-plan user and project limits, the feature comparison, migration discounts, and a short FAQ. It is a lot of material, so take the space you need.'
+      theme: auto
+      image_count: '0'
+      max_slides: '12'
+      required_topics: 'starter,professional,enterprise,comparison,faq'
+    assert:
+      - type: contains
+        value: Migration Discounts
+
+  - description: dense technical prompt — gaia auto-pick with tight summaries
+    vars:
+      golden: dense-api-reference
+      outline_prompt: file://prompts/outline-auto-dense-12.txt
+      user_request: 'A punchy developer-relations deck about our public API for a conference audience: authentication, the five most-used endpoints, rate limits, pagination, error handling and webhooks. Bold and energetic, but keep every slide readable.'
+      theme: auto
+      image_count: '0'
+      max_slides: '12'
+      required_topics: 'authentication,rate limits,pagination,webhooks'
+    assert:
+      - type: contains
+        value: '"theme": "gaia"'
+
+  - description: edge — single-slide deck (max_slides 1)
+    vars:
+      golden: edge-single-slide
+      outline_prompt: file://prompts/outline-auto-single-1.txt
+      user_request: 'I need exactly one slide summarizing our Q3 result: the headline is that we beat the target, and it should carry only three supporting bullets: revenue, the new customers count, and the product launch date.'
+      theme: auto
+      image_count: '0'
+      max_slides: '1'
+      required_topics: 'revenue,customers,launch'
+    assert:
+      - type: contains
+        value: beat the target
+
+  - description: edge — max slide budget (max_slides 60, hard cap)
+    vars:
+      golden: edge-max-slides
+      outline_prompt: file://prompts/outline-auto-max-60.txt
+      user_request: 'Compile a comprehensive employee handbook overview deck for new joiners: working hours and remote policy, vacation and sick days, expenses, equipment, security rules, communication norms, on-call, and the review cycle. It is the full handbook, so use as many slides as needed.'
+      theme: auto
+      image_count: '0'
+      max_slides: '60'
+      required_topics: 'security,vacation,expenses,on-call'
+    assert:
+      - type: contains
+        value: Handbook

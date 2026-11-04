@@ -1,0 +1,15 @@
+{
+  "metadata": {
+    "golden_id": "nextcloud-onboarding",
+    "user_request": "Build an onboarding deck for new employees explaining how we use Nextcloud at our company: what it is, working with files and sharing, calendar and contacts, and collaborating in Talk. It should end with where to get help. Use our Nextcloud branding.",
+    "theme": "nextcloud",
+    "image_count": 0,
+    "max_slides": 8,
+    "prompt_variant": "outline-nextcloud",
+    "provenance": "synthetic",
+    "synthetic_note": "synthetic recording authored for the eval lane (no live capture available); modeled on the outline schema and the Phase 1 prompt rules, and verified against the real parse_outline gates by evals/scripts/render_prompt_snapshots.py check",
+    "recorded_at": "2026-11-03",
+    "pipeline_ref": "479b844"
+  },
+  "outline_text": "{\n  \"title\": \"Working in Nextcloud\",\n  \"theme\": \"nextcloud\",\n  \"paginate\": true,\n  \"slides\": [\n    {\n      \"title\": \"Agenda\",\n      \"summary\": \"What Nextcloud is, files and sharing, calendar and contacts, Talk collaboration, and where to get help.\"\n    },\n    {\n      \"title\": \"What Is Nextcloud?\",\n      \"summary\": \"Our company hub for documents and communication: one place for files, calendars, contacts and chats, in our own data center.\"\n    },\n    {\n      \"title\": \"Files and Sharing\",\n      \"summary\": \"Every project lives in its folder. Share with internal links, request uploads with file drops, and set expiry dates on external shares.\"\n    },\n    {\n      \"title\": \"Calendar and Contacts\",\n      \"summary\": \"Book rooms and meetings from the shared calendar; your contacts sync to your phone; invitations update by email automatically.\"\n    },\n    {\n      \"title\": \"Collaborating in Talk\",\n      \"summary\": \"Project channels replace long email threads; share files in the chat; start a call from any conversation when writing is too slow.\"\n    },\n    {\n      \"title\": \"Where to Get Help\",\n      \"summary\": \"The Handbook space in Nextcloud, the help desk channel in Talk, and the IT self-service portal for account issues.\"\n    }\n  ]\n}"
+}

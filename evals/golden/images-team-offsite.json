@@ -1,0 +1,15 @@
+{
+  "metadata": {
+    "golden_id": "images-team-offsite",
+    "user_request": "Prepare a short deck for our team offsite in Lisbon with the four attached photos: the group photo as the deck background, the venue photo on the schedule slide, the workshop photo on the workshops slide, and the dinner photo on the social slide. Cover the schedule, the workshops and the budget.",
+    "theme": "auto",
+    "image_count": 4,
+    "max_slides": 8,
+    "prompt_variant": "outline-auto-images-4",
+    "provenance": "synthetic",
+    "synthetic_note": "synthetic recording authored for the eval lane (no live capture available); modeled on the outline schema and the Phase 1 prompt rules, and verified against the real parse_outline gates by evals/scripts/render_prompt_snapshots.py check",
+    "recorded_at": "2026-11-03",
+    "pipeline_ref": "479b844"
+  },
+  "outline_text": "{\n  \"title\": \"Lisbon Offsite 2026\",\n  \"theme\": \"default\",\n  \"backgroundImage\": \"#file:4\",\n  \"slides\": [\n    {\n      \"title\": \"Lisbon Offsite 2026\",\n      \"summary\": \"Welcome, the offsite goals, and the team photo from last year as a side image to set the mood; split right.\",\n      \"has_image\": true\n    },\n    {\n      \"title\": \"Schedule\",\n      \"summary\": \"Two days: day one strategy and workshops, day two retrospectives and the open afternoon; venue photo; split right.\",\n      \"has_image\": true\n    },\n    {\n      \"title\": \"Workshops\",\n      \"summary\": \"Three parallel sessions: API design, incident drills and a writing lab; bring laptops; workshop photo; split right.\",\n      \"has_image\": true\n    },\n    {\n      \"title\": \"Budget\",\n      \"summary\": \"Total 18,500 euros: travel 9,000, venue and catering 6,500, workshops and social 3,000; underspent by 500 against plan.\"\n    },\n    {\n      \"title\": \"Social Program\",\n      \"summary\": \"Wednesday dinner at the waterfront restaurant and a free Thursday evening; dinner photo; split right.\",\n      \"has_image\": true\n    },\n    {\n      \"title\": \"Practical Notes\",\n      \"summary\": \"Reimbursement within 30 days through the portal; emergency contact is the ops phone; flights home after 3 pm Friday.\"\n    }\n  ]\n}"
+}

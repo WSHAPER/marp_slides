@@ -1,0 +1,15 @@
+{
+  "metadata": {
+    "golden_id": "dense-api-reference",
+    "user_request": "A punchy developer-relations deck about our public API for a conference audience: authentication, the five most-used endpoints, rate limits, pagination, error handling and webhooks. Bold and energetic, but keep every slide readable.",
+    "theme": "auto",
+    "image_count": 0,
+    "max_slides": 12,
+    "prompt_variant": "outline-auto-dense-12",
+    "provenance": "synthetic",
+    "synthetic_note": "synthetic recording authored for the eval lane (no live capture available); modeled on the outline schema and the Phase 1 prompt rules, and verified against the real parse_outline gates by evals/scripts/render_prompt_snapshots.py check",
+    "recorded_at": "2026-11-03",
+    "pipeline_ref": "479b844"
+  },
+  "outline_text": "{\n  \"title\": \"Ship Faster with Our API\",\n  \"theme\": \"gaia\",\n  \"paginate\": true,\n  \"slides\": [\n    {\n      \"title\": \"Hook\",\n      \"summary\": \"One API, five endpoints, and your integration live today; this talk is the whole getting-started path.\"\n    },\n    {\n      \"title\": \"Authentication\",\n      \"summary\": \"One bearer token per workspace; create it in settings; rotate without downtime using the two-token overlap window.\"\n    },\n    {\n      \"title\": \"Five Endpoints You Need\",\n      \"summary\": \"List, get, create, update, delete on the resource endpoint family; everything else is a parameter on these five.\"\n    },\n    {\n      \"title\": \"Rate Limits\",\n      \"summary\": \"600 requests per minute per token; burst to 900 for ten seconds; the headers tell you exactly when the window resets.\"\n    },\n    {\n      \"title\": \"Pagination\",\n      \"summary\": \"Cursor-based, not offsets: pass the returned cursor, stop at the empty page; stable under concurrent writes.\"\n    },\n    {\n      \"title\": \"Error Handling\",\n      \"summary\": \"Every error is JSON with a code, a message and a doc link; the 429 response includes the retry-after seconds.\"\n    },\n    {\n      \"title\": \"Webhooks\",\n      \"summary\": \"Subscribe once, get events pushed; deliveries retry for 24 hours; verify signatures with the shared secret header.\"\n    },\n    {\n      \"title\": \"SDKs and Examples\",\n      \"summary\": \"Official SDKs in TypeScript, Python and Go; copy-paste examples for every endpoint in the docs.\"\n    },\n    {\n      \"title\": \"Call to Action\",\n      \"summary\": \"Free tier, no card, docs at example.com/docs; the QR code takes you straight to a running key.\"\n    }\n  ]\n}"
+}

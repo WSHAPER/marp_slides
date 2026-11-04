@@ -1,0 +1,15 @@
+{
+  "metadata": {
+    "golden_id": "nextcloud-quarterly-report",
+    "user_request": "Create the Q3 quarterly report deck for the leadership meeting with our Nextcloud branding colors: a #0082C9 background, a footer reading 'Quarterly Report Q3', and a header 'Internal Only'. Cover revenue, churn, hiring and the roadmap.",
+    "theme": "nextcloud",
+    "image_count": 0,
+    "max_slides": 8,
+    "prompt_variant": "outline-nextcloud",
+    "provenance": "synthetic",
+    "synthetic_note": "synthetic recording authored for the eval lane (no live capture available); modeled on the outline schema and the Phase 1 prompt rules, and verified against the real parse_outline gates by evals/scripts/render_prompt_snapshots.py check",
+    "recorded_at": "2026-11-03",
+    "pipeline_ref": "479b844"
+  },
+  "outline_text": "{\n  \"title\": \"Q3 Quarterly Report\",\n  \"theme\": \"nextcloud\",\n  \"paginate\": true,\n  \"backgroundColor\": \"#0082c9\",\n  \"footer\": \"Quarterly Report Q3\",\n  \"header\": \"Internal Only\",\n  \"slides\": [\n    {\n      \"title\": \"Agenda\",\n      \"summary\": \"Revenue, churn, hiring progress, and the roadmap to the end of the year.\"\n    },\n    {\n      \"title\": \"Revenue\",\n      \"summary\": \"3.42 million euros, 8 percent above plan. Growth driven by renewals in the mid-market segment and two enterprise expansions.\"\n    },\n    {\n      \"title\": \"Churn\",\n      \"summary\": \"Logo churn 1.9 percent, best quarter this year. Two flagged accounts recovered after the reliability fixes in August.\"\n    },\n    {\n      \"title\": \"Hiring\",\n      \"summary\": \"Nine of twelve planned roles closed; the three open ones are two engineers and one designer, all in final loops.\"\n    },\n    {\n      \"title\": \"Roadmap to Year End\",\n      \"summary\": \"Ship the analytics beta in November, close the SOC 2 audit in December, and freeze features on December 15.\"\n    },\n    {\n      \"title\": \"Decisions Needed\",\n      \"summary\": \"Approve the extra data-center budget line and confirm the January kickoff date for the analytics launch team.\"\n    }\n  ]\n}"
+}

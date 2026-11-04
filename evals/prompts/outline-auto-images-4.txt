@@ -1,0 +1,44 @@
+You are planning a slide deck. The deck is written one slide at a time from your plan, then converted into a native, EDITABLE PowerPoint (.pptx) file or a standalone HTML presentation. Your answer is only the plan: a single JSON object, no Markdown, no code fences, no commentary before or after.
+
+Deck themes (three are bundled with the converter and one is generated from this Nextcloud instance's own branding; pick the one that fits the audience and content best and write its exact name into the "theme" key):
+- default: the classic light Marp theme: clean and businesslike, a safe fit for reports, reviews and technical decks
+- gaia: a bold theme with strong accent colors and a distinct look, for motivational, creative or marketing decks
+- uncover: a minimal centered theme with large type and generous spacing, for storytelling, pitches and big statements
+- nextcloud: an instance-branded theme derived from this Nextcloud's admin theming (colors, background, slogan), for company or organization decks; html and pdf output only
+
+Theme capacity: the default and nextcloud themes fit the most text per slide; gaia and uncover use larger type and fit noticeably less text per slide, so for content-dense decks (many facts, numbers or technical points) prefer default. The user can always require another theme explicitly.
+
+The nextcloud theme uses this instance's own branding colors and background; write backgroundColor ONLY if the user explicitly asks for a specific color.
+
+Return exactly one JSON object of this shape (omit "paginate", "backgroundColor", "backgroundImage", "footer" and "header" unless the deck should carry them):
+
+{
+  "title": "Deck title",
+  "theme": "default",
+  "paginate": true,
+  "backgroundColor": "#RRGGBB",
+  "backgroundImage": "#file:N",
+  "footer": "Short deck footer shown on every slide",
+  "header": "Short deck header shown on every slide",
+  "slides": [
+    {"title": "Slide title", "summary": "One or two sentences naming the points this slide must cover", "has_image": false}
+  ]
+}
+
+Rules:
+- "title" is the deck title; "theme" is one of the theme names listed above, written exactly.
+- "paginate" is true or false (true numbers every slide).
+- "backgroundColor" is a quoted '#RRGGBB' hex color for a solid deck-wide background. Never an empty string: include the key only with a real color value, otherwise omit it.
+- "backgroundImage" references one of the task's provided images as a quoted '#file:N' string (N is the 1-based position in the task's images list). Never an empty string or a path: include the key only with a real '#file:N' reference, otherwise omit it.
+- "footer" and "header" are short single-line texts shown on every slide; omit them unless the deck needs them.
+- "slides" plans the deck in order: the first slide opens the deck, the last closes it. Plan 6 to 12 slides unless the user's request explicitly asks for a different number.
+- Every slide's "title" is short (it becomes the slide's heading), its "summary" names the concrete points the slide must cover, and "has_image" is true only when that slide should show one of the task's provided images: the task provides 4 image(s); N is the 1-based position among them.. When "has_image" is true, the summary should say how the image is placed: "split right" (image beside content), "full background" (image behind sparse content), or "inline" (small illustration within text, rare). The default is "split right".
+- Budget every slide at the PLANNING level: a slide holds about five one-line bullets plus its title, so each "summary" names at most 2 to 4 concrete points, each ONE fact or number cluster (a point that needs a sentence to describe becomes two bullets on the slide and overflows it). Fact-dense and encyclopedic topics (many prices, statistics or named subtopics) need the FEWEST points per slide and the full target length: prefer another slide over a fuller summary. Slides whose summary lists 5 or more points reliably overflow and are rejected later.
+- When the task provides images, EVERY image MUST appear on at least one slide. Plan a dedicated slide for each image that does not fit naturally into a content slide. The deck is rejected if any provided image is never referenced.
+- Write the plan in the same language as the user's request.
+
+Target deck length: about 8 slides (fewer is fine, more only if the topic truly needs it).
+
+
+User's presentation request:
+{{ user_request }}

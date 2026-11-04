@@ -1,0 +1,15 @@
+{
+  "metadata": {
+    "golden_id": "dense-pricing-matrix",
+    "user_request": "Create a detailed pricing overview deck for our SaaS with the three plans Starter, Professional and Enterprise: what each plan costs per month, the per-plan user and project limits, the feature comparison, migration discounts, and a short FAQ. It is a lot of material, so take the space you need.",
+    "theme": "auto",
+    "image_count": 0,
+    "max_slides": 12,
+    "prompt_variant": "outline-auto-dense-12",
+    "provenance": "synthetic",
+    "synthetic_note": "synthetic recording authored for the eval lane (no live capture available); modeled on the outline schema and the Phase 1 prompt rules, and verified against the real parse_outline gates by evals/scripts/render_prompt_snapshots.py check",
+    "recorded_at": "2026-11-03",
+    "pipeline_ref": "479b844"
+  },
+  "outline_text": "{\n  \"title\": \"SaaS Pricing Overview\",\n  \"theme\": \"default\",\n  \"paginate\": true,\n  \"slides\": [\n    {\n      \"title\": \"Agenda\",\n      \"summary\": \"The three plans, per-plan limits, a feature comparison, migration discounts, and the FAQ.\"\n    },\n    {\n      \"title\": \"Plans at a Glance\",\n      \"summary\": \"Starter 9 euros per user per month; Professional 19; Enterprise from 29 with a volume discount; all billed annually or monthly.\"\n    },\n    {\n      \"title\": \"Starter Plan\",\n      \"summary\": \"Up to 5 users and 20 projects; community support; 10 gigabytes of storage; single sign-on not included.\"\n    },\n    {\n      \"title\": \"Professional Plan\",\n      \"summary\": \"Up to 50 users, unlimited projects; priority support; 500 gigabytes; single sign-on and audit log included.\"\n    },\n    {\n      \"title\": \"Enterprise Plan\",\n      \"summary\": \"Unlimited users; named support engineer; custom storage; data residency in the EU or US; onboarding workshop included.\"\n    },\n    {\n      \"title\": \"Feature Comparison: Core\",\n      \"summary\": \"Rows: projects, storage, support, single sign-on. Checkmarks per plan; differences highlighted; details on the next slide.\"\n    },\n    {\n      \"title\": \"Feature Comparison: Advanced\",\n      \"summary\": \"Audit log from Professional; API access everywhere; sandbox environments Enterprise only; export formats compared.\"\n    },\n    {\n      \"title\": \"Migration Discounts\",\n      \"summary\": \"20 percent for the first year when moving from a competitor; 10 percent for annual prepay; both combinable until June.\"\n    },\n    {\n      \"title\": \"FAQ\",\n      \"summary\": \"Can plans mix? Yes, per team. Is there a free trial? 14 days, no card. What happens at the user limit? Soft cap with a reminder.\"\n    },\n    {\n      \"title\": \"Where to Get Help\",\n      \"summary\": \"The pricing calculator in the docs, sales for Enterprise, and the in-app chat for plan changes.\"\n    }\n  ]\n}"
+}

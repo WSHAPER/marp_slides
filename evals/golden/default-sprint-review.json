@@ -1,0 +1,15 @@
+{
+  "metadata": {
+    "golden_id": "default-sprint-review",
+    "user_request": "Prepare a sprint review deck for sprint 42 of the billing squad. Cover the sprint goals, the key metrics (velocity, cycle time, open bugs), what was delivered, what carried over and why, and one improvement we commit to next sprint.",
+    "theme": "auto",
+    "image_count": 0,
+    "max_slides": 8,
+    "prompt_variant": "outline-auto",
+    "provenance": "synthetic",
+    "synthetic_note": "synthetic recording authored for the eval lane (no live capture available); modeled on the outline schema and the Phase 1 prompt rules, and verified against the real parse_outline gates by evals/scripts/render_prompt_snapshots.py check",
+    "recorded_at": "2026-11-03",
+    "pipeline_ref": "479b844"
+  },
+  "outline_text": "{\n  \"title\": \"Billing Squad Sprint 42 Review\",\n  \"theme\": \"default\",\n  \"slides\": [\n    {\n      \"title\": \"Agenda\",\n      \"summary\": \"Goals, metrics, delivered work, carryover, and the improvement we commit to for sprint 43.\"\n    },\n    {\n      \"title\": \"Sprint Goals\",\n      \"summary\": \"Close all payment retries; ship the invoice PDF preview; prepare the migration dry run. All three goals were met.\"\n    },\n    {\n      \"title\": \"Key Metrics\",\n      \"summary\": \"Velocity 34 points, up from 29. Median cycle time 2.1 days, down from 3.4. Open bugs down to 11 from 18.\"\n    },\n    {\n      \"title\": \"Delivered This Sprint\",\n      \"summary\": \"Retry queue with exponential backoff; PDF preview behind a feature flag; dry-run report for the legacy data migration.\"\n    },\n    {\n      \"title\": \"Carryover and Blockers\",\n      \"summary\": \"Invoice localization carried over: translator availability. Tax-rule engine blocked on the legal review, expected mid next sprint.\"\n    },\n    {\n      \"title\": \"Improvement for Sprint 43\",\n      \"summary\": \"We commit to slicing stories under three days and reviewing the board twice daily to catch stalls early.\"\n    }\n  ]\n}"
+}

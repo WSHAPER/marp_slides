@@ -1,0 +1,229 @@
+# yaml-language-server: $schema=https://promptfoo.dev/config-schema.json
+# Nightly (model-graded) tier of the marp_slides LLM eval lane.
+#
+# Run (pinned promptfoo; from the evals/ directory):
+#
+#   cd evals && npx promptfoo@0.125.1 eval -c nightly.yaml
+#
+# This tier calls a REAL model through any OpenAI-compatible endpoint and
+# adds LLM-judged rubrics on top of the deterministic outline contract.
+# It deliberately never runs in CI: judges are model calls (flaky, priced,
+# network-dependent) — the CI tier replays golden recordings instead.
+# Response caching is left ENABLED (promptfoo's default, disk cache under
+# ~/.promptfoo/cache, 14-day TTL): an unchanged provider/prompt pair must
+# not re-bill on every nightly run. Use --no-cache only when a fresh
+# sampling run is the point.
+#
+# Environment (the eval lane's OWN knobs — production inference has NO
+# endpoint env: the ExApp schedules nested core:text2text tasks on the
+# Nextcloud instance and whatever text provider its admin configured; see
+# marp_slides/ocs_tasks.py):
+#   EVAL_LLM_BASE_URL   OpenAI-compatible base URL of the target model
+#                       (must include the /v1 prefix), e.g. a local
+#                       vLLM/ollama server running the same qwen model
+#                       class the pipeline was calibrated on
+#   EVAL_LLM_API_KEY    API key for the target endpoint (omit for
+#                       unauthenticated local servers)
+#   EVAL_LLM_MODEL      model id as listed by the endpoint
+#   EVAL_JUDGE_BASE_URL / EVAL_JUDGE_API_KEY / EVAL_JUDGE_MODEL  — same
+#                       three knobs for the judge model (may point at the
+#                       same endpoint; a stronger judge is fine)
+#
+# Smoke-testing this tier without any real endpoint:
+#   python3 ../evals/scripts/openai_stub.py 8787 &   # from evals/
+#   EVAL_LLM_BASE_URL=http://127.0.0.1:8787/v1 EVAL_LLM_MODEL=stub \
+#     EVAL_JUDGE_BASE_URL=http://127.0.0.1:8787/v1 EVAL_JUDGE_MODEL=stub \
+#     npx promptfoo@0.125.1 eval -c nightly.yaml --no-cache
+#
+# What this tier gates: live outline quality under the REAL prompt
+# snapshots — format honesty (bare JSON, no fences/commentary), planning
+# discipline (summaries sized so the slide can fit), and faithfulness to
+# the request — plus every deterministic pipeline gate from the CI tier.
+
+description: marp_slides outline eval — nightly tier (live model + judge rubrics, cached)
+
+prompts:
+  - '{{outline_prompt}}'
+
+providers:
+  - id: 'openai:chat:{{env.EVAL_LLM_MODEL}}'
+    label: 'pipeline-model ({{env.EVAL_LLM_MODEL}})'
+    config:
+      apiBaseUrl: '{{env.EVAL_LLM_BASE_URL}}'
+      apiKeyEnvar: EVAL_LLM_API_KEY
+      apiKeyRequired: false
+      temperature: 0
+
+defaultTest:
+  options:
+    # The judge is a SEPARATE provider from the target (promptfoo's
+    # grading config); showThinking:false keeps thinking-style judges
+    # (vLLM/ollama qwen) graded on their final answer only.
+    provider:
+      id: 'openai:chat:{{env.EVAL_JUDGE_MODEL}}'
+      label: 'judge ({{env.EVAL_JUDGE_MODEL}})'
+      config:
+        apiBaseUrl: '{{env.EVAL_JUDGE_BASE_URL}}'
+        apiKeyEnvar: EVAL_JUDGE_API_KEY
+        apiKeyRequired: false
+        temperature: 0
+        showThinking: false
+  assert:
+    # deterministic: the same pipeline gates as the CI tier, applied to
+    # live output (the pipeline enforces these regardless of model)
+    - type: is-json
+      value: file://schema/outline.schema.json
+      metric: outline-schema
+    - type: python
+      value: file://asserts/outline_contract.py
+      metric: outline-contract
+    - type: python
+      value: file://asserts/golden_provenance.py
+      metric: golden-provenance
+    # graded: quality the deterministic tier cannot measure
+    - type: g-eval
+      threshold: 0.7
+      metric: faithfulness
+      value: |
+        You are grading a slide-deck outline — a JSON plan of slide titles
+        and summaries — against the user's presentation request.
+
+        User's request: {{user_request}}
+
+        Score 1.0 only if every planned slide traces directly to the
+        request, every subject the request explicitly asks for is covered
+        by some slide, the slide order serves the request, and no slide
+        introduces material the request does not support. Score 0.0 if
+        major requested subjects are missing or the plan is largely
+        unrelated to the request. Partial coverage or minor invented
+        scope scores in between.
+    - type: g-eval
+      threshold: 0.7
+      metric: planning-fit
+      value: |
+        You are grading a slide-deck outline for slide-level fit: whether
+        each planned slide can fit on ONE slide of a Marp deck.
+
+        The deck system budgets a slide at its title plus about five
+        one-line bullets. Judge each slide's summary: a summary naming at
+        most 2 to 4 concrete points, each a single fact or number
+        cluster, fits; a summary listing 5 or more points, or a paragraph
+        too dense to become a handful of one-line bullets, will overflow
+        its slide (the rendered deck is measured and overflowing slides
+        are rejected downstream).
+
+        Score 1.0 if every slide's summary respects that planning budget;
+        score lower in proportion to how many slides plan too much
+        content; score 0.0 if most slides are overstuffed.
+    - type: llm-rubric
+      metric: format-honesty
+      value: |
+        The output must be one bare JSON object and nothing else: no
+        markdown code fences, no commentary before or after, no XML-style
+        thinking tags. Its keys are exactly the outline contract's keys
+        (title, theme, paginate, backgroundColor, backgroundImage, footer,
+        header, slides with title/summary/has_image), the theme is one of
+        the four bundled theme names written exactly, and every value is
+        honest plan content — real slide titles, real summaries — not
+        placeholders or filler.
+
+tests:
+  - description: default theme — project kickoff (business deck shape)
+    vars:
+      golden: default-project-kickoff
+      outline_prompt: file://prompts/outline-auto.txt
+      user_request: "Create a presentation for our internal project kickoff meeting. Introduce the Aurora project's goals for this quarter, the timeline through the end of March, who is on the team and what they own, and the main risks with their mitigations. Keep it practical; the audience is the whole engineering department."
+      theme: auto
+      image_count: '0'
+      max_slides: '8'
+      required_topics: 'agenda,goals,timeline,risks'
+
+  - description: default theme — sprint review with metrics
+    vars:
+      golden: default-sprint-review
+      outline_prompt: file://prompts/outline-auto.txt
+      user_request: 'Prepare a sprint review deck for sprint 42 of the billing squad. Cover the sprint goals, the key metrics (velocity, cycle time, open bugs), what was delivered, what carried over and why, and one improvement we commit to next sprint.'
+      theme: auto
+      image_count: '0'
+      max_slides: '8'
+      required_topics: 'metrics,velocity,carried'
+
+  - description: nextcloud theme pinned by the task input
+    vars:
+      golden: nextcloud-onboarding
+      outline_prompt: file://prompts/outline-nextcloud.txt
+      user_request: 'Build an onboarding deck for new employees explaining how we use Nextcloud at our company: what it is, working with files and sharing, calendar and contacts, and collaborating in Talk. It should end with where to get help. Use our Nextcloud branding.'
+      theme: nextcloud
+      image_count: '0'
+      max_slides: '8'
+      required_topics: 'files,sharing,calendar,talk,help'
+
+  - description: nextcloud theme with full deck chrome (colors, footer, header)
+    vars:
+      golden: nextcloud-quarterly-report
+      outline_prompt: file://prompts/outline-nextcloud.txt
+      user_request: "Create the Q3 quarterly report deck for the leadership meeting with our Nextcloud branding colors: a #0082C9 background, a footer reading 'Quarterly Report Q3', and a header 'Internal Only'. Cover revenue, churn, hiring and the roadmap."
+      theme: nextcloud
+      image_count: '0'
+      max_slides: '8'
+      required_topics: 'revenue,churn,hiring,roadmap'
+
+  - description: two attached images — coverage and placement hints
+    vars:
+      golden: images-product-launch
+      outline_prompt: file://prompts/outline-auto-images-2.txt
+      user_request: 'Make a launch deck for the Nimbus smart thermostat with the two attached images: use the product photo as the opening slide background and put the lifestyle photo beside the pricing slide. Cover the product story, top features, pricing tiers, and availability.'
+      theme: auto
+      image_count: '2'
+      max_slides: '8'
+      required_topics: 'pricing,availability,features'
+
+  - description: four attached images incl. deck background reference
+    vars:
+      golden: images-team-offsite
+      outline_prompt: file://prompts/outline-auto-images-4.txt
+      user_request: 'Prepare a short deck for our team offsite in Lisbon with the four attached photos: the group photo as the deck background, the venue photo on the schedule slide, the workshop photo on the workshops slide, and the dinner photo on the social slide. Cover the schedule, the workshops and the budget.'
+      theme: auto
+      image_count: '4'
+      max_slides: '8'
+      required_topics: 'schedule,workshops,budget'
+
+  - description: dense fact-heavy prompt — planning budget discipline
+    vars:
+      golden: dense-pricing-matrix
+      outline_prompt: file://prompts/outline-auto-dense-12.txt
+      user_request: 'Create a detailed pricing overview deck for our SaaS with the three plans Starter, Professional and Enterprise: what each plan costs per month, the per-plan user and project limits, the feature comparison, migration discounts, and a short FAQ. It is a lot of material, so take the space you need.'
+      theme: auto
+      image_count: '0'
+      max_slides: '12'
+      required_topics: 'starter,professional,enterprise,comparison,faq'
+
+  - description: dense technical prompt — gaia auto-pick with tight summaries
+    vars:
+      golden: dense-api-reference
+      outline_prompt: file://prompts/outline-auto-dense-12.txt
+      user_request: 'A punchy developer-relations deck about our public API for a conference audience: authentication, the five most-used endpoints, rate limits, pagination, error handling and webhooks. Bold and energetic, but keep every slide readable.'
+      theme: auto
+      image_count: '0'
+      max_slides: '12'
+      required_topics: 'authentication,rate limits,pagination,webhooks'
+
+  - description: edge — single-slide deck (max_slides 1)
+    vars:
+      golden: edge-single-slide
+      outline_prompt: file://prompts/outline-auto-single-1.txt
+      user_request: 'I need exactly one slide summarizing our Q3 result: the headline is that we beat the target, and it should carry only three supporting bullets: revenue, the new customers count, and the product launch date.'
+      theme: auto
+      image_count: '0'
+      max_slides: '1'
+      required_topics: 'revenue,customers,launch'
+
+  - description: edge — max slide budget (max_slides 60, hard cap)
+    vars:
+      golden: edge-max-slides
+      outline_prompt: file://prompts/outline-auto-max-60.txt
+      user_request: 'Compile a comprehensive employee handbook overview deck for new joiners: working hours and remote policy, vacation and sick days, expenses, equipment, security rules, communication norms, on-call, and the review cycle. It is the full handbook, so use as many slides as needed.'
+      theme: auto
+      image_count: '0'
+      max_slides: '60'
+      required_topics: 'security,vacation,expenses,on-call'

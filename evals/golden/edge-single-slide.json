@@ -1,0 +1,15 @@
+{
+  "metadata": {
+    "golden_id": "edge-single-slide",
+    "user_request": "I need exactly one slide summarizing our Q3 result: the headline is that we beat the target, and it should carry only three supporting bullets: revenue, the new customers count, and the product launch date.",
+    "theme": "auto",
+    "image_count": 0,
+    "max_slides": 1,
+    "prompt_variant": "outline-auto-single-1",
+    "provenance": "synthetic",
+    "synthetic_note": "synthetic recording authored for the eval lane (no live capture available); modeled on the outline schema and the Phase 1 prompt rules, and verified against the real parse_outline gates by evals/scripts/render_prompt_snapshots.py check",
+    "recorded_at": "2026-11-03",
+    "pipeline_ref": "479b844"
+  },
+  "outline_text": "{\n  \"title\": \"Q3 at a Glance\",\n  \"theme\": \"default\",\n  \"slides\": [\n    {\n      \"title\": \"Q3 at a Glance\",\n      \"summary\": \"Headline: we beat the target. Three bullets: revenue 8 percent above plan, 240 new customers, and the Nimbus launch on May 12.\"\n    }\n  ]\n}"
+}

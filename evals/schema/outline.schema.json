@@ -1,0 +1,68 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "Deck outline (Phase 1 LLM plan)",
+  "description": "Mirror of the outline JSON contract enforced by marp_slides.outline.parse_outline (the strict Phase 1 gate). Deliberate deltas, both toward the stricter canonical form the prompt teaches: (1) theme is matched case-sensitively here while parse_outline lowercases before its allow-list check; (2) minLength 1 approximates parse_outline's .strip()-non-empty rule (the evals/asserts/outline_contract.py assert closes that gap exactly). Unknown top-level and slide keys stay allowed: parse_outline ignores them for forward compatibility.",
+  "type": "object",
+  "required": ["title", "theme", "slides"],
+  "properties": {
+    "title": {
+      "type": "string",
+      "minLength": 1,
+      "description": "Deck title; non-empty text (assemble_deck YAML-quotes it into the frontmatter)."
+    },
+    "theme": {
+      "type": "string",
+      "enum": ["default", "gaia", "uncover", "nextcloud"],
+      "description": "Exactly one of the MARP_THEMES names from marp_slides/constructs.py (the prompt's theme list and the validator derive from the same source)."
+    },
+    "paginate": {
+      "type": "boolean",
+      "description": "Optional: true numbers every slide (frontmatter paginate: true)."
+    },
+    "backgroundColor": {
+      "type": "string",
+      "pattern": "^#[0-9A-Fa-f]{6}$",
+      "description": "Optional deck-wide solid background, strict '#RRGGBB' (validate_hex_color normalizes to uppercase)."
+    },
+    "backgroundImage": {
+      "type": "string",
+      "pattern": "^#file:[0-9]+$",
+      "description": "Optional deck-wide background image as a 1-based '#file:N' reference into the task's images input; N must be within the provided image count (bounds checked in evals/asserts/outline_contract.py)."
+    },
+    "footer": {
+      "type": "string",
+      "minLength": 1,
+      "description": "Optional short single-line footer shown on every slide."
+    },
+    "header": {
+      "type": "string",
+      "minLength": 1,
+      "description": "Optional short single-line header shown on every slide."
+    },
+    "slides": {
+      "type": "array",
+      "minItems": 1,
+      "maxItems": 60,
+      "description": "The ordered deck plan; non-empty (parse_outline) and capped at DEFAULT_MAX_SLIDES = 60 (marp_slides/settings.py). The per-task max_slides input (default 8, clamped 1..60) is enforced per test by evals/asserts/outline_contract.py.",
+      "items": {
+        "type": "object",
+        "required": ["title"],
+        "properties": {
+          "title": {
+            "type": "string",
+            "minLength": 1,
+            "description": "Slide title; becomes the slide's heading, so it must be short."
+          },
+          "summary": {
+            "type": "string",
+            "description": "One or two sentences naming the concrete points the slide must cover; defaults to empty when omitted."
+          },
+          "has_image": {
+            "type": "boolean",
+            "description": "True only when this slide should show one of the task's provided images; at least image_count slides must set it (the image-coverage gate, mirrored in evals/asserts/outline_contract.py)."
+          }
+        }
+      }
+    }
+  }
+}
