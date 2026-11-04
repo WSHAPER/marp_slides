@@ -103,8 +103,8 @@ max-branches = 9
 # Tests: assert is the tool (S101); monkeypatched fakes legitimately take
 # unused args to match real signatures (ARG/A002); module-level import
 # patching needs local imports (PLC0415); tmp_path covers PTH123; expected
-# values are literal by nature (PLR2004); the opt-in render test drives the
-# same trusted local binaries as scripts/lo_render_check.py (S108/S603/S607).
+# values are literal by nature (PLR2004); battery-lane render tests drive
+# the same trusted local binaries as scripts/lo_render_check.py (S108/S603/S607).
 "tests/*" = ["S101", "S314", "ARG", "A002", "A006", "PLC0415", "PTH123", "B905", "PLR2004", "S108", "S603", "S607"]
 # Developer tooling: prints are the interface, subprocess calls run trusted
 # local binaries (pdffonts, soffice, marp), /tmp is the audit workspace.
@@ -212,7 +212,13 @@ forbidden_modules = ["nc_py_api", "fastapi", "niquests"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
-addopts = "--strict-markers --strict-config"
+addopts = "--strict-markers --strict-config -m 'not battery and not nightly'"
+markers = [
+    # Environment-gated lanes, deselected by default (see addopts); select
+    # explicitly with `pytest -m battery` / `pytest -m nightly`.
+    "battery: needs the marp toolchain (marp-cli, headless Chromium); explicit or CI battery job only",
+    "nightly: slow lane (mutation, LibreOffice smoke); nightly job only",
+]
 
 [tool.vulture]
 # Dead-code tripwire at high confidence only (90: unused imports and
