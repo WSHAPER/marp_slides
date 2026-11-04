@@ -96,10 +96,13 @@ jobs:
       # --strict: a dependency that cannot be collected fails the whole audit
       # instead of being silently skipped (an unaudited dep is a hole).
       # Resolution mode (not --no-deps): audits the transitive tree exactly
-      # the way the Docker build installs it; --require-hashes does not apply
-      # because the pins carry no hashes yet.
+      # the way the Docker build installs it. requirements.lock (not
+      # requirements.txt) is audited: it is the full hashed closure the image
+      # installs from, so every transitively shipped wheel is covered, and
+      # pip-audit verifies the hashes along the way (--require-hashes is
+      # implied when the file carries --hash pins, stated here explicitly).
       - name: Audit runtime dependency pins
-        run: pip-audit -r requirements.txt --strict --progress-spinner off
+        run: pip-audit -r requirements.lock --require-hashes --strict --progress-spinner off
 
   battery:
     if: >-

@@ -3,9 +3,9 @@
 # that uses the browser, while the PPTX is built natively with python-pptx
 # and marp-cli's HTML gate/render are Node-only) plus a Python FastAPI
 # worker. Layer order rationale: the heavy, rarely changing base first; then
-# OS packages and pinned pip deps (change with requirements.txt only); the
-# application code last, so day-to-day edits rebuild only the cheap COPY
-# layers.
+# OS packages and the hashed lock install (change with requirements.lock,
+# regenerated from requirements.txt — see README "Releases"); the application
+# code last, so day-to-day edits rebuild only the cheap COPY layers.
 FROM marpteam/marp-cli:v4.5.1
 
 # The base image ships neither python3 nor a `marp` command on PATH (it only
@@ -16,10 +16,14 @@ RUN apt-get update \
     && apt-get install -y --no-install-recommends python3 python3-venv \
     && rm -rf /var/lib/apt/lists/*
 
-COPY requirements.txt /tmp/requirements.txt
+# requirements.lock is the full transitive closure of requirements.txt with
+# per-artifact sha256 hashes (CRA: reproducible, auditable installs).
+# --require-hashes makes pip refuse any artifact whose hash is absent from
+# the lock, so the image cannot pick up an unresolved or tampered wheel.
+COPY requirements.lock /tmp/requirements.lock
 RUN python3 -m venv /opt/venv \
-    && /opt/venv/bin/pip install --no-cache-dir -r /tmp/requirements.txt \
-    && rm /tmp/requirements.txt
+    && /opt/venv/bin/pip install --no-cache-dir --require-hashes -r /tmp/requirements.lock \
+    && rm /tmp/requirements.lock
 ENV PATH=/opt/venv/bin:$PATH
 
 # Expose marp-cli as a plain `marp` command for the worker and for ad-hoc use

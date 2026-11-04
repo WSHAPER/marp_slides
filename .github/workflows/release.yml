@@ -1,0 +1,161 @@
+# Release workflow for marp_slides: cuts a GitHub release with the CRA
+# artifacts (machine-readable SBOM, checksums, image digests) whenever a
+# vX.Y.Z tag is pushed.
+#
+# Unique-version enforcement (Cyber Resilience Act: every release is a
+# distinct, identifiable version with its own SBOM):
+#   1. The tag MUST equal APP_VERSION in appinfo/info.xml (guard below), and
+#      tests/test_versions.py already pins that constant to settings.py and
+#      the docker image-tag — so a tag names exactly one version triple.
+#   2. A version is released at most once: the no-re-tagging guard fails the
+#      run if a GitHub release for the tag already exists. Deleting a release
+#      to sneak a different commit under the same tag is out of process:
+#      never reuse a version, cut a new patch release instead.
+#   3. The SBOM is generated FROM THE COMMITTED LOCK (requirements.lock),
+#      not from a live environment, so every SBOM describes exactly the
+#      dependency set the tagged image installs (hash-checked via
+#      --require-hashes in the Dockerfile).
+#
+# This workflow creates the GitHub release and attaches the CRA artifacts.
+# It deliberately does NOT push the docker image: publishing to the registry
+# advertised in appinfo/info.xml (docker.io) is the human's release step, run
+# after reviewing this release's artifacts (repo policy: no push from CI
+# without explicit registry secrets).
+#
+# Not reusable nextcloud automation: the org templates
+# (.github/workflow-templates/appstore-build-publish.yml and
+# docker-build-publish.yml in nextcloud/.github) are gated on
+# github.repository_owner == 'nextcloud-releases' and need org secrets; this
+# third-party repo runs its own pipeline (see tmp/cra-sbom.md for the
+# evidence and README "Releases" for the process).
+name: release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write # create the GitHub release and upload its assets
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      GH_TOKEN: ${{ github.token }}
+      APP_ID: marp_slides
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Read APP_VERSION from appinfo/info.xml
+        run: |
+          APP_VERSION="$(python3 -c 'import xml.etree.ElementTree as ET; print(ET.parse("appinfo/info.xml").getroot().findtext("version"))')"
+          if [[ -z "$APP_VERSION" ]]; then
+            echo "FAIL: no <version> in appinfo/info.xml" >&2
+            exit 1
+          fi
+          echo "APP_VERSION=$APP_VERSION" >> "$GITHUB_ENV"
+
+      # Guard 1 — the tag must name this exact app version (a drifted tag
+      # would label a release with a version the manifest does not carry).
+      - name: Verify the tag equals APP_VERSION
+        run: |
+          if [[ "${GITHUB_REF_NAME}" != "v${APP_VERSION}" ]]; then
+            echo "FAIL: tag ${GITHUB_REF_NAME} does not equal v${APP_VERSION} (appinfo/info.xml)" >&2
+            exit 1
+          fi
+
+      # Guard 2 — no-re-tagging: a release for this tag must not exist.
+      # (gh release view exits non-zero when the release is absent.)
+      - name: Verify no release exists for this tag yet
+        run: |
+          if gh release view "${GITHUB_REF_NAME}" >/dev/null 2>&1; then
+            echo "FAIL: release ${GITHUB_REF_NAME} already exists; never re-release a version, cut a new one" >&2
+            exit 1
+          fi
+
+      # The image tag mirrors the manifest (image-tag == APP_VERSION, pinned
+      # by tests/test_versions.py). Built, not pushed — see the header.
+      - name: Build the docker image
+        run: docker build -t "${APP_ID}:${APP_VERSION}" .
+
+      - name: Record image digests
+        run: |
+          {
+            echo "# Image digests for ${GITHUB_REF_NAME}"
+            echo
+            echo "app image (${APP_ID}:${APP_VERSION}):"
+            docker image inspect --format '{{.Id}}' "${APP_ID}:${APP_VERSION}"
+            echo
+            echo "pinned base image (marpteam/marp-cli:v4.5.1, as resolved at build time):"
+            docker image inspect --format '{{.Id}}' marpteam/marp-cli:v4.5.1
+          } > image-digests.txt
+          cat image-digests.txt
+
+      # SBOM from the committed lock — hermetic: no docker, no live resolve.
+      # cyclonedx-py is pinned in the job, not requirements_dev.txt, because
+      # it is a release-time network tool outside the offline gate suite
+      # (same convention as pip-audit in ci.yml).
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.11"
+      - name: Install cyclonedx-py (pinned)
+        run: pip install cyclonedx-py==7.6.0
+      # SOURCE_DATE_EPOCH = the tagged commit's timestamp makes the SBOM
+      # byte-reproducible for this tag (--output-reproducible drops the
+      # random serial; the epoch fixes the one timestamp it keeps).
+      - name: Generate the CycloneDX SBOM from requirements.lock
+        run: |
+          SOURCE_DATE_EPOCH="$(git log -1 --format=%ct HEAD)" \
+            cyclonedx-py requirements requirements.lock \
+            --output-reproducible -o sbom.cyclonedx.json
+      # cyclonedx-py 7.6.0 has no --name/--version for the requirements
+      # source, so the app itself is added as the root component here —
+      # version straight from appinfo/info.xml (the guarded APP_VERSION),
+      # never a second copy of the version string in the repo.
+      - name: Add the app as the SBOM root component
+        run: |
+          python3 - "$APP_VERSION" sbom.cyclonedx.json <<'PYEOF'
+          import json
+          import sys
+
+          version, path = sys.argv[1], sys.argv[2]
+          with open(path) as f:
+              bom = json.load(f)
+          bom["metadata"]["component"] = {
+              "bom-ref": f"marp_slides@{version}",
+              "type": "application",
+              "name": "marp_slides",
+              "version": version,
+          }
+          with open(path, "w") as f:
+              json.dump(bom, f, indent=2, sort_keys=True)
+              f.write("\n")
+          PYEOF
+          python3 -m json.tool sbom.cyclonedx.json >/dev/null
+
+      - name: Checksum the SBOM
+        run: sha256sum sbom.cyclonedx.json > sbom.cyclonedx.json.sha256
+
+      - name: Create the GitHub release with the CRA artifacts
+        run: |
+          cat > release-notes.md <<EOF
+          # marp_slides ${APP_VERSION}
+
+          Cyber Resilience Act release artifacts:
+
+          - \`sbom.cyclonedx.json\` — CycloneDX 1.6 SBOM generated from the committed \`requirements.lock\` (every locked dependency with its sha256 hashes); the app itself is the root component.
+          - \`sbom.cyclonedx.json.sha256\` — checksum of the SBOM.
+          - \`image-digests.txt\` — digests of the built \`marp-slides:${APP_VERSION}\` image and its pinned base image.
+
+          The docker image is published to the registry advertised in \`appinfo/info.xml\` as a separate manual step.
+          EOF
+          gh release create "${GITHUB_REF_NAME}" \
+            --title "marp_slides ${APP_VERSION}" \
+            --notes-file release-notes.md \
+            sbom.cyclonedx.json sbom.cyclonedx.json.sha256 image-digests.txt
